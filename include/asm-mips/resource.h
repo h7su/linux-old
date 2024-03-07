@@ -1,14 +1,13 @@
-/*
- * Process resource limits
+/* $Id: resource.h,v 1.4 2000/01/27 23:45:30 ralf Exp $
  *
  * This file is subject to the terms and conditions of the GNU General Public
  * License.  See the file "COPYING" in the main directory of this archive
  * for more details.
  *
- * Copyright (C) 1995, 1996 by Ralf Baechle
+ * Copyright (C) 1995, 1996, 1998 by Ralf Baechle
  */
-#ifndef __ASM_MIPS_RESOURCE_H
-#define __ASM_MIPS_RESOURCE_H
+#ifndef _ASM_RESOURCE_H
+#define _ASM_RESOURCE_H
 
 /*
  * Resource limits
@@ -23,25 +22,33 @@
 #define RLIMIT_RSS 7			/* max resident set size */
 #define RLIMIT_NPROC 8			/* max number of processes */
 #define RLIMIT_MEMLOCK 9		/* max locked-in-memory address space */
+#define RLIMIT_LOCKS	10		/* maximum file locks held */
 
-#define RLIM_NLIMITS 10			/* Number of limit flavors.  */
+#define RLIM_NLIMITS 11			/* Number of limit flavors.  */
+
+/*
+ * SuS says limits have to be unsigned.
+ * Which makes a ton more sense anyway.
+ */
+#define RLIM_INFINITY	0x7fffffffUL
 
 #ifdef __KERNEL__
 
 #define INIT_RLIMITS					\
 {							\
-	{LONG_MAX, LONG_MAX},				\
-	{LONG_MAX, LONG_MAX},				\
-	{LONG_MAX, LONG_MAX},				\
-	{_STK_LIM, _STK_LIM},				\
-	{       0, LONG_MAX},				\
-	{NR_OPEN, NR_OPEN},				\
-	{LONG_MAX, LONG_MAX},				\
-	{LONG_MAX, LONG_MAX},				\
-	{MAX_TASKS_PER_USER, MAX_TASKS_PER_USER},	\
-	{ LONG_MAX, LONG_MAX },				\
+	{ RLIM_INFINITY, RLIM_INFINITY },		\
+	{ RLIM_INFINITY, RLIM_INFINITY },		\
+	{ RLIM_INFINITY, RLIM_INFINITY },		\
+	{ _STK_LIM,      RLIM_INFINITY },		\
+	{        0,      RLIM_INFINITY },		\
+	{ INR_OPEN,      INR_OPEN      },		\
+	{ RLIM_INFINITY, RLIM_INFINITY },		\
+	{ RLIM_INFINITY, RLIM_INFINITY },		\
+	{ 0,             0             },		\
+	{ RLIM_INFINITY, RLIM_INFINITY },		\
+	{ RLIM_INFINITY, RLIM_INFINITY },		\
 }
 
 #endif /* __KERNEL__ */
 
-#endif /* __ASM_MIPS_RESOURCE_H */
+#endif /* _ASM_RESOURCE_H */

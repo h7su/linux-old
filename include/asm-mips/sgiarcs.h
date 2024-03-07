@@ -1,12 +1,13 @@
-/* $Id: sgiarcs.h,v 1.2 1998/07/08 16:01:57 ralf Exp $
+/* $Id: sgiarcs.h,v 1.3 1999/02/25 20:55:08 tsbogend Exp $
  *
  * SGI ARCS firmware interface defines.
  *
  * Copyright (C) 1996 David S. Miller (dm@engr.sgi.com)
  */
+#ifndef _ASM_SGIARCS_H
+#define _ASM_SGIARCS_H
 
-#ifndef _MIPS_SGIARCS_H
-#define _MIPS_SGIARCS_H
+#include <asm/arc/types.h>
 
 /* Various ARCS error codes. */
 #define PROM_ESUCCESS                   0x00
@@ -88,19 +89,36 @@ struct linux_sysid {
 };
 
 /* ARCS prom memory descriptors. */
-enum linux_memtypes {
-	eblock,  /* exception block */
-	rvpage,  /* ARCS romvec page */
-	fcontig, /* Contiguous and free */
-	free,    /* Generic free memory */
-	bmem,    /* Borken memory, don't use */
-	prog,    /* A loaded program resides here */
-	atmp,    /* ARCS temporary storage area, wish Sparc OpenBoot told this */
-	aperm,   /* ARCS permanent storage... */
+enum arcs_memtypes {
+	arcs_eblock,  /* exception block */
+	arcs_rvpage,  /* ARCS romvec page */
+	arcs_fcontig, /* Contiguous and free */
+	arcs_free,    /* Generic free memory */
+	arcs_bmem,    /* Borken memory, don't use */
+	arcs_prog,    /* A loaded program resides here */
+	arcs_atmp,    /* ARCS temporary storage area, wish Sparc OpenBoot told this */
+	arcs_aperm,   /* ARCS permanent storage... */
+};
+
+/* ARC has slightly different types than ARCS */
+enum arc_memtypes {
+	arc_eblock,  /* exception block */
+	arc_rvpage,  /* romvec page */
+	arc_free,    /* Generic free memory */
+	arc_bmem,    /* Borken memory, don't use */
+	arc_prog,    /* A loaded program resides here */
+	arc_atmp,    /* temporary storage area */
+	arc_aperm,   /* permanent storage */
+	arc_fcontig, /* Contiguous and free */    
+};
+
+union linux_memtypes {
+    enum arcs_memtypes arcs;
+    enum arc_memtypes arc;
 };
 
 struct linux_mdesc {
-	enum linux_memtypes type;
+        union linux_memtypes type;
 	unsigned long base;
 	unsigned long pages;
 };
@@ -215,8 +233,8 @@ struct linux_romvec {
 	long (*mount)(char *file, enum linux_mountops op);
 
 	/* Dealing with firmware environment variables. */
-	char *(*get_evar)(char *name);
-	long (*set_evar)(char *name, char *value);
+	PCHAR (*get_evar)(CHAR *name);
+	LONG (*set_evar)(PCHAR name, PCHAR value);
 
 	long (*get_finfo)(unsigned long fd, struct linux_finfo *buf);
 	long (*set_finfo)(unsigned long fd, unsigned long flags,
@@ -349,4 +367,4 @@ struct linux_smonblock {
 	int             smax;              /* Max # of symbols. */
 };
 
-#endif /* !(_MIPS_SGIARCS_H) */
+#endif /* _ASM_SGIARCS_H */

@@ -60,7 +60,7 @@ typedef struct {
 	hfs_byte_t	RExtRec[12];	/* first extent record
 					   for the resource fork */
 	hfs_lword_t	Resrv;		/* reserved by Apple */
-} FIL_REC;
+} __attribute__((packed)) FIL_REC;
 
 /* the catalog record for a directory */
 typedef struct {
@@ -74,14 +74,14 @@ typedef struct {
 	hfs_dinfo_t	UsrInfo;	/* data used by the Finder */
 	hfs_dxinfo_t	FndrInfo;	/* more data used by Finder */
 	hfs_byte_t	Resrv[16];	/* reserved by Apple */
-} DIR_REC;
+} __attribute__((packed)) DIR_REC;
 
 /* the catalog record for a thread */
 typedef struct {
 	hfs_byte_t		Reserv[8];	/* reserved by Apple */
 	hfs_lword_t		ParID;		/* CNID of parent directory */
 	struct hfs_name		CName;		/* The name of this entry */
-} THD_REC;
+}  __attribute__((packed)) THD_REC;
 
 /* A catalog tree record */
 struct hfs_cat_rec {
@@ -92,7 +92,7 @@ struct hfs_cat_rec {
 		DIR_REC dir;
 		THD_REC thd;
 	} u;
-};
+} __attribute__((packed));
 
 /*================ File-local variables ================*/
  
@@ -302,6 +302,8 @@ static void __read_entry(struct hfs_cat_entry *entry,
 		entry->modify_date = hfs_get_nl(cat->u.dir.MdDat);
 		entry->backup_date = hfs_get_nl(cat->u.dir.BkDat);
 		dir->dirs = dir->files = 0;
+		hfs_init_waitqueue(&dir->read_wait);
+		hfs_init_waitqueue(&dir->write_wait);
 	} else if (cat->cdrType == HFS_CDR_FIL) {
 		struct hfs_file *fil = &entry->u.file;
 
@@ -647,7 +649,7 @@ static void update_dir(struct hfs_mdb *mdb, struct hfs_cat_entry *dir,
  */
 static inline void start_write(struct hfs_cat_entry *dir)
 {
-	if (dir->u.dir.readers || dir->u.dir.read_wait) {
+	if (dir->u.dir.readers || waitqueue_active(&dir->u.dir.read_wait)) {
 		hfs_sleep_on(&dir->u.dir.write_wait);
 	}
 	++dir->u.dir.writers;
@@ -658,7 +660,7 @@ static inline void start_write(struct hfs_cat_entry *dir)
  */
 static inline void start_read(struct hfs_cat_entry *dir)
 {
-	if (dir->u.dir.writers || dir->u.dir.write_wait) {
+	if (dir->u.dir.writers || waitqueue_active(&dir->u.dir.write_wait)) {
 		hfs_sleep_on(&dir->u.dir.read_wait);
 	}
 	++dir->u.dir.readers;

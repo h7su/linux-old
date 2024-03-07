@@ -12,7 +12,7 @@
  *
  *  Copyright (C) 1995 Andreas Busse
  *
- * $Id: gdb-stub.c,v 1.4 1997/12/02 05:51:06 ralf Exp $
+ * $Id: gdb-stub.c,v 1.6 1999/05/01 22:40:35 ralf Exp $
  */
 
 /*
@@ -115,7 +115,7 @@ void handle_exception(struct gdb_regs *regs);
 
 static char input_buffer[BUFMAX];
 static char output_buffer[BUFMAX];
-static int initialized = 0;	/* !0 means we've been initialized */
+static int initialized;	/* !0 means we've been initialized */
 static const char hexchars[]="0123456789abcdef";
 
 
@@ -326,7 +326,7 @@ static struct hard_trap_info
 	{ 7, SIGBUS },			/* data bus error */
 	{ 9, SIGTRAP },			/* break */
 	{ 10, SIGILL },			/* reserved instruction */
-/*	{ 11, SIGILL },		*/	/* cpu unusable */
+/*	{ 11, SIGILL },		*/	/* CPU unusable */
 	{ 12, SIGFPE },			/* overflow */
 	{ 13, SIGTRAP },		/* trap */
 	{ 14, SIGSEGV },		/* virtual instruction cache coherency */
@@ -362,8 +362,6 @@ void set_debug_traps(void)
 
 	initialized = 1;
 	restore_flags(flags);
-
-	breakpoint();
 }
 
 
@@ -379,7 +377,7 @@ extern void fltr_set_mem_err(void)
 }
 
 /*
- * Convert the MIPS hardware trap type code to a unix signal number.
+ * Convert the MIPS hardware trap type code to a Unix signal number.
  */
 static int computeSignal(int tt)
 {

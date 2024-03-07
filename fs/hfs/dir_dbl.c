@@ -27,7 +27,6 @@ static struct dentry *dbl_lookup(struct inode *, struct dentry *);
 static int dbl_readdir(struct file *, void *, filldir_t);
 static int dbl_create(struct inode *, struct dentry *, int);
 static int dbl_mkdir(struct inode *, struct dentry *, int);
-static int dbl_mknod(struct inode *, struct dentry *, int, int);
 static int dbl_unlink(struct inode *, struct dentry *);
 static int dbl_rmdir(struct inode *, struct dentry *);
 static int dbl_rename(struct inode *, struct dentry *,
@@ -57,42 +56,20 @@ const struct hfs_name hfs_dbl_reserved2[] = {
 #define ROOTINFO	(&hfs_dbl_reserved2[0])
 #define PCNT_ROOTINFO	(&hfs_dbl_reserved2[1])
 
-static struct file_operations hfs_dbl_dir_operations = {
-	NULL,			/* lseek - default */
-	hfs_dir_read,		/* read - invalid */
-	NULL,			/* write - bad */
-	dbl_readdir,		/* readdir */
-	NULL,			/* select - default */
-	NULL,			/* ioctl - default */
-	NULL,			/* mmap - none */
-	NULL,			/* no special open code */
-	NULL,			/* flush */
-	NULL,			/* no special release code */
-	file_fsync,		/* fsync - default */
-        NULL,			/* fasync - default */
-        NULL,			/* check_media_change - none */
-        NULL			/* revalidate - none */
+struct file_operations hfs_dbl_dir_operations = {
+	read:		generic_read_dir,
+	readdir:	dbl_readdir,
+	fsync:		file_fsync,
 };
 
 struct inode_operations hfs_dbl_dir_inode_operations = {
-	&hfs_dbl_dir_operations,/* default directory file-ops */
-	dbl_create,		/* create */
-	dbl_lookup,		/* lookup */
-	NULL,			/* link */
-	dbl_unlink,		/* unlink */
-	NULL,			/* symlink */
-	dbl_mkdir,		/* mkdir */
-	dbl_rmdir,		/* rmdir */
-	dbl_mknod,		/* mknod */
-	dbl_rename,		/* rename */
-	NULL,			/* readlink */
-	NULL,			/* follow_link */
-	NULL,			/* readpage */
-	NULL,			/* writepage */
-	NULL,			/* bmap */
-	NULL,			/* truncate */
-	NULL,			/* permission */
-	NULL			/* smap */
+	create:		dbl_create,
+	lookup:		dbl_lookup,
+	unlink:		dbl_unlink,
+	mkdir:		dbl_mkdir,
+	rmdir:		dbl_rmdir,
+	rename:		dbl_rename,
+	setattr:	hfs_notify_change,
 };
 
 
@@ -202,15 +179,12 @@ static int dbl_readdir(struct file * filp,
         struct hfs_cat_entry *entry;
 	struct inode *dir = filp->f_dentry->d_inode;
 
-	if (!dir || !dir->i_sb || !S_ISDIR(dir->i_mode)) {
-		return -EBADF;
-	}
-
 	entry = HFS_I(dir)->entry;
 
 	if (filp->f_pos == 0) {
 		/* Entry 0 is for "." */
-		if (filldir(dirent, DOT->Name, DOT_LEN, 0, dir->i_ino)) {
+		if (filldir(dirent, DOT->Name, DOT_LEN, 0, dir->i_ino,
+			    DT_DIR)) {
 			return 0;
 		}
 		filp->f_pos = 1;
@@ -219,7 +193,7 @@ static int dbl_readdir(struct file * filp,
 	if (filp->f_pos == 1) {
 		/* Entry 1 is for ".." */
 		if (filldir(dirent, DOT_DOT->Name, DOT_DOT_LEN, 1,
-			    hfs_get_hl(entry->key.ParID))) {
+			    hfs_get_hl(entry->key.ParID), DT_DIR)) {
 			return 0;
 		}
 		filp->f_pos = 2;
@@ -256,7 +230,8 @@ static int dbl_readdir(struct file * filp,
 				    &((struct hfs_cat_key *)brec.key)->CName);
 			}
 
-			if (filldir(dirent, tmp_name, len, filp->f_pos, ino)) {
+			if (filldir(dirent, tmp_name, len, filp->f_pos, ino,
+				    DT_UNKNOWN)) {
 				hfs_cat_close(entry, &brec);
 				return 0;
 			}
@@ -270,7 +245,8 @@ static int dbl_readdir(struct file * filp,
 			/* In root dir last entry is for "%RootInfo" */
 			if (filldir(dirent, PCNT_ROOTINFO->Name,
 				    PCNT_ROOTINFO_LEN, filp->f_pos,
-				    ntohl(entry->cnid) | HFS_DBL_HDR)) {
+				    ntohl(entry->cnid) | HFS_DBL_HDR,
+				    DT_UNKNOWN)) {
 				return 0;
 			}
 		}
@@ -318,28 +294,6 @@ static int dbl_mkdir(struct inode * parent, struct dentry *dentry,
 		error = -EEXIST;
 	} else {
 		error = hfs_mkdir(parent, dentry, mode);
-	}
-	return error;
-}
-
-/*
- * dbl_mknod()
- *
- * This is the mknod() entry in the inode_operations structure for
- * regular HFS directories.  The purpose is to create a new entry
- * in a directory, given the inode for the parent directory and the
- * name (and its length) and the mode of the new entry (and the device
- * number if the entry is to be a device special file).
- */
-static int dbl_mknod(struct inode *dir, struct dentry *dentry,
-		     int mode, int rdev)
-{
-	int error;
-
-	if (is_hdr(dir, dentry->d_name.name, dentry->d_name.len)) {
-		error = -EEXIST;
-	} else {
-		error = hfs_mknod(dir, dentry, mode, rdev);
 	}
 	return error;
 }

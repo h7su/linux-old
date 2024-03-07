@@ -57,10 +57,17 @@ struct smb_conn_opt {
 	/* The following are NT LM 0.12 options */
 	__u32              maxraw;
 	__u32              capabilities;
-	__u16              serverzone;
+	__s16              serverzone;
 };
 
 #ifdef __KERNEL__
+
+#define SMB_NLS_MAXNAMELEN 20
+struct smb_nls_codepage {
+	char local_name[SMB_NLS_MAXNAMELEN];
+	char remote_name[SMB_NLS_MAXNAMELEN];
+};
+
 
 #define SMB_MAXNAMELEN 255
 #define SMB_MAXPATHLEN 1024

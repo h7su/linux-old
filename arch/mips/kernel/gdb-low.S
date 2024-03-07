@@ -5,14 +5,13 @@
  *
  * Copyright (C) 1995 Andreas Busse
  *
- * $Id: gdb-low.S,v 1.3 1997/12/02 05:51:05 ralf Exp $
+ * $Id: gdb-low.S,v 1.4 1997/12/01 17:57:26 ralf Exp $
  */
 
 #include <linux/sys.h>
 
 #include <asm/asm.h>
 #include <asm/mipsregs.h>
-#include <asm/mipsconfig.h>
 #include <asm/regdef.h>
 #include <asm/stackframe.h>
 #include <asm/gdb-stub.h>

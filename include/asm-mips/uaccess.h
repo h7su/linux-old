@@ -1,16 +1,13 @@
 /*
- * include/asm-mips/uaccess.h
- *
  * This file is subject to the terms and conditions of the GNU General Public
  * License.  See the file "COPYING" in the main directory of this archive
  * for more details.
  *
- * Copyright (C) 1996, 1997, 1998 by Ralf Baechle
- *
- * $Id: uaccess.h,v 1.15 1998/05/03 11:13:54 ralf Exp $
+ * Copyright (C) 1996, 1997, 1998, 1999, 2000 by Ralf Baechle
+ * Copyright (C) 1999, 2000 Silicon Graphics, Inc.
  */
-#ifndef __ASM_MIPS_UACCESS_H
-#define __ASM_MIPS_UACCESS_H
+#ifndef _ASM_UACCESS_H
+#define _ASM_UACCESS_H
 
 #include <linux/errno.h>
 #include <linux/sched.h>
@@ -25,15 +22,15 @@
  *
  * For historical reasons, these macros are grossly misnamed.
  */
-#define KERNEL_DS	((mm_segment_t) { 0UL })
-#define USER_DS		((mm_segment_t) { 1UL })
+#define KERNEL_DS	((mm_segment_t) { (unsigned long) 0L })
+#define USER_DS		((mm_segment_t) { (unsigned long) -1L })
 
 #define VERIFY_READ    0
 #define VERIFY_WRITE   1
 
-#define get_fs()        (current->tss.current_ds)
+#define get_fs()        (current->thread.current_ds)
 #define get_ds()	(KERNEL_DS)
-#define set_fs(x)       (current->tss.current_ds=(x))
+#define set_fs(x)       (current->thread.current_ds=(x))
 
 #define segment_eq(a,b)	((a).seg == (b).seg)
 
@@ -50,7 +47,7 @@
  */
 #define __access_ok(addr,size,mask) \
         (((__signed__ long)((mask)&(addr | size | (addr+size)))) >= 0)
-#define __access_mask (-(long)(get_fs().seg))
+#define __access_mask ((long)(get_fs().seg))
 
 #define access_ok(type,addr,size) \
 __access_ok(((unsigned long)(addr)),(size),__access_mask)
@@ -72,34 +69,20 @@ extern inline int verify_area(int type, const void * addr, unsigned long size)
  * (a) re-use the arguments for side effects (sizeof is ok)
  * (b) require any knowledge of processes at this stage
  */
-#define put_user(x,ptr)	__put_user_check((x),(ptr),sizeof(*(ptr)),__access_mask)
-#define get_user(x,ptr) __get_user_check((x),(ptr),sizeof(*(ptr)),__access_mask)
+#define put_user(x,ptr)	\
+	__put_user_check((__typeof__(*(ptr)))(x),(ptr),sizeof(*(ptr)))
+#define get_user(x,ptr) \
+	__get_user_check((__typeof__(*(ptr)))(x),(ptr),sizeof(*(ptr)))
 
 /*
  * The "__xxx" versions do not do address space checking, useful when
  * doing multiple accesses to the same area (the user has to do the
  * checks by hand with "access_ok()")
  */
-#define __put_user(x,ptr) __put_user_nocheck((x),(ptr),sizeof(*(ptr)))
-#define __get_user(x,ptr) __get_user_nocheck((x),(ptr),sizeof(*(ptr)))
-
-/*
- * The "xxx_ret" versions return constant specified in third argument, if
- * something bad happens. These macros can be optimized for the
- * case of just returning from the function xxx_ret is used.
- */
-
-#define put_user_ret(x,ptr,ret) ({ \
-if (put_user(x,ptr)) return ret; })
-
-#define get_user_ret(x,ptr,ret) ({ \
-if (get_user(x,ptr)) return ret; })
-
-#define __put_user_ret(x,ptr,ret) ({ \
-if (__put_user(x,ptr)) return ret; })
-
-#define __get_user_ret(x,ptr,ret) ({ \
-if (__get_user(x,ptr)) return ret; })
+#define __put_user(x,ptr) \
+	__put_user_nocheck((__typeof__(*(ptr)))(x),(ptr),sizeof(*(ptr)))
+#define __get_user(x,ptr) \
+	__get_user_nocheck((__typeof__(*(ptr)))(x),(ptr),sizeof(*(ptr)))
 
 struct __large_struct { unsigned long buf[100]; };
 #define __m(x) (*(struct __large_struct *)(x))
@@ -129,14 +112,14 @@ case 8: __GET_USER_DW; break; \
 default: __get_user_unknown(); break; \
 } x = (__typeof__(*(ptr))) __gu_val; __gu_err; })
 
-#define __get_user_check(x,ptr,size,mask) ({ \
+#define __get_user_check(x,ptr,size) ({ \
 long __gu_err; \
 __typeof__(*(ptr)) __gu_val; \
 long __gu_addr; \
 __asm__("":"=r" (__gu_val)); \
 __gu_addr = (long) (ptr); \
 __asm__("":"=r" (__gu_err)); \
-if (__access_ok(__gu_addr,size,mask)) { \
+if (__access_ok(__gu_addr,size,__access_mask)) { \
 switch (size) { \
 case 1: __get_user_asm("lb"); break; \
 case 2: __get_user_asm("lh"); break; \
@@ -212,14 +195,14 @@ case 8: __PUT_USER_DW; break; \
 default: __put_user_unknown(); break; \
 } __pu_err; })
 
-#define __put_user_check(x,ptr,size,mask) ({ \
+#define __put_user_check(x,ptr,size) ({ \
 long __pu_err; \
 __typeof__(*(ptr)) __pu_val; \
 long __pu_addr; \
 __pu_val = (x); \
 __pu_addr = (long) (ptr); \
 __asm__("":"=r" (__pu_err)); \
-if (__access_ok(__pu_addr,size,mask)) { \
+if (__access_ok(__pu_addr,size,__access_mask)) { \
 switch (size) { \
 case 1: __put_user_asm("sb"); break; \
 case 2: __put_user_asm("sh"); break; \
@@ -265,15 +248,20 @@ __asm__ __volatile__( \
 
 extern void __put_user_unknown(void);
 
-#define copy_to_user_ret(to,from,n,retval) ({ \
-if (copy_to_user(to,from,n)) \
-        return retval; \
-})
-
-#define copy_from_user_ret(to,from,n,retval) ({ \
-if (copy_from_user(to,from,n)) \
-        return retval; \
-})
+/*
+ * We're generating jump to subroutines which will be outside the range of
+ * jump instructions
+ */
+#ifdef MODULE
+#define __MODULE_JAL(destination) \
+	".set\tnoat\n\t" \
+	"la\t$1, " #destination "\n\t" \
+	"jalr\t$1\n\t" \
+	".set\tat\n\t"
+#else
+#define __MODULE_JAL(destination) \
+	"jal\t" #destination "\n\t"
+#endif
 
 extern size_t __copy_user(void *__to, const void *__from, size_t __n);
 
@@ -289,7 +277,7 @@ extern size_t __copy_user(void *__to, const void *__from, size_t __n);
 		"move\t$4, %1\n\t" \
 		"move\t$5, %2\n\t" \
 		"move\t$6, %3\n\t" \
-		"jal\t__copy_user\n\t" \
+		__MODULE_JAL(__copy_user) \
 		"move\t%0, $6" \
 		: "=r" (__cu_len) \
 		: "r" (__cu_to), "r" (__cu_from), "r" (__cu_len) \
@@ -310,10 +298,12 @@ extern size_t __copy_user(void *__to, const void *__from, size_t __n);
 		"move\t$4, %1\n\t" \
 		"move\t$5, %2\n\t" \
 		"move\t$6, %3\n\t" \
+		".set\tnoreorder\n\t" \
+		__MODULE_JAL(__copy_user) \
 		".set\tnoat\n\t" \
 		"addu\t$1, %2, %3\n\t" \
 		".set\tat\n\t" \
-		"jal\t__copy_user\n\t" \
+		".set\treorder\n\t" \
 		"move\t%0, $6" \
 		: "=r" (__cu_len) \
 		: "r" (__cu_to), "r" (__cu_from), "r" (__cu_len) \
@@ -335,7 +325,7 @@ extern size_t __copy_user(void *__to, const void *__from, size_t __n);
 			"move\t$4, %1\n\t" \
 			"move\t$5, %2\n\t" \
 			"move\t$6, %3\n\t" \
-			"jal\t__copy_user\n\t" \
+			__MODULE_JAL(__copy_user) \
 			"move\t%0, $6" \
 			: "=r" (__cu_len) \
 			: "r" (__cu_to), "r" (__cu_from), "r" (__cu_len) \
@@ -357,10 +347,12 @@ extern size_t __copy_user(void *__to, const void *__from, size_t __n);
 			"move\t$4, %1\n\t" \
 			"move\t$5, %2\n\t" \
 			"move\t$6, %3\n\t" \
+			".set\tnoreorder\n\t" \
+			__MODULE_JAL(__copy_user) \
 			".set\tnoat\n\t" \
 			"addu\t$1, %2, %3\n\t" \
 			".set\tat\n\t" \
-			"jal\t__copy_user\n\t" \
+			".set\treorder\n\t" \
 			"move\t%0, $6" \
 			: "=r" (__cu_len) \
 			: "r" (__cu_to), "r" (__cu_from), "r" (__cu_len) \
@@ -378,7 +370,7 @@ __clear_user(void *addr, __kernel_size_t size)
 		"move\t$4, %1\n\t"
 		"move\t$5, $0\n\t"
 		"move\t$6, %2\n\t"
-		"jal\t__bzero\n\t"
+		__MODULE_JAL(__bzero)
 		"move\t%0, $6"
 		: "=r" (res)
 		: "r" (addr), "r" (size)
@@ -390,7 +382,7 @@ __clear_user(void *addr, __kernel_size_t size)
 #define clear_user(addr,n) ({ \
 void * __cl_addr = (addr); \
 unsigned long __cl_size = (n); \
-if (__cl_size && __access_ok(VERIFY_WRITE, ((unsigned long)(__cl_addr)), __cl_size)) \
+if (__cl_size && access_ok(VERIFY_WRITE, ((unsigned long)(__cl_addr)), __cl_size)) \
 __cl_size = __clear_user(__cl_addr, __cl_size); \
 __cl_size; })
 
@@ -407,7 +399,7 @@ __strncpy_from_user(char *__to, const char *__from, long __len)
 		"move\t$4, %1\n\t"
 		"move\t$5, %2\n\t"
 		"move\t$6, %3\n\t"
-		"jal\t__strncpy_from_user_nocheck_asm\n\t"
+		__MODULE_JAL(__strncpy_from_user_nocheck_asm)
 		"move\t%0, $2"
 		: "=r" (res)
 		: "r" (__to), "r" (__from), "r" (__len)
@@ -425,7 +417,7 @@ strncpy_from_user(char *__to, const char *__from, long __len)
 		"move\t$4, %1\n\t"
 		"move\t$5, %2\n\t"
 		"move\t$6, %3\n\t"
-		"jal\t__strncpy_from_user_asm\n\t"
+		__MODULE_JAL(__strncpy_from_user_asm)
 		"move\t%0, $2"
 		: "=r" (res)
 		: "r" (__to), "r" (__from), "r" (__len)
@@ -434,7 +426,6 @@ strncpy_from_user(char *__to, const char *__from, long __len)
 	return res;
 }
 
-
 /* Returns: 0 if bad, string length+1 (memory size) of string if ok */
 extern inline long __strlen_user(const char *s)
 {
@@ -442,7 +433,7 @@ extern inline long __strlen_user(const char *s)
 
 	__asm__ __volatile__(
 		"move\t$4, %1\n\t"
-		"jal\t__strlen_user_nocheck_asm\n\t"
+		__MODULE_JAL(__strlen_user_nocheck_asm)
 		"move\t%0, $2"
 		: "=r" (res)
 		: "r" (s)
@@ -457,11 +448,44 @@ extern inline long strlen_user(const char *s)
 
 	__asm__ __volatile__(
 		"move\t$4, %1\n\t"
-		"jal\t__strlen_user_asm\n\t"
+		__MODULE_JAL(__strlen_user_asm)
 		"move\t%0, $2"
 		: "=r" (res)
 		: "r" (s)
 		: "$2", "$4", "$8", "$31");
+
+	return res;
+}
+
+/* Returns: 0 if bad, string length+1 (memory size) of string if ok */
+extern inline long __strnlen_user(const char *s, long n)
+{
+	long res;
+
+	__asm__ __volatile__(
+		"move\t$4, %1\n\t"
+		"move\t$5, %2\n\t"
+		__MODULE_JAL(__strnlen_user_nocheck_asm)
+		"move\t%0, $2"
+		: "=r" (res)
+		: "r" (s), "r" (n)
+		: "$2", "$4", "$5", "$8", "$31");
+
+	return res;
+}
+
+extern inline long strnlen_user(const char *s, long n)
+{
+	long res;
+
+	__asm__ __volatile__(
+		"move\t$4, %1\n\t"
+		"move\t$5, %2\n\t"
+		__MODULE_JAL(__strnlen_user_asm)
+		"move\t%0, $2"
+		: "=r" (res)
+		: "r" (s), "r" (n)
+		: "$2", "$4", "$5", "$8", "$31");
 
 	return res;
 }
@@ -481,4 +505,4 @@ extern unsigned long search_exception_table(unsigned long addr);
 	fixup_unit;                                             \
 })
 
-#endif /* __ASM_MIPS_UACCESS_H */
+#endif /* _ASM_UACCESS_H */

@@ -1,11 +1,11 @@
-/* $Id: sgialib.h,v 1.2 1998/07/08 16:01:13 ralf Exp $
+/* $Id: sgialib.h,v 1.5 2000/03/19 01:28:58 ralf Exp $
  * sgialib.h: SGI ARCS firmware interface library for the Linux kernel.
  *
  * Copyright (C) 1996 David S. Miller (dm@engr.sgi.com)
  */
 
-#ifndef _MIPS_SGIALIB_H
-#define _MIPS_SGIALIB_H
+#ifndef _ASM_SGIALIB_H
+#define _ASM_SGIALIB_H
 
 #include <asm/sgiarcs.h>
 
@@ -14,10 +14,14 @@ extern struct linux_romvec *romvec;
 extern int prom_argc;
 extern char **prom_argv, **prom_envp;
 
-/* Init the PROM library and it's internal data structures.  Called
+extern int prom_flags;
+#define PROM_FLAG_ARCS  1
+
+/*
+ * Init the PROM library and it's internal data structures.  Called
  * at boot time from head.S before start_kernel is invoked.
  */
-extern int prom_init(int argc, char **argv, char **envp);
+extern int prom_init(int argc, char **argv, char **envp, int *prom_vec);
 
 /* Simple char-by-char console I/O. */
 extern void prom_putchar(char c);
@@ -31,6 +35,7 @@ extern void prom_printf(char *fmt, ...);
 struct prom_pmemblock {
 	unsigned long base; /* Within KSEG0. */
 	unsigned int size;  /* In bytes. */
+        unsigned int type;  /* free or prom memory */
 };
 
 /* Get next memory descriptor after CURR, returns first descriptor
@@ -71,14 +76,14 @@ extern pcomponent *prom_childadd(pcomponent *this, pcomponent *tmp, void *data);
 extern long prom_delcomponent(pcomponent *this);
 extern pcomponent *prom_componentbypath(char *path);
 
-/* This is called at prom_init time to setup the tags which the
- * MIPS kernel setup code wants to diddle with. 
+/* This is called at prom_init time to identify the
+ * ARC architecture we are running on
  */
-extern void prom_setup_archtags(void);
+extern void prom_identify_arch(void);
 
 /* Environemt variable routines. */
-extern char *prom_getenv(char *name);
-extern long prom_setenv(char *name, char *value);
+extern PCHAR ArcGetEnvironmentVariable(CHAR *name);
+extern LONG SetEnvironmentVariable(PCHAR name, PCHAR value);
 
 /* ARCS command line acquisition and parsing. */
 extern char *prom_getcmdline(void);
@@ -115,4 +120,4 @@ extern long prom_cfgsave(void);
 extern struct linux_sysid *prom_getsysid(void);
 extern void prom_cacheflush(void);
 
-#endif /* !(_MIPS_SGIALIB_H) */
+#endif /* _ASM_SGIALIB_H */

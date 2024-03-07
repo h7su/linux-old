@@ -25,6 +25,7 @@
  *		2 of the License, or (at your option) any later version.
  */
 
+#include <linux/config.h>
 #include <asm/errno.h>
 				
 /*
@@ -39,7 +40,7 @@ unsigned int csum_partial(const unsigned char * buff, int len, unsigned int sum)
 .align 4
 .globl csum_partial								
 		
-#if CPU!=686
+#ifndef CONFIG_X86_USE_PPRO_CHECKSUM
 
 	  /*		
 	   * Experiments with Ethernet and SLIP connections show that buff
@@ -114,12 +115,16 @@ csum_partial:
 	popl %esi
 	ret
 
-#else /* CPU==686 */
+#else
+
+/* Version for PentiumII/PPro */
 
 csum_partial:
-	movl 12(%esp),%eax	# Function arg: unsigned int sum
-	movl 8(%esp),%ecx	# Function arg: int len
-	movl 4(%esp),%esi	# Function arg:	const unsigned char *buf
+	pushl %esi
+	pushl %ebx
+	movl 20(%esp),%eax	# Function arg: unsigned int sum
+	movl 16(%esp),%ecx	# Function arg: int len
+	movl 12(%esp),%esi	# Function arg:	const unsigned char *buf
 
 	testl $2, %esi         
 	jnz 30f                 
@@ -204,9 +209,11 @@ csum_partial:
 	addl %ebx,%eax
 	adcl $0,%eax
 80: 
+	popl %ebx
+	popl %esi
 	ret
 				
-#endif /* CPU==686 */ 
+#endif
 
 /*
 unsigned int csum_partial_copy_generic (const char *src, char *dst,
@@ -239,7 +246,7 @@ unsigned int csum_partial_copy_generic (const char *src, char *dst,
 .align 4
 .globl csum_partial_copy_generic
 				
-#if CPU!=686
+#ifndef CONFIG_X86_USE_PPRO_CHECKSUM
 
 #define ARGBASE 16		
 #define FP		12
@@ -369,7 +376,7 @@ DST(	movb %cl, (%edi)	)
 
 #define ROUND1(x) \
 	SRC(movl x(%esi), %ebx	)	;	\
-	addl %ebx, %eax\n		;	\
+	addl %ebx, %eax			;	\
 	DST(movl %ebx, x(%edi)	)	; 
 
 #define ROUND(x) \
@@ -387,26 +394,32 @@ csum_partial_copy_generic:
 	movl ARGBASE+8(%esp),%edi	#dst	
 	movl ARGBASE+12(%esp),%ecx	#len
 	movl ARGBASE+16(%esp),%eax	#sum
-	movl %ecx, %edx  
+#	movl %ecx, %edx  
 	movl %ecx, %ebx  
+	movl %esi, %edx
 	shrl $6, %ecx     
 	andl $0x3c, %ebx  
 	negl %ebx
 	subl %ebx, %esi  
 	subl %ebx, %edi  
+	lea  -1(%esi),%edx
+	andl $-32,%edx
 	lea 3f(%ebx,%ebx), %ebx
 	testl %esi, %esi 
-	jmp *%ebx         
+	jmp *%ebx
 1:	addl $64,%esi
 	addl $64,%edi 
+	SRC(movb -32(%edx),%bl)	; SRC(movb (%edx),%bl)
 	ROUND1(-64) ROUND(-60) ROUND(-56) ROUND(-52)	
 	ROUND (-48) ROUND(-44) ROUND(-40) ROUND(-36)	
 	ROUND (-32) ROUND(-28) ROUND(-24) ROUND(-20)	
 	ROUND (-16) ROUND(-12) ROUND(-8)  ROUND(-4)	
 3:	adcl $0,%eax
+	addl $64, %edx
 	dec %ecx
 	jge 1b
-4:      andl $3, %edx
+4:	movl ARGBASE+12(%esp),%edx	#len
+	andl $3, %edx
 	jz 7f
 	cmpl $2, %edx
 	jb 5f
@@ -444,4 +457,4 @@ DST(	movb %dl, (%edi)         )
 #undef ROUND
 #undef ROUND1		
 		
-#endif	/* CPU==i686 */ 
+#endif

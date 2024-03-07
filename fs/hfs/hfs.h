@@ -80,9 +80,24 @@
 #define HFS_FK_RSRC	0xFF
 
 /* bits in hfs_fil_entry.Flags */
-#define HFS_FIL_LOCK	0x01
-#define HFS_FIL_THD	0x02
-#define HFS_FIL_USED	0x80
+#define HFS_FIL_LOCK	0x01  /* locked */
+#define HFS_FIL_THD	0x02  /* file thread */
+#define HFS_FIL_DOPEN   0x04  /* data fork open */
+#define HFS_FIL_ROPEN   0x08  /* resource fork open */
+#define HFS_FIL_DIR     0x10  /* directory (always clear) */
+#define HFS_FIL_RSRV1   0x20  /* reserved */
+#define HFS_FIL_NOCOPY  0x40  /* copy-protected file */
+#define HFS_FIL_USED	0x80  /* open */
+
+/* bits in hfs_dir_entry.Flags. dirflags is 16 bits. */
+#define HFS_DIR_LOCK        0x01  /* locked */
+#define HFS_DIR_THD         0x02  /* directory thread */
+#define HFS_DIR_INEXPFOLDER 0x04  /* in a shared area */
+#define HFS_DIR_MOUNTED     0x08  /* mounted */
+#define HFS_DIR_DIR         0x10  /* directory (always set) */
+#define HFS_DIR_EXPFOLDER   0x20  /* share point */
+#define HFS_DIR_RSRV1       0x40  /* reserved */
+#define HFS_DIR_RSRV2       0x80  /* reserved */
 
 /* Access types used when requesting access to a B-node */
 #define HFS_LOCK_NONE	0x0000	/* Illegal */
@@ -115,7 +130,7 @@
 struct hfs_name {
 	hfs_byte_t	Len;
 	hfs_byte_t	Name[31];
-};
+} __attribute__((packed));
 
 typedef struct {
 	hfs_word_t	v;
@@ -135,21 +150,21 @@ typedef struct {
 	hfs_word_t	 fdFlags;
 	hfs_point_t	 fdLocation;
 	hfs_word_t	 fdFldr;
-} hfs_finfo_t;
+} __attribute__((packed)) hfs_finfo_t;
 
 typedef struct {
 	hfs_word_t	fdIconID;
 	hfs_byte_t	fdUnused[8];
 	hfs_word_t	fdComment;
 	hfs_lword_t	fdPutAway;
-} hfs_fxinfo_t;
+} __attribute__((packed)) hfs_fxinfo_t;
 
 typedef struct {
 	hfs_rect_t	frRect;
 	hfs_word_t	frFlags;
 	hfs_point_t	frLocation;
 	hfs_word_t	frView;
-} hfs_dinfo_t;
+} __attribute__((packed)) hfs_dinfo_t;
 
 typedef struct {
 	hfs_point_t	frScroll;
@@ -157,7 +172,7 @@ typedef struct {
 	hfs_word_t	frUnused;
 	hfs_word_t	frComment;
 	hfs_lword_t	frPutAway;
-} hfs_dxinfo_t;
+} __attribute__((packed)) hfs_dxinfo_t;
 
 union hfs_finder_info {
 	struct {
@@ -174,7 +189,7 @@ union hfs_finder_info {
 struct hfs_bkey {
 	hfs_byte_t	KeyLen;		/* number of bytes in the key */
 	hfs_byte_t	value[1];	/* (KeyLen) bytes of key */
-};
+} __attribute__((packed));
 
 /* Cast to a pointer to a generic bkey */
 #define	HFS_BKEY(X)	(((void)((X)->KeyLen)), ((struct hfs_bkey *)(X)))
@@ -185,7 +200,7 @@ struct hfs_cat_key {
 	hfs_byte_t	Resrv1;	/* padding */
 	hfs_lword_t	ParID;	/* CNID of the parent dir */
 	struct hfs_name	CName;	/* The filename of the entry */
-};
+} __attribute__((packed));
 
 /* The key used in the extents b-tree: */
 struct hfs_ext_key {
@@ -193,7 +208,7 @@ struct hfs_ext_key {
 	hfs_byte_t	FkType;	/* HFS_FK_{DATA,RSRC} */
 	hfs_lword_t	FNum;	/* The File ID of the file */
 	hfs_word_t	FABN;	/* allocation blocks number*/
-};
+} __attribute__((packed));
 
 /*======== Data structures kept in memory ========*/
 
@@ -478,6 +493,9 @@ extern void hfs_extent_out(const struct hfs_fork *, hfs_byte_t *);
 extern int hfs_extent_map(struct hfs_fork *, int, int);
 extern void hfs_extent_adj(struct hfs_fork *);
 extern void hfs_extent_free(struct hfs_fork *);
+
+/* file.c */
+extern int hfs_get_block(struct inode *, long, struct buffer_head *, int);
 
 /* mdb.c */
 extern struct hfs_mdb *hfs_mdb_get(hfs_sysmdb, int, hfs_s32);

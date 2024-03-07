@@ -71,7 +71,7 @@ struct raw_mdb {
 	hfs_byte_t	drXTExtRec[12];	/* extents B-tree's first 3 extents */
 	hfs_lword_t	drCTFlSize;	/* bytes in the catalog B-tree */
 	hfs_byte_t	drCTExtRec[12];	/* catalog B-tree's first 3 extents */
-};
+} __attribute__((packed));
 
 /*================ Global functions ================*/
 
@@ -99,7 +99,9 @@ struct hfs_mdb *hfs_mdb_get(hfs_sysmdb sys_mdb, int readonly,
 	memset(mdb, 0, sizeof(*mdb));
 	mdb->magic = HFS_MDB_MAGIC;
 	mdb->sys_mdb = sys_mdb;
-	INIT_LIST_HEAD(&mdb->entry_dirty);  
+	INIT_LIST_HEAD(&mdb->entry_dirty);
+	hfs_init_waitqueue(&mdb->rename_wait);
+	hfs_init_waitqueue(&mdb->bitmap_wait);
 
 	/* See if this is an HFS filesystem */
 	buf = hfs_buffer_get(sys_mdb, part_start + HFS_MDB_BLK, 1);

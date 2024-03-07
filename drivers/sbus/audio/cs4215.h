@@ -1,4 +1,4 @@
-/*
+/* $Id: cs4215.h,v 1.8 2000/10/27 07:01:38 uzi Exp $
  * drivers/sbus/audio/cs4215.h
  *
  * Copyright (C) 1997 Rudolf Koenig (rfkoenig@immd4.informatik.uni-erlangen.de)
@@ -11,11 +11,10 @@
 struct cs4215 {
 	__u8	data[4];	/* Data mode: Time slots 5-8 */
 	__u8	ctrl[4];	/* Ctrl mode: Time slots 1-4 */
-	__volatile__ struct dbri_mem td;
-	__volatile__ struct dbri_mem rd;
 	__u8	onboard;
-	__u32	status;
-        __u32	version;
+	__u8	offset;		/* Bit offset from frame sync to time slot 1 */
+	volatile __u32	status;
+	volatile __u32	version;
 };
 
 
@@ -104,7 +103,7 @@ static struct {
 
 /* Time Slot 6, Output Setting  */
 #define CS4215_RO(v)	v	/* Right Output Attenuation 0x3f: -94.5 dB */
-#define CS4215_SE	(1<<6)	/* Line Out Enable */
+#define CS4215_SE	(1<<6)	/* Speaker Enable */
 #define CS4215_ADI	(1<<7)	/* A/D Data Invalid: Busy in calibration */
 
 /* Time Slot 7, Input Setting */
@@ -118,4 +117,4 @@ static struct {
 #define CS4215_RG(v)	v	/* Right Gain Setting 0xf: 22.5 dB */
 #define CS4215_MA(v)	(v<<4)	/* Monitor Path Attenuation 0xf: mute */
 
-#endif
+#endif /* _CS4215_H_ */

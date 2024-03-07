@@ -10,240 +10,220 @@
 # License.  See the file "COPYING" in the main directory of this archive
 # for more details.
 #
-# Copyright (C) 1995, 1996 by Russell King
+# Copyright (C) 1995-2000 by Russell King
 
-CFLAGS_PROC		:=
-ASFLAGS_PROC		:=
+OBJCOPY		:= $(CROSS_COMPILE)objcopy -O binary -R .note -R .comment -S
+CPP		:= $(CC) -E
+LINKFLAGS	:= -p -X -T arch/arm/vmlinux.lds
+ARCHCC		:= $(word 1,$(CC))
 
-# All processors get `-mshort-load-bytes' for now, to work around alignment
-# problems.  This is more of a hack that just happens to work than a real fix
-# but it will do for now.
+AFLAGS		+= -mno-fpu
+CFLAGS_PIPE	:= -pipe
+CFLAGS		:= $(CFLAGS) $(CFLAGS_PIPE) -msoft-float
 
+ifdef CONFIG_FRAME_POINTER
+CFLAGS		:= $(CFLAGS:-fomit-frame-pointer=)
+endif
+
+ifdef CONFIG_DEBUG_INFO
+CFLAGS		+= -g
+endif
+
+GZFLAGS		= -9
+
+# Ensure this is ld "2.9.4" or later
+NEW_LINKER	:= $(shell $(LD) --gc-sections --version >/dev/null 2>&1; echo $$?)
+
+ifneq ($(NEW_LINKER),0)
+dummy:;		@echo '*** ${VERSION}.${PATCHLEVEL} kernels no longer build correctly with old versions of binutils.'
+		@echo '*** Please upgrade your binutils to 2.9.5.'
+		@false
+endif
+
+# GCC 2.7 uses different options to later compilers; sort out which we have
+NEW_GCC		:= $(shell $(CC) --version 2>&1 | grep '^2\.7' > /dev/null; echo $$?)
+
+#
+# select flags depending on the compiler
+#
+ifneq ($(NEW_GCC),0)
+CFLAGS			+= -mshort-load-bytes
+CFLAGS_PROC_CPU_26	:= -mcpu=arm3 -mapcs-26 -Os
+CFLAGS_PROC_CPU_32v3	:= -march=armv3
+CFLAGS_PROC_CPU_32v4	:= -march=armv4
+else
+CFLAGS			+= -DNO_TEXT_SECTIONS
+CFLAGS_PROC_CPU_26	:= -m3
+CFLAGS_PROC_CPU_32v3	:= -m6
+CFLAGS_PROC_CPU_32v4	:= -m6
+endif
+
+#
+# Select CPU dependent flags
+#
 ifeq ($(CONFIG_CPU_26),y)
-  PROCESSOR		 = armo
-  TEXTADDR		 = 0x02080000
-  ZTEXTADDR		 = 0x01800000
-  ZRELADDR		 = 0x02080000
-  ifeq ($(CONFIG_BINUTILS_NEW),y)
-    CFLAGS_PROC		+= -mapcs-26 -mshort-load-bytes
-    ifeq ($(CONFIG_CPU_ARM2),y)
-      CFLAGS_PROC	+= -mcpu=arm2
-      ASFLAGS_PROC	+= -m2
-    endif
-    ifeq ($(CONFIG_CPU_ARM3),y)
-      CFLAGS_PROC	+= -mcpu=arm3
-      ASFLAGS_PROC	+= -m3
-    endif
-  else
-    ifeq ($(CONFIG_CPU_ARM2),y)
-      CFLAGS_PROC	+= -m2
-      ASFLAGS_PROC	+= -m2
-    endif
-    ifeq ($(CONFIG_CPU_ARM3),y)
-      CFLAGS_PROC	+= -m3
-      ASFLAGS_PROC	+= -m3
-    endif
-  endif
+ PROCESSOR	 = armo
+ TEXTADDR	 = 0x02080000
+ CFLAGS		+= $(CFLAGS_PROC_CPU_26)
+ AFLAGS		+= -mapcs-26
 endif
 
 ifeq ($(CONFIG_CPU_32),y)
-  PROCESSOR		 = armv
-  TEXTADDR		 = 0xC0008000
-  ifeq ($(CONFIG_BINUTILS_NEW),y)
-    CFLAGS_PROC		+= -mapcs-32 -mshort-load-bytes
-    ifeq ($(CONFIG_CPU_ARM6),y)
-      CFLAGS_PROC	+= -mcpu=arm6
-    endif
-    ifeq ($(CONFIG_CPU_ARM7),y)
-      CFLAGS_PROC	+= -mcpu=arm7
-    endif
-    ifeq ($(CONFIG_CPU_SA110),y)
-      CFLAGS_PROC	+= -mcpu=strongarm110
-    endif
-  else
-    CFLAGS_PROC		+= -m6
-  endif
-  ASFLAGS_PROC		+= -m6
+ PROCESSOR	 = armv
+ TEXTADDR	 = 0xC0008000
+ ifeq ($(CONFIG_CPU_32v4),y)
+  CFLAGS	+= $(CFLAGS_PROC_CPU_32v4)
+  AFLAGS	+= -mapcs-32 -marmv4
+ else
+  CFLAGS	+= $(CFLAGS_PROC_CPU_32v3)
+  AFLAGS	+= -mapcs-32 -marmv3m
+ endif
+
+ opt-$(CONFIG_CPU_ARM6)		:= -mtune=arm6
+ opt-$(CONFIG_CPU_ARM7)		:= -mtune=arm7
+ opt-$(CONFIG_CPU_ARM720)	:= -mtune=arm7tdmi
+ opt-$(CONFIG_CPU_ARM920)	:= -mtune=arm9tdmi
+ opt-$(CONFIG_CPU_SA110)	:= -mtune=strongarm110
+ opt-$(CONFIG_CPU_SA1100)	:= -mtune=strongarm110
+
+ ifneq ($(NEW_GCC),0)
+ CFLAGS	+= $(opt-y)
+ endif
 endif
 
-# Processor Architecture
-# CFLAGS_PROC - processor dependent CFLAGS
-# PROCESSOR - processor type
-# TEXTADDR - Uncompressed kernel link text address
-# ZTEXTADDR - Compressed kernel link text address
-# ZRELADDR - Compressed kernel relocating address (point at which uncompressed kernel is loaded).
-#
+LIBGCC		:= $(shell $(CC) $(CFLAGS) --print-libgcc-file-name)
 
-COMPRESSED_HEAD	 = head.o
+export	LIBGCC MACHINE PROCESSOR TEXTADDR GZFLAGS
 
-ifeq ($(CONFIG_ARCH_A5K),y)
-MACHINE		 = a5k
-ARCHDIR		 = arc
-COMPRESSED_EXTRA = $(TOPDIR)/arch/arm/lib/ll_char_wr.o
-endif
-
-ifeq ($(CONFIG_ARCH_ARC),y)
+ifeq ($(CONFIG_ARCH_ARCA5K),y)
 MACHINE		 = arc
-ARCHDIR		 = arc
-COMPRESSED_EXTRA = $(TOPDIR)/arch/arm/lib/ll_char_wr.o
 endif
 
 ifeq ($(CONFIG_ARCH_RPC),y)
 MACHINE		 = rpc
-ARCHDIR		 = rpc
-COMPRESSED_EXTRA = $(TOPDIR)/arch/arm/lib/ll_char_wr.o
-ZTEXTADDR	 = 0x10008000
-ZRELADDR	 = 0x10008000
 endif
 
 ifeq ($(CONFIG_ARCH_EBSA110),y)
 MACHINE		 = ebsa110
-ARCHDIR		 = ebsa110
-ZTEXTADDR	 = 0x00008000
-ZRELADDR	 = 0x00008000
 endif
 
-ifeq ($(CONFIG_ARCH_EBSA285),y)
-MACHINE		 = ebsa285
-ARCHDIR		 = ebsa285
-ZTEXTADDR	 = 0x00008000
-ZRELADDR	 = 0x00008000
+ifeq ($(CONFIG_ARCH_CLPS7500),y)
+MACHINE		 = clps7500
+INCDIR		 = cl7500
+endif
+
+ifeq ($(CONFIG_FOOTBRIDGE),y)
+MACHINE		 = footbridge
+INCDIR		 = ebsa285
+endif
+
+ifeq ($(CONFIG_ARCH_CO285),y)
+TEXTADDR	 = 0x60008000
+MACHINE		 = footbridge
+INCDIR		 = ebsa285
 endif
 
 ifeq ($(CONFIG_ARCH_NEXUSPCI),y)
 MACHINE		 = nexuspci
-ARCHDIR		 = nexuspci
-ZTEXTADDR	 = 0x40200000
-ZRELADDR	 = 0x40008000
-COMPRESSED_EXTRA = $(TOPDIR)/arch/arm/lib/ll_char_wr_scc.o
-COMPRESSED_HEAD	 = head-nexuspci.o
 endif
 
-ifeq ($(CONFIG_ARCH_VNC),y)
-TEXTADDR	 = 0xC000C000
-MACHINE		 = vnc
-ARCHDIR		 = vnc
+ifeq ($(CONFIG_ARCH_SHARK),y)
+MACHINE		 = shark
 endif
 
-ifeq ($(CONFIG_ARCH_TBOX),y)
-MACHINE		 = tbox
-ARCHDIR		 = tbox
-ZTEXTADDR	 = 0x80008000
-ZRELDIR		 = 0x80008000
+ifeq ($(CONFIG_ARCH_SA1100),y)
+MACHINE		 = sa1100
 endif
 
-PERL		 = perl
-ifeq ($(CONFIG_BINUTILS_NEW),y)
-LD		 = $(CROSS_COMPILE)ld -m elf32arm
-else
-LD		 = $(CROSS_COMPILE)ld -m elf_arm
+ifeq ($(CONFIG_ARCH_L7200),y)
+MACHINE		 = l7200
 endif
-OBJCOPY		 = $(CROSS_COMPILE)objcopy -O binary -R .note -R .comment -S
-OBJDUMP		 = $(CROSS_COMPILE)objdump
-CPP		 = $(CC) -E
-ARCHCC		:= $(word 1,$(CC))
-GCCLIB		:= `$(CC) $(CFLAGS_PROC) --print-libgcc-file-name`
-#GCCARCH		:= -B/usr/bin/arm-linuxelf- 
-HOSTCFLAGS	:= $(CFLAGS:-fomit-frame-pointer=)
-ifeq ($(CONFIG_FRAME_POINTER),y)
-CFLAGS		:= $(CFLAGS:-fomit-frame-pointer=)
-endif
-CFLAGS		:= $(CFLAGS_PROC) $(CFLAGS) -pipe
-ASFLAGS		:= $(ASFLAGS_PROC) $(ASFLAGS)
-LINKFLAGS	 = -T $(TOPDIR)/arch/arm/vmlinux-$(PROCESSOR).lds -e stext -Ttext $(TEXTADDR)
-ZLINKFLAGS	 = -Ttext $(ZTEXTADDR)
 
-SUBDIRS		:= $(SUBDIRS:drivers=arch/arm/drivers) arch/arm/lib arch/arm/kernel arch/arm/mm
-HEAD		:= arch/arm/kernel/head-$(PROCESSOR).o arch/arm/kernel/init_task.o
+ifeq ($(CONFIG_ARCH_INTEGRATOR),y)
+MACHINE		 = integrator
+endif
+
+# Only set INCDIR if its not already defined above
+# Grr, ?= doesn't work as all the other assignment operators do.  Make bug?
+ifeq ($(origin INCDIR), undefined)
+INCDIR		:= $(MACHINE)
+endif
+
+# If we have a machine-specific directory, then include it in the build.
+MACHDIR		:= arch/arm/mach-$(MACHINE)
+ifeq ($(MACHDIR),$(wildcard $(MACHDIR)))
+SUBDIRS		+= $(MACHDIR)
+CORE_FILES	:= $(MACHDIR)/$(MACHINE).o $(CORE_FILES)
+endif
+
+HEAD		:= arch/arm/kernel/head-$(PROCESSOR).o \
+		   arch/arm/kernel/init_task.o
+SUBDIRS		+= arch/arm/kernel arch/arm/mm arch/arm/lib \
+		   arch/arm/nwfpe
 CORE_FILES	:= arch/arm/kernel/kernel.o arch/arm/mm/mm.o $(CORE_FILES)
-LIBS		:= arch/arm/lib/lib.a $(LIBS) $(GCCLIB)
+LIBS		:= arch/arm/lib/lib.o arch/arm/lib/lib.a $(LIBS) $(LIBGCC)
 
-BLOCK_DRIVERS	:= drivers/block/block.a
-CDROM_DRIVERS	:= drivers/cdrom/cdrom.a
-ifeq ($(CONFIG_FB),y)
-CHAR_DRIVERS	:= arch/arm/drivers/char1/char1.a drivers/char/char.a arch/arm/drivers/char1/char1.a
-else
-ifeq ($(CONFIG_VGA_CONSOLE),y)
-CHAR_DRIVERS	:= arch/arm/drivers/char1/char1.a drivers/char/char.a arch/arm/drivers/char1/char1.a
-else
-CHAR_DRIVERS	:= arch/arm/drivers/char/char.a
+ifeq ($(CONFIG_NWFPE),y)
+LIBS		:= arch/arm/nwfpe/math-emu.o $(LIBS)
 endif
-endif
-MISC_DRIVERS	:= drivers/misc/misc.a
-NET_DRIVERS	:= drivers/net/net.a
-PARIDE_DRIVERS	:= drivers/block/paride/paride.a
-PCI_DRIVERS	:= drivers/pci/pci.a
-SCSI_DRIVERS	:= drivers/scsi/scsi.a
-SOUND_DRIVERS	:= drivers/sound/sound.a
-VIDEO_DRIVERS	:= drivers/video/video.a
-PNP_DRIVERS	:= drivers/pnp/pnp.a
 
 ifeq ($(CONFIG_ARCH_ACORN),y)
-BLOCK_DRIVERS	+= drivers/acorn/block/acorn-block.a
-CHAR_DRIVERS	+= drivers/acorn/char/acorn-char.a
-NET_DRIVERS	+= drivers/acorn/net/acorn-net.a drivers/net/net.a
-SCSI_DRIVERS	+= drivers/acorn/scsi/acorn-scsi.a
+SUBDIRS		+= drivers/acorn
+DRIVERS		+= drivers/acorn/block/acorn-block.a
+DRIVERS		+= drivers/acorn/char/acorn-char.o
+DRIVERS		+= drivers/acorn/net/acorn-net.o
+DRIVERS		+= drivers/acorn/scsi/acorn-scsi.a
 endif
 
-DRIVERS		:= $(BLOCK_DRIVERS) $(CHAR_DRIVERS) $(MISC_DRIVERS) $(NET_DRIVERS)
-
-ifeq ($(CONFIG_FB),y)
-DRIVERS		:= $(DRIVERS) $(VIDEO_DRIVERS)
-else
-ifeq ($(CONFIG_VGA_CONSOLE),y)
-DRIVERS		:= $(DRIVERS) $(VIDEO_DRIVERS)
-endif
-endif
-ifeq ($(CONFIG_SCSI),y)
-DRIVERS		:= $(DRIVERS) $(SCSI_DRIVERS)
-endif
-ifneq ($(CONFIG_CD_NO_IDESCSI)$(CONFIG_BLK_DEV_IDECD)$(CONFIG_BLK_DEV_SR),)
-DRIVERS		:= $(DRIVERS) $(CDROM_DRIVERS)
-endif
-ifdef CONFIG_PCI
-DRIVERS		:= $(DRIVERS) $(PCI_DRIVERS)
-endif
-ifeq ($(CONFIG_SOUND),y)
-DRIVERS		:= $(DRIVERS) $(SOUND_DRIVERS)
-endif
-ifeq ($(CONFIG_PARIDE),y)
-DRIVERS		:= $(DRIVERS) $(PARIDE_DRIVERS)
-endif
-ifdef CONFIG_PNP
-DRIVERS		:= $(DRIVERS) $(PNP_DRIVERS)
+ifeq ($(CONFIG_ARCH_CLPS7500),y)
+SUBDIRS		+= drivers/acorn/char
+DRIVERS		+= drivers/acorn/char/acorn-char.o
 endif
 
-symlinks::
+MAKEBOOT	 = $(MAKE) -C arch/$(ARCH)/boot
+
+# The following is a hack to get 'constants.h' up
+# to date before starting compilation
+
+$(patsubst %, _dir_%, $(SUBDIRS)) init/main.o init/version.o : \
+	include/asm-arm/mach-types.h
+
+$(patsubst %, _dir_%, $(SUBDIRS)) : constants
+
+include/asm-arm/mach-types.h: arch/arm/tools/mach-types  \
+			      arch/arm/tools/gen-mach-types
+	@awk -f arch/arm/tools/gen-mach-types arch/arm/tools/mach-types > $@
+
+constants: dummy
+	@$(MAKE) -C arch/arm/lib constants.h
+
+symlinks: archsymlinks
+
+archsymlinks:
 	$(RM) include/asm-arm/arch include/asm-arm/proc
-	(cd include/asm-arm; ln -sf arch-$(ARCHDIR) arch; ln -sf proc-$(PROCESSOR) proc)
+	(cd include/asm-arm; ln -sf arch-$(INCDIR) arch; ln -sf proc-$(PROCESSOR) proc)
 
-# Once we've finished integrating the sources, the @$(MAKE) will disappear
+vmlinux: arch/arm/vmlinux.lds
+
+arch/arm/vmlinux.lds: arch/arm/vmlinux-$(PROCESSOR).lds.in dummy
+	@sed 's/TEXTADDR/$(TEXTADDR)/' <$< >$@
+
+arch/arm/kernel arch/arm/mm arch/arm/lib: dummy
+	$(MAKE) CFLAGS="$(CFLAGS) $(CFLAGS_KERNEL)" $(subst $@, _dir_$@, $@)
+
+bzImage zImage zinstall Image bootpImage install: vmlinux
+	@$(MAKEBOOT) $@
+
 archmrproper:
-	rm -f include/asm-arm/arch include/asm-arm/proc
-	@$(MAKE) -C arch/$(ARCH)/drivers mrproper
+	$(RM) include/asm-arm/arch include/asm-arm/proc
 
-arch/arm/kernel: dummy
-	$(MAKE) linuxsubdirs SUBDIRS=arch/arm/kernel
+archclean:
+	@$(MAKEBOOT) clean
+	$(RM) arch/arm/lib/constants.h arch/arm/vmlinux.lds
+	$(RM) include/asm-arm/mach-types.h
 
-arch/arm/mm: dummy
-	$(MAKE) linuxsubdirs SUBDIRS=arch/arm/mm
-
-arch/arm/lib: dummy
-	$(MAKE) linuxsubdirs SUBDIRS=arch/arm/lib
-
-MAKEBOOT = $(MAKE) -C arch/$(ARCH)/boot
-
-zImage: vmlinux
-	@$(MAKEBOOT) zImage
-
-zinstall: vmlinux
-	@$(MAKEBOOT) zinstall
-
-Image: vmlinux
-	@$(MAKEBOOT) Image
-
-install: vmlinux
-	@$(MAKEBOOT) install
+archdep: archsymlinks
+	@$(MAKEBOOT) dep
 
 # My testing targets (that short circuit a few dependencies)
 zImg:;	@$(MAKEBOOT) zImage
@@ -251,10 +231,25 @@ Img:;	@$(MAKEBOOT) Image
 i:;	@$(MAKEBOOT) install
 zi:;	@$(MAKEBOOT) zinstall
 
-archclean:
-	@$(MAKEBOOT) clean
-	$(RM) arch/arm/lib/constants.h
+#
+# Configuration targets.  Use these to select a
+# configuration for your architecture
+CFGS=	a5k_config		ebsa110_config		\
+	footbridge_config	rpc_config		\
+	brutus_config		victor_config		\
+	empeg_config		thinclient_config	\
+	assabet_config		lart_config		\
+	cerf_config		lusl7200_config 
 
-archdep:
-	@$(MAKEBOOT) dep
-sed -e /^MACHINE..*=/s,= .*,= rpc,;/^PROCESSOR..*=/s,= .*,= armv, linux/arch/arm/Makefile.normal
+$(CFGS):
+	@( \
+	CFG=$(@:_config=); \
+	if [ -f arch/arm/def-configs/$$CFG ]; then \
+	  $(RM) arch/arm/defconfig; \
+	  cp arch/arm/def-configs/$$CFG arch/arm/defconfig; \
+	  echo "*** Default configuration for $$CFG installed"; \
+	  echo "*** Next, you may run 'make oldconfig'"; \
+	else \
+	  echo "$$CFG does not exist"; \
+	fi; \
+	)

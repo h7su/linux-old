@@ -1,4 +1,4 @@
-/* $Id: timod.c,v 1.1 1998/03/26 08:46:18 jj Exp $
+/* $Id: timod.c,v 1.10 2000/07/28 12:15:02 davem Exp $
  * timod.c: timod emulation.
  *
  * Copyright (C) 1998 Patrik Rak (prak3264@ss1000.ms.mff.cuni.cz)
@@ -15,8 +15,11 @@
 #include <linux/smp_lock.h>
 #include <linux/ioctl.h>
 #include <linux/fs.h>
+#include <linux/file.h>
 #include <linux/netdevice.h>
 #include <linux/poll.h>
+
+#include <net/sock.h>
 
 #include <asm/uaccess.h>
 #include <asm/termios.h>
@@ -24,18 +27,13 @@
 #include "conv.h"
 #include "socksys.h"
 
-extern char *getname32(u32 filename);
-#define putname32 putname
-
 extern asmlinkage int sys_ioctl(unsigned int fd, unsigned int cmd, 
 	unsigned long arg);
 extern asmlinkage int sys32_ioctl(unsigned int fd, unsigned int cmd,
 	u32 arg);
 asmlinkage int solaris_ioctl(unsigned int fd, unsigned int cmd, u32 arg);
 
-#ifdef __SMP__
 spinlock_t timod_pagelock = SPIN_LOCK_UNLOCKED;
-#endif
 static char * page = NULL ;
 
 #ifndef DEBUG_SOLARIS_KMALLOC
@@ -76,7 +74,7 @@ void mykfree(void *p)
 
 #define BUF_SIZE	PAGE_SIZE
 #define PUT_MAGIC(a,m)
-#define CHECK_MAGIC(a,m)
+#define SCHECK_MAGIC(a,m)
 #define BUF_OFFSET	0
 #define MKCTL_TRAILER	0
 
@@ -86,7 +84,7 @@ void mykfree(void *p)
 #define BUFPAGE_MAGIC	0xBADC0DEDDEADBABEL
 #define MKCTL_MAGIC	0xDEADBABEBADC0DEDL
 #define PUT_MAGIC(a,m)	do{(*(u64*)(a))=(m);}while(0)
-#define CHECK_MAGIC(a,m)	do{if((*(u64*)(a))!=(m))printk("%s,%u,%s(): magic %08x at %p corrupted!\n",\
+#define SCHECK_MAGIC(a,m)	do{if((*(u64*)(a))!=(m))printk("%s,%u,%s(): magic %08x at %p corrupted!\n",\
 				__FILE__,__LINE__,__FUNCTION__,(m),(a));}while(0)
 #define BUF_OFFSET	sizeof(u64)
 #define MKCTL_TRAILER	sizeof(u64)
@@ -117,8 +115,8 @@ static void putpage(char *p)
 {
 	SOLD("putting page");
 	p = p - BUF_OFFSET;
-	CHECK_MAGIC(p,BUFPAGE_MAGIC);
-	CHECK_MAGIC(p+PAGE_SIZE-sizeof(u64),BUFPAGE_MAGIC);
+	SCHECK_MAGIC(p,BUFPAGE_MAGIC);
+	SCHECK_MAGIC(p+PAGE_SIZE-sizeof(u64),BUFPAGE_MAGIC);
 	spin_lock(&timod_pagelock);
 	if (page) {
 		spin_unlock(&timod_pagelock);
@@ -153,8 +151,10 @@ static void timod_wake_socket(unsigned int fd)
 	SOLD("wakeing socket");
 	sock = &current->files->fd[fd]->f_dentry->d_inode->u.socket_i;
 	wake_up_interruptible(&sock->wait);
-	if (sock->fasync_list && !(sock->flags & SO_WAITDATA))
-		kill_fasync(sock->fasync_list, SIGIO);
+	read_lock(&sock->sk->callback_lock);
+	if (sock->fasync_list && !test_bit(SOCK_ASYNC_WAITDATA, &sock->flags))
+		__kill_fasync(sock->fasync_list, SIGIO, POLL_IN);
+	read_unlock(&sock->sk->callback_lock);
 	SOLD("done");
 }
 
@@ -617,22 +617,6 @@ int timod_putmsg(unsigned int fd, char *ctl_buf, int ctl_len,
 	return -EINVAL;
 }
 
-/* copied directly from fs/select.c */
-
-static void free_wait(poll_table * p)
-{
-	struct poll_table_entry * entry = p->entry + p->nr;
-
-	SOLD("entry");
-	while (p->nr > 0) {
-		p->nr--;
-		entry--;
-		remove_wait_queue(entry->wait_address,&entry->wait);
-	}
-	SOLD("done");
-}
-
-
 int timod_getmsg(unsigned int fd, char *ctl_buf, int ctl_maxlen, s32 *ctl_len,
 			char *data_buf, int data_maxlen, s32 *data_len, int *flags_p)
 {
@@ -668,18 +652,12 @@ int timod_getmsg(unsigned int fd, char *ctl_buf, int ctl_maxlen, s32 *ctl_len,
 	}
 	if (!(filp->f_flags & O_NONBLOCK)) {
 		poll_table wait_table, *wait;
-		struct poll_table_entry *entry;
-		SOLD("getting poll_table");
-		entry = (struct poll_table_entry *)__get_free_page(GFP_KERNEL);
-		if (!entry)
-			return -ENOMEM;
-		SOLD("got one");
-		wait_table.nr = 0;
-		wait_table.entry = entry;
+
+		poll_initwait(&wait_table);
 		wait = &wait_table;
 		for(;;) {
 			SOLD("loop");
-			current->state = TASK_INTERRUPTIBLE;
+			set_current_state(TASK_INTERRUPTIBLE);
 			/* ! ( l<0 || ( l>=0 && ( ! pfirst || (flags == HIPRI && pri != HIPRI) ) ) ) */ 
 			/* ( ! l<0 && ! ( l>=0 && ( ! pfirst || (flags == HIPRI && pri != HIPRI) ) ) ) */ 
 			/* ( l>=0 && ( ! l>=0 || ! ( ! pfirst || (flags == HIPRI && pri != HIPRI) ) ) ) */ 
@@ -703,13 +681,17 @@ int timod_getmsg(unsigned int fd, char *ctl_buf, int ctl_maxlen, s32 *ctl_len,
 				SOLD("avoiding lockup");
 				break ;
 			}
+			if(wait_table.error) {
+				SOLD("wait-table error");
+				poll_freewait(&wait_table);
+				return wait_table.error;
+			}
 			SOLD("scheduling");
 			schedule();
 		}
 		SOLD("loop done");
 		current->state = TASK_RUNNING;
-		free_wait(&wait_table);
-		free_page((unsigned long)entry);
+		poll_freewait(&wait_table);
 		if (signal_pending(current)) {
 			SOLD("signal pending");
 			return -EINTR;
@@ -721,7 +703,7 @@ int timod_getmsg(unsigned int fd, char *ctl_buf, int ctl_maxlen, s32 *ctl_len,
 #define min(a,b) ((a)<(b)?(a):(b))
 #endif
 		int l = min(ctl_maxlen, it->length);
-		CHECK_MAGIC((char*)((u64)(((char *)&it->type)+sock->offset+it->length+7)&~7),MKCTL_MAGIC);
+		SCHECK_MAGIC((char*)((u64)(((char *)&it->type)+sock->offset+it->length+7)&~7),MKCTL_MAGIC);
 		SOLD("purting ctl data");
 		if(copy_to_user(ctl_buf,
 			(char*)&it->type + sock->offset, l))

@@ -27,7 +27,7 @@ extern struct vt_struct {
 	struct vt_mode	vt_mode;
 	int		vt_pid;
 	int		vt_newvt;
-	struct wait_queue *paste_wait;
+	wait_queue_head_t paste_wait;
 } *vt_cons[MAX_NR_CONSOLES];
 
 void (*kd_mksound)(unsigned int hz, unsigned int ticks);
@@ -35,7 +35,6 @@ void (*kd_mksound)(unsigned int hz, unsigned int ticks);
 /* console.c */
 
 struct console_font_op;
-struct consw;
 
 int vc_allocate(unsigned int console);
 int vc_cons_allocated(unsigned int console);

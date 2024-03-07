@@ -6,7 +6,7 @@
  * kernel stack during a system call or other kernel entry.
  *
  * this should only contain volatile regs
- * since we can keep non-volatile in the tss
+ * since we can keep non-volatile in the thread_struct
  * should set this up when only volatiles are saved
  * by intr code.
  *
@@ -22,27 +22,30 @@ struct pt_regs {
 	unsigned long gpr[32];
 	unsigned long nip;
 	unsigned long msr;
-	unsigned long orig_gpr3; /* Used for restarting system calls */
+	unsigned long orig_gpr3;	/* Used for restarting system calls */
 	unsigned long ctr;
 	unsigned long link;
 	unsigned long xer;
 	unsigned long ccr;
-	unsigned long mq;	/* 601 only (not used at present) */
-				/* Used on APUS to hold IPL value. */
-	unsigned long trap;	/* Reason for being here */
-	unsigned long dar;	/* Fault registers */
+	unsigned long mq;		/* 601 only (not used at present) */
+					/* Used on APUS to hold IPL value. */
+	unsigned long trap;		/* Reason for being here */
+	unsigned long dar;		/* Fault registers */
 	unsigned long dsisr;
-	unsigned long result;   /* Result of a system call */
+	unsigned long result; 		/* Result of a system call */
 };
 #endif
 
+#ifdef __KERNEL__
 #define STACK_FRAME_OVERHEAD	16	/* size of minimum stack frame */
 
 /* Size of stack frame allocated when calling signal handler. */
 #define __SIGNAL_FRAMESIZE	64
 
 #define instruction_pointer(regs) ((regs)->nip)
-#define user_mode(regs) ((regs)->msr & 0x4000)
+#define user_mode(regs) (((regs)->msr & MSR_PR) != 0)
+
+#endif /* __KERNEL__ */
 
 /*
  * Offsets used by 'ptrace' system call interface.

@@ -35,6 +35,9 @@
  * general case (size = XXX). I hope.
  */
 
+#define DATA_BUFFER_USED(bh) \
+	(atomic_read(&bh->b_count)>1 || buffer_locked(bh))
+
 /* We throw away any data beyond inode->i_size. */
 
 static int trunc_direct(struct inode * inode)
@@ -58,7 +61,7 @@ repeat:
 			brelse(bh);
 			goto repeat;
 		}
-		if ((bh && bh->b_count != 1) || (block != *p)) {
+		if ((bh && DATA_BUFFER_USED(bh)) || (block != *p)) {
 			retry = 1;
 			brelse(bh);
 			continue;
@@ -115,20 +118,20 @@ repeat:
 			brelse(bh);
 			goto repeat;
 		}
-		if ((bh && bh->b_count != 1) || (tmp != *ind)) {
+		if ((bh && DATA_BUFFER_USED(bh)) || (tmp != *ind)) {
 			retry = 1;
 			brelse(bh);
 			continue;
 		}
 		*ind = 0;
-		mark_buffer_dirty(indbh, 1);
+		mark_buffer_dirty(indbh);
 		brelse(bh);
 		sysv_free_block(sb,block);
 	}
 	for (i = 0; i < sb->sv_ind_per_block; i++)
 		if (((sysv_zone_t *) indbh->b_data)[i])
 			goto done;
-	if ((indbh->b_count != 1) || (indtmp != *p)) {
+	if (DATA_BUFFER_USED(indbh) || (indtmp != *p)) {
 		brelse(indbh);
 		return 1;
 	}
@@ -180,12 +183,12 @@ static int trunc_dindirect(struct inode * inode, unsigned long offset, sysv_zone
 			continue;
 		retry |= trunc_indirect(inode,offset+(i<<sb->sv_ind_per_block_bits),ind,sb->sv_convert,&dirty);
 		if (dirty)
-			mark_buffer_dirty(indbh, 1);
+			mark_buffer_dirty(indbh);
 	}
 	for (i = 0; i < sb->sv_ind_per_block; i++)
 		if (((sysv_zone_t *) indbh->b_data)[i])
 			goto done;
-	if ((indbh->b_count != 1) || (indtmp != *p)) {
+	if (DATA_BUFFER_USED(indbh) || (indtmp != *p)) {
 		brelse(indbh);
 		return 1;
 	}
@@ -237,12 +240,12 @@ static int trunc_tindirect(struct inode * inode, unsigned long offset, sysv_zone
 			continue;
 		retry |= trunc_dindirect(inode,offset+(i<<sb->sv_ind_per_block_2_bits),ind,sb->sv_convert,&dirty);
 		if (dirty)
-			mark_buffer_dirty(indbh, 1);
+			mark_buffer_dirty(indbh);
 	}
 	for (i = 0; i < sb->sv_ind_per_block; i++)
 		if (((sysv_zone_t *) indbh->b_data)[i])
 			goto done;
-	if ((indbh->b_count != 1) || (indtmp != *p)) {
+	if (DATA_BUFFER_USED(indbh) || (indtmp != *p)) {
 		brelse(indbh);
 		return 1;
 	}

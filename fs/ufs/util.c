@@ -6,6 +6,7 @@
  * Charles University, Faculty of Mathematics and Physics
  */
  
+#include <linux/string.h>
 #include <linux/malloc.h>
 #include <linux/locks.h>
 
@@ -93,13 +94,13 @@ void ubh_brelse_uspi (struct ufs_sb_private_info * uspi)
 	}
 }
 
-void ubh_mark_buffer_dirty (struct ufs_buffer_head * ubh, int flag)
+void ubh_mark_buffer_dirty (struct ufs_buffer_head * ubh)
 {
 	unsigned i;
 	if (!ubh)
 		return;
 	for ( i = 0; i < ubh->count; i++ )
-		mark_buffer_dirty (ubh->bh[i], flag);
+		mark_buffer_dirty (ubh->bh[i]);
 }
 
 void ubh_mark_buffer_uptodate (struct ufs_buffer_head * ubh, int flag)
@@ -136,8 +137,8 @@ unsigned ubh_max_bcount (struct ufs_buffer_head * ubh)
 	if (!ubh)
 		return 0;
 	for ( i = 0; i < ubh->count; i++ ) 
-		if ( ubh->bh[i]->b_count > max )
-			max = ubh->bh[i]->b_count;
+		if ( atomic_read(&ubh->bh[i]->b_count) > max )
+			max = atomic_read(&ubh->bh[i]->b_count);
 	return max;
 }
 

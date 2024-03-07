@@ -62,68 +62,28 @@ const struct hfs_name hfs_nat_reserved2[] = {
 #define DOT_PARENT	(&hfs_nat_reserved1[3])
 #define ROOTINFO        (&hfs_nat_reserved2[0])
 
-static struct file_operations hfs_nat_dir_operations = {
-	NULL,			/* lseek - default */
-	hfs_dir_read,		/* read - invalid */
-	NULL,			/* write - bad */
-	nat_readdir,		/* readdir */
-	NULL,			/* select - default */
-	NULL,			/* ioctl - default */
-	NULL,			/* mmap - none */
-	NULL,			/* no special open code */
-	NULL,			/* flush */
-	NULL,			/* no special release code */
-	file_fsync,		/* fsync - default */
-        NULL,			/* fasync - default */
-        NULL,			/* check_media_change - none */
-        NULL,			/* revalidate - none */
-	NULL                    /* lock - none */
+struct file_operations hfs_nat_dir_operations = {
+	read:		generic_read_dir,
+	readdir:	nat_readdir,
+	fsync:		file_fsync,
 };
 
 struct inode_operations hfs_nat_ndir_inode_operations = {
-	&hfs_nat_dir_operations,/* default directory file-ops */
-	hfs_create,		/* create */
-	nat_lookup,		/* lookup */
-	NULL,			/* link */
-	hfs_unlink,		/* unlink */
-	NULL,			/* symlink */
-	hfs_mkdir,		/* mkdir */
-	nat_rmdir,		/* rmdir */
-	hfs_mknod,		/* mknod */
-	hfs_rename,		/* rename */
-	NULL,			/* readlink */
-	NULL,			/* follow_link */
-	NULL,			/* readpage */
-	NULL,			/* writepage */
-	NULL,			/* bmap */
-	NULL,			/* truncate */
-	NULL,			/* permission */
-	NULL,			/* smap */
-	NULL,                   /* updatepage */
-	NULL                    /* revalidate */
+	create:		hfs_create,
+	lookup:		nat_lookup,
+	unlink:		hfs_unlink,
+	mkdir:		hfs_mkdir,
+	rmdir:		nat_rmdir,
+	rename:		hfs_rename,
+	setattr:	hfs_notify_change,
 };
 
 struct inode_operations hfs_nat_hdir_inode_operations = {
-	&hfs_nat_dir_operations,/* default directory file-ops */
-	hfs_create,		/* create */
-	nat_lookup,		/* lookup */
-	NULL,			/* link */
-	nat_hdr_unlink,		/* unlink */
-	NULL,			/* symlink */
-	NULL,			/* mkdir */
-	NULL,			/* rmdir */
-	NULL,			/* mknod */
-	nat_hdr_rename,		/* rename */
-	NULL,			/* readlink */
-	NULL,			/* follow_link */
-	NULL,			/* readpage */
-	NULL,			/* writepage */
-	NULL,			/* bmap */
-	NULL,			/* truncate */
-	NULL,			/* permission */
-	NULL,			/* smap */
-	NULL,                   /* updatepage */
-	NULL                    /* revalidate */
+	create:		hfs_create,
+	lookup:		nat_lookup,
+	unlink:		nat_hdr_unlink,
+	rename:		nat_hdr_rename,
+	setattr:	hfs_notify_change,
 };
 
 /*================ File-local functions ================*/
@@ -225,17 +185,14 @@ static int nat_readdir(struct file * filp,
         struct hfs_cat_entry *entry;
 	struct inode *dir = filp->f_dentry->d_inode;
 
-	if (!dir || !dir->i_sb || !S_ISDIR(dir->i_mode)) {
-		return -EBADF;
-	}
-
 	entry = HFS_I(dir)->entry;
 	type = HFS_ITYPE(dir->i_ino);
 	skip_dirs = (type == HFS_NAT_HDIR);
 
 	if (filp->f_pos == 0) {
 		/* Entry 0 is for "." */
-		if (filldir(dirent, DOT->Name, DOT_LEN, 0, dir->i_ino)) {
+		if (filldir(dirent, DOT->Name, DOT_LEN, 0, dir->i_ino,
+			    DT_DIR)) {
 			return 0;
 		}
 		filp->f_pos = 1;
@@ -252,7 +209,7 @@ static int nat_readdir(struct file * filp,
 		}
 
 		if (filldir(dirent, DOT_DOT->Name,
-			    DOT_DOT_LEN, 1, ntohl(cnid))) {
+			    DOT_DOT_LEN, 1, ntohl(cnid), DT_DIR)) {
 			return 0;
 		}
 		filp->f_pos = 2;
@@ -279,7 +236,7 @@ static int nat_readdir(struct file * filp,
 				len = hfs_namein(dir, tmp_name,
 				    &((struct hfs_cat_key *)brec.key)->CName);
 				if (filldir(dirent, tmp_name, len,
-					    filp->f_pos, ino)) {
+					    filp->f_pos, ino, DT_UNKNOWN)) {
 					hfs_cat_close(entry, &brec);
 					return 0;
 				}
@@ -294,14 +251,16 @@ static int nat_readdir(struct file * filp,
 			/* In normal dirs entry 2 is for ".AppleDouble" */
 			if (filldir(dirent, DOT_APPLEDOUBLE->Name,
 				    DOT_APPLEDOUBLE_LEN, filp->f_pos,
-				    ntohl(entry->cnid) | HFS_NAT_HDIR)) {
+				    ntohl(entry->cnid) | HFS_NAT_HDIR,
+				    DT_UNKNOWN)) {
 				return 0;
 			}
 		} else if (type == HFS_NAT_HDIR) {
 			/* In .AppleDouble entry 2 is for ".Parent" */
 			if (filldir(dirent, DOT_PARENT->Name,
 				    DOT_PARENT_LEN, filp->f_pos,
-				    ntohl(entry->cnid) | HFS_NAT_HDR)) {
+				    ntohl(entry->cnid) | HFS_NAT_HDR,
+				    DT_UNKNOWN)) {
 				return 0;
 			}
 		}
@@ -314,7 +273,8 @@ static int nat_readdir(struct file * filp,
 		    (type == HFS_NAT_HDIR)) {
 			if (filldir(dirent, ROOTINFO->Name,
 				    ROOTINFO_LEN, filp->f_pos,
-				    ntohl(entry->cnid) | HFS_NAT_HDR)) {
+				    ntohl(entry->cnid) | HFS_NAT_HDR,
+				    DT_UNKNOWN)) {
 				return 0;
 			}
 		}

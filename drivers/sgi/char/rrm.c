@@ -12,6 +12,10 @@
 #include <asm/uaccess.h>
 #include <asm/rrm.h>
 
+#ifdef MODULE
+#include <linux/module.h>
+#endif
+
 int
 rrm_open_rn (int rnid, void *arg)
 {
@@ -56,7 +60,8 @@ rrm_command (unsigned int cmd, void *arg)
 	i = verify_area (VERIFY_READ, arg, rrm_functions [cmd].arg_size);
 	if (i) return i;
 
-	__get_user_ret (rnid, (int *) arg, -EFAULT);
+	if (__get_user (rnid, (int *) arg))
+		return -EFAULT;
 	return (*(rrm_functions [cmd].r_fn))(rnid, arg);
 }
 
@@ -66,4 +71,3 @@ rrm_close (struct inode *inode, struct file *file)
 	/* This routine is invoked when the device is closed */
 	return 0;
 }
-

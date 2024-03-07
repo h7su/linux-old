@@ -8,6 +8,7 @@
 
 #include <linux/sched.h>
 #include <linux/unistd.h>
+#include <linux/string.h>
 #include <linux/malloc.h>
 
 #include <linux/sunrpc/clnt.h>
@@ -53,7 +54,6 @@ nlmsvc_share_file(struct nlm_host *host, struct nlm_file *file,
 	share->s_owner.len  = oh->len;
 	share->s_next       = file->f_shares;
 	file->f_shares      = share;
-	file->f_count	   += 1;
 
 update:
 	share->s_access = argp->fsm_access;

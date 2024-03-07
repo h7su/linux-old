@@ -1,5 +1,10 @@
+/*
+ *  linux/arch/arm/kernel/init_task.c
+ */
 #include <linux/mm.h>
+#include <linux/fs.h>
 #include <linux/sched.h>
+#include <linux/init.h>
 
 #include <asm/uaccess.h>
 #include <asm/pgtable.h>
@@ -8,7 +13,7 @@ static struct vm_area_struct init_mmap = INIT_MMAP;
 static struct fs_struct init_fs = INIT_FS;
 static struct files_struct init_files = INIT_FILES;
 static struct signal_struct init_signals = INIT_SIGNALS;
-struct mm_struct init_mm = INIT_MM;
+struct mm_struct init_mm = INIT_MM(init_mm);
 
 /*
  * Initial task structure.
@@ -20,4 +25,5 @@ struct mm_struct init_mm = INIT_MM;
  *
  * The things we do for performance..
  */
-union task_union init_task_union __attribute__((__section__(".init.task"))) = { INIT_TASK };
+union task_union init_task_union __attribute__((__section__(".init.task"))) =
+		{ INIT_TASK(init_task_union.task) };

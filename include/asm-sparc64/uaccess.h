@@ -1,4 +1,4 @@
-/* $Id: uaccess.h,v 1.29 1999/05/08 03:03:25 davem Exp $ */
+/* $Id: uaccess.h,v 1.33 2000/08/29 07:01:58 davem Exp $ */
 #ifndef _ASM_UACCESS_H
 #define _ASM_UACCESS_H
 
@@ -30,30 +30,21 @@
  * "For historical reasons, these macros are grossly misnamed." -Linus
  */
 
-#define KERNEL_DS   ((mm_segment_t) { 0x00 })
-#define USER_DS     ((mm_segment_t) { 0x2B })	/* har har har */
+#define KERNEL_DS   ((mm_segment_t) { ASI_P })
+#define USER_DS     ((mm_segment_t) { ASI_AIUS })	/* har har har */
 
 #define VERIFY_READ	0
 #define VERIFY_WRITE	1
 
-#define get_fs() (current->tss.current_ds)
+#define get_fs() (current->thread.current_ds)
 #define get_ds() (KERNEL_DS)
 
 #define segment_eq(a,b)  ((a).seg == (b).seg)
 
 #define set_fs(val)								\
 do {										\
-	if (current->tss.current_ds.seg != val.seg) {				\
-		current->tss.current_ds = (val);				\
-		if (segment_eq((val), KERNEL_DS)) {				\
-			flushw_user ();						\
-			current->tss.ctx = 0;					\
-		} else {							\
-			current->tss.ctx = (current->mm->context & 0x3ff);	\
-		}								\
-		spitfire_set_secondary_context(current->tss.ctx); 		\
-		__asm__ __volatile__("flush %g6");				\
-	}									\
+	current->thread.current_ds = (val);					\
+	__asm__ __volatile__ ("wr %%g0, %0, %%asi" : : "r" ((val).seg));	\
 } while(0)
 
 #define __user_ok(addr,size) 1
@@ -111,22 +102,12 @@ extern void __ret_efault(void);
 unsigned long __pu_addr = (unsigned long)(ptr); \
 __put_user_nocheck((__typeof__(*(ptr)))(x),__pu_addr,sizeof(*(ptr))); })
 
-#define put_user_ret(x,ptr,retval) ({ \
-unsigned long __pu_addr = (unsigned long)(ptr); \
-__put_user_nocheck_ret((__typeof__(*(ptr)))(x),__pu_addr,sizeof(*(ptr)),retval); })
-
 #define get_user(x,ptr) ({ \
 unsigned long __gu_addr = (unsigned long)(ptr); \
 __get_user_nocheck((x),__gu_addr,sizeof(*(ptr)),__typeof__(*(ptr))); })
 
-#define get_user_ret(x,ptr,retval) ({ \
-unsigned long __gu_addr = (unsigned long)(ptr); \
-__get_user_nocheck_ret((x),__gu_addr,sizeof(*(ptr)),__typeof__(*(ptr)),retval); })
-
 #define __put_user(x,ptr) put_user(x,ptr)
-#define __put_user_ret(x,ptr,retval) put_user_ret(x,ptr,retval)
 #define __get_user(x,ptr) get_user(x,ptr)
-#define __get_user_ret(x,ptr,retval) get_user_ret(x,ptr,retval)
 
 struct __large_struct { unsigned long buf[100]; };
 #define __m(x) ((struct __large_struct *)(x))
@@ -154,7 +135,7 @@ default: if (__put_user_bad()) return retval; break; \
 #define __put_user_asm(x,size,addr,ret)					\
 __asm__ __volatile__(							\
 	"/* Put user asm, inline. */\n"					\
-"1:\t"	"st"#size "a %1, [%2] %4\n\t"					\
+"1:\t"	"st"#size "a %1, [%2] %%asi\n\t"				\
 	"clr	%0\n"							\
 "2:\n\n\t"								\
 	".section .fixup,#alloc,#execinstr\n\t"				\
@@ -168,22 +149,22 @@ __asm__ __volatile__(							\
 	".word	1b, 3b\n\t"						\
 	".previous\n\n\t"						\
        : "=r" (ret) : "r" (x), "r" (__m(addr)),				\
-	 "i" (-EFAULT), "i" (ASI_S))
+	 "i" (-EFAULT))
 
 #define __put_user_asm_ret(x,size,addr,ret,foo)				\
 if (__builtin_constant_p(ret) && ret == -EFAULT)			\
 __asm__ __volatile__(							\
 	"/* Put user asm ret, inline. */\n"				\
-"1:\t"	"st"#size "a %1, [%2] %3\n\n\t"					\
+"1:\t"	"st"#size "a %1, [%2] %%asi\n\n\t"				\
 	".section __ex_table,#alloc\n\t"				\
 	".align	4\n\t"							\
 	".word	1b, __ret_efault\n\n\t"					\
 	".previous\n\n\t"						\
-       : "=r" (foo) : "r" (x), "r" (__m(addr)), "i" (ASI_S));		\
+       : "=r" (foo) : "r" (x), "r" (__m(addr)));			\
 else									\
 __asm__ __volatile(							\
 	"/* Put user asm ret, inline. */\n"				\
-"1:\t"	"st"#size "a %1, [%2] %4\n\n\t"					\
+"1:\t"	"st"#size "a %1, [%2] %%asi\n\n\t"				\
 	".section .fixup,#alloc,#execinstr\n\t"				\
 	".align	4\n"							\
 "3:\n\t"								\
@@ -195,7 +176,7 @@ __asm__ __volatile(							\
 	".word	1b, 3b\n\n\t"						\
 	".previous\n\n\t"						\
        : "=r" (foo) : "r" (x), "r" (__m(addr)),				\
-         "i" (ret), "i" (ASI_S))
+         "i" (ret))
 
 extern int __put_user_bad(void);
 
@@ -223,7 +204,7 @@ default: if (__get_user_bad()) return retval; \
 #define __get_user_asm(x,size,addr,ret)					\
 __asm__ __volatile__(							\
 	"/* Get user asm, inline. */\n"					\
-"1:\t"	"ld"#size "a [%2] %4, %1\n\t"					\
+"1:\t"	"ld"#size "a [%2] %%asi, %1\n\t"				\
 	"clr	%0\n"							\
 "2:\n\n\t"								\
 	".section .fixup,#alloc,#execinstr\n\t"				\
@@ -238,33 +219,33 @@ __asm__ __volatile__(							\
 	".word	1b, 3b\n\n\t"						\
 	".previous\n\t"							\
        : "=r" (ret), "=r" (x) : "r" (__m(addr)),			\
-	 "i" (-EFAULT), "i" (ASI_S))
+	 "i" (-EFAULT))
 
 #define __get_user_asm_ret(x,size,addr,retval)				\
 if (__builtin_constant_p(retval) && retval == -EFAULT)			\
 __asm__ __volatile__(							\
 	"/* Get user asm ret, inline. */\n"				\
-"1:\t"	"ld"#size "a [%1] %2, %0\n\n\t"					\
+"1:\t"	"ld"#size "a [%1] %%asi, %0\n\n\t"				\
 	".section __ex_table,#alloc\n\t"				\
 	".align	4\n\t"							\
 	".word	1b,__ret_efault\n\n\t"					\
 	".previous\n\t"							\
-       : "=r" (x) : "r" (__m(addr)), "i" (ASI_S));			\
+       : "=r" (x) : "r" (__m(addr)));					\
 else									\
 __asm__ __volatile__(							\
 	"/* Get user asm ret, inline. */\n"				\
-"1:\t"	"ld"#size "a [%1] %2, %0\n\n\t"					\
+"1:\t"	"ld"#size "a [%1] %%asi, %0\n\n\t"				\
 	".section .fixup,#alloc,#execinstr\n\t"				\
 	".align	4\n"							\
 "3:\n\t"								\
 	"ret\n\t"							\
-	" restore %%g0, %3, %%o0\n\n\t"					\
+	" restore %%g0, %2, %%o0\n\n\t"					\
 	".previous\n\t"							\
 	".section __ex_table,#alloc\n\t"				\
 	".align	4\n\t"							\
 	".word	1b, 3b\n\n\t"						\
 	".previous\n\t"							\
-       : "=r" (x) : "r" (__m(addr)), "i" (retval), "i" (ASI_S))
+       : "=r" (x) : "r" (__m(addr)), "i" (retval))
 
 extern int __get_user_bad(void);
 
@@ -297,60 +278,23 @@ extern __kernel_size_t __copy_in_user(void *to, const void *from,
 	__copy_from_user((void *)(to),	\
 		    (void *)(from), (__kernel_size_t)(n))
 
-#define copy_from_user_ret(to,from,n,retval) ({ \
-if (copy_from_user(to,from,n)) \
-	return retval; \
-})
-
-#define __copy_from_user_ret(to,from,n,retval) ({ \
-if (__copy_from_user(to,from,n)) \
-	return retval; \
-})
-
 #define copy_to_user(to,from,n) \
 	__copy_to_user((void *)(to), \
 	(void *) (from), (__kernel_size_t)(n))
-
-#define copy_to_user_ret(to,from,n,retval) ({ \
-if (copy_to_user(to,from,n)) \
-	return retval; \
-})
-
-#define __copy_to_user_ret(to,from,n,retval) ({ \
-if (__copy_to_user(to,from,n)) \
-	return retval; \
-})
 
 #define copy_in_user(to,from,n) \
 	__copy_in_user((void *)(to), \
 	(void *) (from), (__kernel_size_t)(n))
 
-#define copy_in_user_ret(to,from,n,retval) ({ \
-if (copy_in_user(to,from,n)) \
-	return retval; \
-})
-
-#define __copy_in_user_ret(to,from,n,retval) ({ \
-if (__copy_in_user(to,from,n)) \
-	return retval; \
-})
-
 extern __inline__ __kernel_size_t __clear_user(void *addr, __kernel_size_t size)
 {
 	extern __kernel_size_t __bzero_noasi(void *addr, __kernel_size_t size);
 	
-	
-	__asm__ __volatile__ ("wr %%g0, %0, %%asi" : : "i" (ASI_S));
 	return __bzero_noasi(addr, size);
 }
 
 #define clear_user(addr,n) \
 	__clear_user((void *)(addr), (__kernel_size_t)(n))
-
-#define clear_user_ret(addr,size,retval) ({ \
-if (clear_user(addr,size)) \
-	return retval; \
-})
 
 extern int __strncpy_from_user(unsigned long dest, unsigned long src, int count);
 
@@ -358,8 +302,10 @@ extern int __strncpy_from_user(unsigned long dest, unsigned long src, int count)
 	__strncpy_from_user((unsigned long)(dest), (unsigned long)(src), (int)(count))
 
 extern int __strlen_user(const char *);
+extern int __strnlen_user(const char *, long len);
 
 #define strlen_user __strlen_user
+#define strnlen_user __strnlen_user
 
 #endif  /* __ASSEMBLY__ */
 

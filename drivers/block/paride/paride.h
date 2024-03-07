@@ -1,3 +1,6 @@
+#ifndef __DRIVERS_PARIDE_H__
+#define __DRIVERS_PARIDE_H__
+
 /* 
 	paride.h	(c) 1997-8  Grant R. Guenther <grant@torque.net>
    		                    Under the terms of the GPL.
@@ -44,7 +47,7 @@ struct pi_adapter  {
 	int	reserved;	     /* number of ports reserved */
 	int	private;	     /* for protocol module */
 
-	struct wait_queue *parq;     /* semaphore for parport sharing */
+	wait_queue_head_t parq;     /* semaphore for parport sharing */
 	void	*pardev;	     /* pointer to pardevice */
 	char	*parname;	     /* parport name */
 	int	claimed;	     /* parport has already been claimed */
@@ -161,4 +164,5 @@ typedef struct pi_protocol PIP;
 extern int pi_register( PIP * );
 extern void pi_unregister ( PIP * );
 
+#endif /* __DRIVERS_PARIDE_H__ */
 /* end of paride.h */

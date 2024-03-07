@@ -171,91 +171,6 @@
  */
 
 /*
- * AIC7XXX_FAKE_NEGOTIATION_CMDS
- *   We now have two distinctly different methods of device negotiation
- *   in this code.  The two methods are selected by either defining or not
- *   defining this option.  The difference is as follows:
- *
- *   With AIC7XXX_FAKE_NEGOTIATION_CMDS not set (commented out)
- *     When the driver is in need of issuing a negotiation command for any
- *     given device, it will add the negotiation message on to part of a
- *     regular SCSI command for the device.  In the process, if the device
- *     is configured for and using tagged queueing, then the code will
- *     also issue that single command as a non-tagged command, attach the
- *     negotiation message to that one command, and use a temporary
- *     queue depth of one to keep the untagged and tagged commands from
- *     overlapping.
- *       Pros: This doesn't use any extra SCB structures, it's simple, it
- *         works most of the time (if not all of the time now), and
- *         since we get the device capability info frmo the INQUIRY data
- *         now, shouldn't cause any problems.
- *       Cons: When we need to send a negotiation command to a device, we
- *         must use a command that is being sent to LUN 0 of the device.
- *         If we try sending one to high LUN numbers, then some devices
- *         get noticeably upset.  Since we have to wait for a command with
- *         LUN == 0 to come along, we may not be able to renegotiate when
- *         we want if the user is actually using say LUN 1 of a CD Changer
- *         instead of using LUN 0 for an extended period of time.
- *
- *   With AIC7XXX_FAKE_NEGOTIATION_CMDS defined
- *     When we need to negotiate with a device, instead of attaching our
- *     negotiation message to an existing command, we insert our own
- *     fictional Scsi_Cmnd into the chain that has the negotiation message
- *     attached to it.  We send this one command as untagged regardless
- *     of the device type, and we fiddle with the queue depth the same as
- *     we would with the option unset to avoid overlapping commands.  The
- *     primary difference between this and the unset option is that the
- *     negotiation message is no longer attached to a specific command,
- *     instead it is its own command and is merely triggered by a
- *     combination of both A) We need to negotiate and B) The mid level
- *     SCSI code has sent us a command.  We still don't do any negotiation
- *     unless there is a valid SCSI command to be processed.
- *       Pros: This fixes the problem above in the Cons section.  Since we
- *         issue our own fake command, we can set the LUN to 0 regardless
- *         of what the LUN is in the real command.  It also means that if
- *         the device get's nasty over negotiation issues, it won't be
- *         showing up on a regular command, so we won't get any SENSE buffer
- *         data or STATUS_BYTE returns to the mid level code that are caused
- *         by snits in the negotiation code.
- *       Cons: We add more code, and more complexity.  This means more ways
- *         in which things could break.  It means a larger driver.  It means
- *         more resource consumption for the fake commands.  However, the
- *         biggest problem is this.  Take a system where there is a CD-ROM
- *         on the SCSI bus.  Someone has a CD in the CD-ROM and is using it.
- *         For some reason the SCSI bus gets reset.  We don't touch the
- *         CD-ROM again for quite a period of time (so we don't renegotiate
- *         after the reset until we do touch the CD-ROM again).  In the
- *         time while we aren't using the CD-ROM, the current disc is
- *         removed and a new one put in.  When we go to check that disc, we
- *         will first have to renegotiate.  In so doing, we issue our fake
- *         SCSI command, which happens to be TEST_UNIT_READY.  The CD-ROM
- *         negotiates with us, then responds to our fake command with a
- *         CHECK_CONDITION status.  We REQUEST_SENSE from the CD-ROM, it
- *         then sends the SENSE data to our fake command to tell it that
- *         it has been through a disc change.  There, now we've cleared out
- *         the SENSE data along with our negotiation command, and when the
- *         real command executes, it won't pick up that the CD was changed.
- *         That's the biggest Con to this approach.  In the future, I could
- *         probably code around this problem though, so this option is still
- *         viable.
- *
- *  So, which command style should you use?  I would appreciate it if people
- *  could try out both types.  I want to know about any cases where one
- *  method works and the other doesn't.  If one method works on significantly
- *  more systems than another, then it will become the default.  If the second
- *  option turns out to work best, then I'll find a way to work around that
- *  big con I listed.
- *
- *  -- July 7, 02:33
- *    OK...I just added some code that should make the Con listed for the
- *    fake commands a non issue now.  However, it needs testing.  For now,
- *    I'm going to make the default to use the fake commands, we'll see how
- *    it goes.
- */
- 
-#define AIC7XXX_FAKE_NEGOTIATION_CMDS
-
-/*
  * AIC7XXX_STRICT_PCI_SETUP
  *   Should we assume the PCI config options on our controllers are set with
  *   sane and proper values, or should we be anal about our PCI config
@@ -327,7 +242,9 @@
 #include <linux/proc_fs.h>
 #include <linux/blk.h>
 #include <linux/tqueue.h>
-#include <linux/tasks.h>
+#include <linux/init.h>
+#include <linux/spinlock.h>
+#include <linux/smp.h>
 #include "sd.h"
 #include "scsi.h"
 #include "hosts.h"
@@ -336,6 +253,7 @@
 #include "aic7xxx/sequencer.h"
 #include "aic7xxx/scsi_message.h"
 #include "aic7xxx_reg.h"
+#include <scsi/scsicam.h>
 
 #include <linux/stat.h>
 #include <linux/malloc.h>        /* for kmalloc() */
@@ -348,13 +266,7 @@
  */
 #define VIRT_TO_BUS(a) (unsigned int)virt_to_bus((void *)(a))
 
-struct proc_dir_entry proc_scsi_aic7xxx = {
-    PROC_SCSI_AIC7XXX, 7, "aic7xxx",
-    S_IFDIR | S_IRUGO | S_IXUGO, 2,
-    0, 0, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL
-};
-
-#define AIC7XXX_C_VERSION  "5.1.10"
+#define AIC7XXX_C_VERSION  "5.2.1"
 
 #define NUMBER(arr)     (sizeof(arr) / sizeof(arr[0]))
 #define MIN(a,b)        (((a) < (b)) ? (a) : (b))
@@ -371,49 +283,12 @@ struct proc_dir_entry proc_scsi_aic7xxx = {
 #  define FALSE 0
 #endif
 
-#ifndef KERNEL_VERSION
-#  define KERNEL_VERSION(x,y,z) (((x)<<16)+((y)<<8)+(z))
-#endif
-
-/*
- * We need the bios32.h file if we are kernel version 2.1.92 or less.  The
- * full set of pci_* changes wasn't in place until 2.1.93
- */
-
-#if LINUX_VERSION_CODE <= KERNEL_VERSION(2,1,92)
-#  if defined(__sparc_v9__) || defined(__powerpc__)
-#    error "PPC and Sparc platforms are only support under 2.1.92 and above"
-#  endif
-#  include <linux/bios32.h>
-#endif
-
-#if defined(__powerpc__)
+#if defined(__powerpc__) || defined(__i386__)
 #  define MMAPIO
-#  ifdef mb
-#    undef mb
-#  endif
-#  define mb() \
-     __asm__ __volatile__("eieio" ::: "memory")
-#elif defined(__i386__)
-#  define MMAPIO
-#  ifdef mb
-#    undef mb
-#  endif
-#  define mb() \
-     __asm__ __volatile__("lock ; addl $0,0(%%esp)": : :"memory")
-#elif defined(__alpha__)
-#  ifdef mb
-#    undef mb
-#  endif
-#  define mb() \
-     __asm__ __volatile__("mb": : :"memory")
 #endif
 
-#if LINUX_VERSION_CODE > KERNEL_VERSION(2,1,0)
-#  include <asm/spinlock.h>
-#  include <linux/smp.h>
-#  define cpuid smp_processor_id()
 #  if LINUX_VERSION_CODE < KERNEL_VERSION(2,1,95)
+#    define cpuid smp_processor_id()
 #    define DRIVER_LOCK_INIT \
        spin_lock_init(&p->spin_lock);
 #    define DRIVER_LOCK \
@@ -431,33 +306,15 @@ struct proc_dir_entry proc_scsi_aic7xxx = {
 #    define DRIVER_LOCK
 #    define DRIVER_UNLOCK
 #  endif
-#else
-#  define cpuid 0
-#  define DRIVER_LOCK_INIT
-#  define DRIVER_LOCK \
-       save_flags(cpu_flags); \
-       cli();
-#  define DRIVER_UNLOCK \
-       restore_flags(cpu_flags);
-#  define le32_to_cpu(x) (x)
-#  define cpu_to_le32(x) (x)
-#endif
 
 /*
  * You can try raising me if tagged queueing is enabled, or lowering
  * me if you only have 4 SCBs.
  */
-#ifdef CONFIG_AIC7XXX_CMDS_PER_LUN
-#define AIC7XXX_CMDS_PER_LUN CONFIG_AIC7XXX_CMDS_PER_LUN
+#ifdef CONFIG_AIC7XXX_CMDS_PER_DEVICE
+#define AIC7XXX_CMDS_PER_DEVICE CONFIG_AIC7XXX_CMDS_PER_DEVICE
 #else
-#define AIC7XXX_CMDS_PER_LUN 24
-#endif
-
-/* Set this to the delay in seconds after SCSI bus reset. */
-#ifdef CONFIG_AIC7XXX_RESET_DELAY
-#define AIC7XXX_RESET_DELAY CONFIG_AIC7XXX_RESET_DELAY
-#else
-#define AIC7XXX_RESET_DELAY 5
+#define AIC7XXX_CMDS_PER_DEVICE 8
 #endif
 
 /*
@@ -471,38 +328,15 @@ struct proc_dir_entry proc_scsi_aic7xxx = {
 #endif
 
 /*
- * NOTE: Uncommenting the define below no longer has any effect, the
- *       tagged queue value array is always active now.  I've added
- *       a setup option to set this particular array and I'm hoping
- *       insmod will be smart enough to set it properly as well.  It's
- *       by use of this array that a person can enable tagged queueing.
- *       The DEFAULT_TAG_COMMANDS define has been changed to disable
- *       tagged queueing by default, so if your devices can handle tagged
- *       queueing you will need to add a line to their lilo.conf file like:
- *       append="aic7xxx=verbose,tag_info:{{32,32,32,32},{32,32,32,32}}"
- *       which will result in the first four devices on the first two
- *       controllers being set to a tagged queue depth of 32.
- *
- * Set this for defining the number of tagged commands on a device
- * by device, and controller by controller basis.  The first set
- * of tagged commands will be used for the first detected aic7xxx
- * controller, the second set will be used for the second detected
- * aic7xxx controller, and so on.  These values will *only* be used
- * for targets that are tagged queueing capable; these values will
- * be ignored in all other cases.  The tag_commands is an array of
- * 16 to allow for wide and twin adapters.  Twin adapters will use
- * indexes 0-7 for channel 0, and indexes 8-15 for channel 1.
- *
  * *** Determining commands per LUN ***
  * 
- * When AIC7XXX_CMDS_PER_LUN is not defined, the driver will use its
+ * When AIC7XXX_CMDS_PER_DEVICE is not defined, the driver will use its
  * own algorithm to determine the commands/LUN.  If SCB paging is
  * enabled, which is always now, the default is 8 commands per lun
  * that indicates it supports tagged queueing.  All non-tagged devices
  * use an internal queue depth of 3, with no more than one of those
  * three commands active at one time.
  */
-/* #define AIC7XXX_TAGGED_QUEUEING_BY_DEVICE */
 
 typedef struct
 {
@@ -513,8 +347,13 @@ typedef struct
  * Make a define that will tell the driver not to use tagged queueing
  * by default.
  */
+#ifdef CONFIG_AIC7XXX_TCQ_ON_BY_DEFAULT
+#define DEFAULT_TAG_COMMANDS {0, 0, 0, 0, 0, 0, 0, 0,\
+                              0, 0, 0, 0, 0, 0, 0, 0}
+#else
 #define DEFAULT_TAG_COMMANDS {255, 255, 255, 255, 255, 255, 255, 255,\
                               255, 255, 255, 255, 255, 255, 255, 255}
+#endif
 
 /*
  * Modify this as you see fit for your system.  By setting tag_commands
@@ -542,8 +381,8 @@ typedef struct
 
 /*
  * NOTE: The below structure is for reference only, the actual structure
- *       to modify in order to change things is located around line
- *       number 1305
+ *       to modify in order to change things is found after this fake one.
+ *
 adapter_tag_info_t aic7xxx_tag_info[] =
 {
   {DEFAULT_TAG_COMMANDS},
@@ -552,6 +391,27 @@ adapter_tag_info_t aic7xxx_tag_info[] =
   {{255, 16, 4, 255, 16, 4, 4, 4, 127, 4, 4, 4, 4, 4, 4, 4}}
 };
 */
+
+static adapter_tag_info_t aic7xxx_tag_info[] =
+{
+  {DEFAULT_TAG_COMMANDS},
+  {DEFAULT_TAG_COMMANDS},
+  {DEFAULT_TAG_COMMANDS},
+  {DEFAULT_TAG_COMMANDS},
+  {DEFAULT_TAG_COMMANDS},
+  {DEFAULT_TAG_COMMANDS},
+  {DEFAULT_TAG_COMMANDS},
+  {DEFAULT_TAG_COMMANDS},
+  {DEFAULT_TAG_COMMANDS},
+  {DEFAULT_TAG_COMMANDS},
+  {DEFAULT_TAG_COMMANDS},
+  {DEFAULT_TAG_COMMANDS},
+  {DEFAULT_TAG_COMMANDS},
+  {DEFAULT_TAG_COMMANDS},
+  {DEFAULT_TAG_COMMANDS},
+  {DEFAULT_TAG_COMMANDS}
+};
+
 
 /*
  * Define an array of board names that can be indexed by aha_type.
@@ -577,13 +437,17 @@ static const char *board_names[] = {
   "Adaptec AHA-394X Ultra SCSI host adapter",           /* AIC_7882 */
   "Adaptec AHA-398X Ultra SCSI host adapter",           /* AIC_7883 */
   "Adaptec AHA-2944 Ultra SCSI host adapter",           /* AIC_7884 */
+  "Adaptec AHA-2940UW Pro Ultra SCSI host adapter",     /* AIC_7887 */
   "Adaptec AIC-7895 Ultra SCSI host adapter",           /* AIC_7895 */
   "Adaptec AIC-7890/1 Ultra2 SCSI host adapter",        /* AIC_7890 */
+  "Adaptec AHA-293X Ultra2 SCSI host adapter",          /* AIC_7890 */
   "Adaptec AHA-294X Ultra2 SCSI host adapter",          /* AIC_7890 */
   "Adaptec AIC-7896/7 Ultra2 SCSI host adapter",        /* AIC_7896 */
   "Adaptec AHA-394X Ultra2 SCSI host adapter",          /* AIC_7897 */
   "Adaptec AHA-395X Ultra2 SCSI host adapter",          /* AIC_7897 */
   "Adaptec PCMCIA SCSI controller",                     /* card bus stuff */
+  "Adaptec AIC-7892 Ultra 160/m SCSI host adapter",     /* AIC_7892 */
+  "Adaptec AIC-7899 Ultra 160/m SCSI host adapter",     /* AIC_7899 */
 };
 
 /*
@@ -630,7 +494,7 @@ static const char *board_names[] = {
  * AIC-7770 I/O range to reserve for a card
  */
 #define MINREG                0xC00
-#define MAXREG                0xCBF
+#define MAXREG                0xCFF
 
 #define INTDEF                0x5C      /* Interrupt Definition Register */
 
@@ -784,6 +648,11 @@ struct seeprom_config {
 #define aic7xxx_position(cmd)        ((cmd)->SCp.have_data_in)
 
 /*
+ * The stored DMA mapping for single-buffer data transfers.
+ */
+#define aic7xxx_mapping(cmd)	     ((cmd)->SCp.phase)
+
+/*
  * So we can keep track of our host structs
  */
 static struct aic7xxx_host *first_aic7xxx = NULL;
@@ -851,15 +720,17 @@ typedef enum {
         SCB_DEVICE_RESET        = 0x0020,
         SCB_RESET               = 0x0040,
         SCB_RECOVERY_SCB        = 0x0080,
-        SCB_WAS_BUSY            = 0x0100,
+        SCB_MSGOUT_PPR          = 0x0100,
         SCB_MSGOUT_SENT         = 0x0200,
         SCB_MSGOUT_SDTR         = 0x0400,
         SCB_MSGOUT_WDTR         = 0x0800,
-        SCB_MSGOUT_BITS         = SCB_MSGOUT_SENT | 
+        SCB_MSGOUT_BITS         = SCB_MSGOUT_PPR |
+                                  SCB_MSGOUT_SENT | 
                                   SCB_MSGOUT_SDTR |
                                   SCB_MSGOUT_WDTR,
         SCB_QUEUED_ABORT        = 0x1000,
-        SCB_QUEUED_FOR_DONE     = 0x2000
+        SCB_QUEUED_FOR_DONE     = 0x2000,
+        SCB_WAS_BUSY            = 0x4000
 } scb_flag_type;
 
 typedef enum {
@@ -886,6 +757,8 @@ typedef enum {
   *  and what flags weren't.  This way, I could clean up the flag usage on
   *  a use by use basis.  Doug Ledford
   */
+        AHC_MOTHERBOARD           = 0x00020000,
+        AHC_NO_STPWEN             = 0x00040000,
         AHC_RESET_DELAY           = 0x00080000,
         AHC_A_SCANNED             = 0x00100000,
         AHC_B_SCANNED             = 0x00200000,
@@ -913,6 +786,8 @@ typedef enum {
   AHC_AIC7890          = 0x0006,
   AHC_AIC7895          = 0x0007,
   AHC_AIC7896          = 0x0008,
+  AHC_AIC7892          = 0x0009,
+  AHC_AIC7899          = 0x000a,
   AHC_VL               = 0x0100,
   AHC_EISA             = 0x0200,
   AHC_PCI              = 0x0400,
@@ -929,16 +804,31 @@ typedef enum {
   AHC_QUEUE_REGS       = 0x0040,
   AHC_SG_PRELOAD       = 0x0080,
   AHC_SPIOCAP          = 0x0100,
+  AHC_ULTRA3           = 0x0200,
+  AHC_NEW_AUTOTERM     = 0x0400,
   AHC_AIC7770_FE       = AHC_FENONE,
   AHC_AIC7850_FE       = AHC_SPIOCAP,
   AHC_AIC7860_FE       = AHC_ULTRA|AHC_SPIOCAP,
   AHC_AIC7870_FE       = AHC_FENONE,
   AHC_AIC7880_FE       = AHC_ULTRA,
   AHC_AIC7890_FE       = AHC_MORE_SRAM|AHC_CMD_CHAN|AHC_ULTRA2|
-                         AHC_QUEUE_REGS|AHC_SG_PRELOAD,
+                         AHC_QUEUE_REGS|AHC_SG_PRELOAD|AHC_NEW_AUTOTERM,
   AHC_AIC7895_FE       = AHC_MORE_SRAM|AHC_CMD_CHAN|AHC_ULTRA,
   AHC_AIC7896_FE       = AHC_AIC7890_FE,
+  AHC_AIC7892_FE       = AHC_AIC7890_FE|AHC_ULTRA3,
+  AHC_AIC7899_FE       = AHC_AIC7890_FE|AHC_ULTRA3,
 } ahc_feature;
+
+#define SCB_DMA_ADDR(scb, addr) ((unsigned long)(addr) + (scb)->scb_dma->dma_offset)
+
+struct aic7xxx_scb_dma {
+	unsigned long	       dma_offset;    /* Correction you have to add
+					       * to virtual address to get
+					       * dma handle in this region */
+	dma_addr_t	       dma_address;   /* DMA handle of the start,
+					       * for unmap */
+	unsigned int	       dma_len;	      /* DMA length */
+};
 
 struct aic7xxx_scb {
         struct aic7xxx_hwscb  *hscb;          /* corresponding hardware scb */
@@ -948,15 +838,17 @@ struct aic7xxx_scb {
         struct hw_scatterlist *sg_list;       /* SG list in adapter format */
         unsigned char          tag_action;
         unsigned char          sg_count;
-        unsigned char          sense_cmd[6];  /*
+        unsigned char          *sense_cmd;    /*
                                                * Allocate 6 characters for
                                                * sense command.
                                                */
+	unsigned char	       *cmnd;
         unsigned int           sg_length; /* We init this during buildscb so we
                                            * don't have to calculate anything
                                            * during underflow/overflow/stat code
                                            */
         void                  *kmalloc_ptr;
+	struct aic7xxx_scb_dma *scb_dma;
 };
 
 /*
@@ -994,6 +886,8 @@ typedef struct {
   unsigned char  numscbs;          /* current number of scbs */
   unsigned char  maxhscbs;         /* hardware scbs */
   unsigned char  maxscbs;          /* max scbs including pageable scbs */
+  dma_addr_t	 hscbs_dma;	   /* DMA handle to hscbs */
+  unsigned int   hscbs_dma_len;    /* length of the above DMA area */
   void          *hscb_kmalloc_ptr;
 } scb_data_type;
 
@@ -1014,9 +908,12 @@ typedef struct {
   unsigned char goal_period;
   unsigned char cur_offset;
   unsigned char goal_offset;
+  unsigned char cur_options;
+  unsigned char goal_options;
   unsigned char user_width;
   unsigned char user_period;
   unsigned char user_offset;
+  unsigned char user_options;
 } transinfo_type;
 
 /*
@@ -1045,10 +942,11 @@ struct aic7xxx_host {
   unsigned long            isr_count;        /* Interrupt count */
   unsigned long            spurious_int;
   scb_data_type           *scb_data;
+  volatile unsigned short  needdv;
+  volatile unsigned short  needppr;
   volatile unsigned short  needsdtr;
-  volatile unsigned short  sdtr_pending;
   volatile unsigned short  needwdtr;
-  volatile unsigned short  wdtr_pending;
+  volatile unsigned short  dtr_pending;
   struct aic7xxx_cmd_queue {
     Scsi_Cmnd *head;
     Scsi_Cmnd *tail;
@@ -1067,13 +965,17 @@ struct aic7xxx_host {
   volatile unsigned char   activescbs;       /* active scbs */
   volatile unsigned char   max_activescbs;
   volatile unsigned char   qinfifonext;
+  volatile unsigned char  *untagged_scbs;
+  volatile unsigned char  *qoutfifo;
+  volatile unsigned char  *qinfifo;
 
 #define  DEVICE_PRESENT                 0x01
 #define  BUS_DEVICE_RESET_PENDING       0x02
 #define  DEVICE_RESET_DELAY             0x04
-#define  DEVICE_PRINT_SDTR              0x08
-#define  DEVICE_PRINT_WDTR              0x10
+#define  DEVICE_PRINT_DTR               0x08
+#define  DEVICE_PARITY_ERROR            0x10
 #define  DEVICE_WAS_BUSY                0x20
+#define  DEVICE_SCSI_3                  0x40
 #define  DEVICE_SCANNED                 0x80
   volatile unsigned char   dev_flags[MAX_TARGETS];
   volatile unsigned char   dev_active_cmds[MAX_TARGETS];
@@ -1084,17 +986,13 @@ struct aic7xxx_host {
   struct timer_list        dev_timer;
   unsigned long            dev_expires[MAX_TARGETS];
 
-#if LINUX_VERSION_CODE > KERNEL_VERSION(2,1,0)
   spinlock_t               spin_lock;
   volatile unsigned char   cpu_lock_count[NR_CPUS];
-#endif
 
+  Scsi_Cmnd               *dev_dtr_cmnd[MAX_TARGETS];
 
-#ifdef AIC7XXX_FAKE_NEGOTIATION_CMDS
-  Scsi_Cmnd               *dev_wdtr_cmnd[MAX_TARGETS];
-  Scsi_Cmnd               *dev_sdtr_cmnd[MAX_TARGETS];
-#endif
-
+  unsigned int             dev_checksum[MAX_TARGETS];
+  
   unsigned char            dev_last_queue_full[MAX_TARGETS];
   unsigned char            dev_last_queue_full_count[MAX_TARGETS];
   unsigned char            dev_max_queue_depth[MAX_TARGETS];
@@ -1102,7 +1000,7 @@ struct aic7xxx_host {
   volatile scb_queue_type  delayed_scbs[MAX_TARGETS];
 
 
-  unsigned char            msg_buf[9];       /* The message for the target */
+  unsigned char            msg_buf[13];      /* The message for the target */
   unsigned char            msg_type;
 #define MSG_TYPE_NONE              0x00
 #define MSG_TYPE_INITIATOR_MSGOUT  0x01
@@ -1116,30 +1014,22 @@ struct aic7xxx_host {
    * We put the less frequently used host structure items after the more
    * frequently used items to try and ease the burden on the cache subsystem.
    * These entries are not *commonly* accessed, whereas the preceding entries
-   * are accessed very often.  The only exceptions are the qinfifo, qoutfifo,
-   * and untagged_scbs array.  But, they are often accessed only once and each
-   * access into these arrays is likely to blow a cache line, so they are put
-   * down here so we can minimize the number of cache lines required to hold
-   * the preceeding entries.
+   * are accessed very often.
    */
 
-  volatile unsigned char   untagged_scbs[256];
-  volatile unsigned char   qoutfifo[256];
-  volatile unsigned char   qinfifo[256];
   unsigned int             irq;              /* IRQ for this adapter */
   int                      instance;         /* aic7xxx instance number */
   int                      scsi_id;          /* host adapter SCSI ID */
   int                      scsi_id_b;        /* channel B for twin adapters */
   unsigned int             bios_address;
   int                      board_name_index;
+  unsigned short           needppr_copy;     /* default config */
   unsigned short           needsdtr_copy;    /* default config */
   unsigned short           needwdtr_copy;    /* default config */
   unsigned short           ultraenb;         /* Ultra mode target list */
   unsigned short           bios_control;     /* bios control - SEEPROM */
   unsigned short           adapter_control;  /* adapter control - SEEPROM */
-#if LINUX_VERSION_CODE > KERNEL_VERSION(2,1,92)
-  struct pci_dev          *pdev;
-#endif
+  struct pci_dev	  *pdev;
   unsigned char            pci_bus;
   unsigned char            pci_device_fn;
   struct seeprom_config    sc;
@@ -1150,6 +1040,7 @@ struct aic7xxx_host {
   int                      host_no;          /* SCSI host number */
   unsigned long            mbase;            /* I/O memory address */
   ahc_chip                 chip;             /* chip type */
+  dma_addr_t		   fifo_dma;	     /* DMA handle for fifo arrays */
 
   /*
    * Statistics Kept:
@@ -1192,9 +1083,12 @@ struct aic7xxx_host {
  * Provides a mapping of transfer periods in ns/4 to the proper value to
  * stick in the SCSIRATE reg to use that transfer rate.
  */
-#define AHC_SYNCRATE_ULTRA2 0
-#define AHC_SYNCRATE_ULTRA  2
-#define AHC_SYNCRATE_FAST   5
+#define AHC_SYNCRATE_ULTRA3 0
+#define AHC_SYNCRATE_ULTRA2 1
+#define AHC_SYNCRATE_ULTRA  3
+#define AHC_SYNCRATE_FAST   6
+#define AHC_SYNCRATE_CRC 0x40
+#define AHC_SYNCRATE_SE  0x10
 static struct aic7xxx_syncrate {
   /* Rates in Ultra mode have bit 8 of sxfr set */
 #define                ULTRA_SXFR 0x100
@@ -1203,6 +1097,7 @@ static struct aic7xxx_syncrate {
   unsigned char period;
   const char *rate[2];
 } aic7xxx_syncrates[] = {
+  { 0x42,  0x000,   9,  {"80.0", "160.0"} },
   { 0x13,  0x000,  10,  {"40.0", "80.0"} },
   { 0x14,  0x000,  11,  {"33.0", "66.6"} },
   { 0x15,  0x100,  12,  {"20.0", "40.0"} },
@@ -1391,15 +1286,32 @@ static int aic7xxx_dump_sequencer = 0;
  * would result in never finding any devices :)
  */
 static int aic7xxx_no_probe = 0;
-
+/*
+ * On some machines, enabling the external SCB RAM isn't reliable yet.  I
+ * haven't had time to make test patches for things like changing the
+ * timing mode on that external RAM either.  Some of those changes may
+ * fix the problem.  Until then though, we default to external SCB RAM
+ * off and give a command line option to enable it.
+ */
+static int aic7xxx_scbram = 0;
+/*
+ * So that we can set how long each device is given as a selection timeout.
+ * The table of values goes like this:
+ *   0 - 256ms
+ *   1 - 128ms
+ *   2 - 64ms
+ *   3 - 32ms
+ * We default to 64ms because it's fast.  Some old SCSI-I devices need a
+ * longer time.  The final value has to be left shifted by 3, hence 0x10
+ * is the final value.
+ */
+static int aic7xxx_seltime = 0x10;
 /*
  * So that insmod can find the variable and make it point to something
  */
 #ifdef MODULE
 static char * aic7xxx = NULL;
-#if LINUX_VERSION_CODE > KERNEL_VERSION(2,1,18)
 MODULE_PARM(aic7xxx, "s");
-#endif
 
 /*
  * Just in case someone uses commas to separate items on the insmod
@@ -1409,35 +1321,6 @@ MODULE_PARM(aic7xxx, "s");
 static char dummy_buffer[60] = "Please don't trounce on me insmod!!\n";
 
 #endif
-
-/*
- * See the comments earlier in the file for what this item is all about
- * If you have more than 4 controllers, you will need to increase the
- * the number of items in the array below.  Additionally, if you don't
- * want to have lilo pass a humongous config line to the aic7xxx driver,
- * then you can get in and manually adjust these instead of leaving them
- * at the default.  Pay attention to the comments earlier in this file
- * concerning this array if you are going to hand modify these values.
- */
-static adapter_tag_info_t aic7xxx_tag_info[] =
-{
-  {DEFAULT_TAG_COMMANDS},
-  {DEFAULT_TAG_COMMANDS},
-  {DEFAULT_TAG_COMMANDS},
-  {DEFAULT_TAG_COMMANDS},
-  {DEFAULT_TAG_COMMANDS},
-  {DEFAULT_TAG_COMMANDS},
-  {DEFAULT_TAG_COMMANDS},
-  {DEFAULT_TAG_COMMANDS},
-  {DEFAULT_TAG_COMMANDS},
-  {DEFAULT_TAG_COMMANDS},
-  {DEFAULT_TAG_COMMANDS},
-  {DEFAULT_TAG_COMMANDS},
-  {DEFAULT_TAG_COMMANDS},
-  {DEFAULT_TAG_COMMANDS},
-  {DEFAULT_TAG_COMMANDS},
-  {DEFAULT_TAG_COMMANDS}
-};
 
 #define VERBOSE_NORMAL         0x0000
 #define VERBOSE_NEGOTIATION    0x0001
@@ -1486,32 +1369,6 @@ static void aic7xxx_check_scbs(struct aic7xxx_host *p, char *buffer);
  *
  ***************************************************************************/
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,1,0)
-static inline void
-mdelay(int milliseconds)
-{
-  int i;
-
-  for(i=0; i<milliseconds; i++)
-    udelay(1000);
-}
-
-static inline int
-time_after_eq(unsigned long a, unsigned long b)
-{
-  return((long)((a) - (b)) >= 0L);
-}
-
-static inline int
-timer_pending(struct timer_list *timer)
-{
-  return( timer->prev != NULL );
-}
-
-#define PCI_DEVICE_ID_ADAPTEC_1480A 0x6075
-
-#endif
-
 static inline unsigned char
 aic_inb(struct aic7xxx_host *p, long port)
 {
@@ -1519,13 +1376,12 @@ aic_inb(struct aic7xxx_host *p, long port)
   unsigned char x;
   if(p->maddr)
   {
-    x = p->maddr[port];
+    x = readb(p->maddr + port);
   }
   else
   {
     x = inb(p->base + port);
   }
-  mb();
   return(x);
 #else
   return(inb(p->base + port));
@@ -1538,15 +1394,18 @@ aic_outb(struct aic7xxx_host *p, unsigned char val, long port)
 #ifdef MMAPIO
   if(p->maddr)
   {
-    p->maddr[port] = val;
+    writeb(val, p->maddr + port);
+    mb(); /* locked operation in order to force CPU ordering */
+    readb(p->maddr + HCNTRL); /* dummy read to flush the PCI write */
   }
   else
   {
     outb(val, p->base + port);
+    mb(); /* locked operation in order to force CPU ordering */
   }
-  mb();
 #else
   outb(val, p->base + port);
+  mb(); /* locked operation in order to force CPU ordering */
 #endif
 }
 
@@ -1559,8 +1418,8 @@ aic_outb(struct aic7xxx_host *p, unsigned char val, long port)
  *   to a parameter with a ':' between the parameter and the value.
  *   ie. aic7xxx=unpause:0x0A,extended
  *-F*************************************************************************/
-void
-aic7xxx_setup(char *s, int *dummy)
+static int
+aic7xxx_setup(char *s)
 {
   int   i, n;
   char *p;
@@ -1582,6 +1441,8 @@ aic7xxx_setup(char *s, int *dummy)
     { "pci_parity", &aic7xxx_pci_parity },
     { "dump_card", &aic7xxx_dump_card },
     { "dump_sequencer", &aic7xxx_dump_sequencer },
+    { "scbram", &aic7xxx_scbram },
+    { "seltime", &aic7xxx_seltime },
     { "tag_info",    NULL }
   };
 
@@ -1675,19 +1536,30 @@ aic7xxx_setup(char *s, int *dummy)
         else if (p[n] == ':')
         {
           *(options[i].flag) = simple_strtoul(p + n + 1, NULL, 0);
+          if(!strncmp(p, "seltime", n))
+          {
+            *(options[i].flag) = (*(options[i].flag) % 4) << 3;
+          }
         }
         else if (!strncmp(p, "verbose", n))
         {
-          *(options[i].flag) = 0xff09;
+          *(options[i].flag) = 0xff29;
         }
         else
         {
           *(options[i].flag) = ~(*(options[i].flag));
+          if(!strncmp(p, "seltime", n))
+          {
+            *(options[i].flag) = (*(options[i].flag) % 4) << 3;
+          }
         }
       }
     }
   }
+  return 1;
 }
+
+__setup("aic7xxx=", aic7xxx_setup);
 
 /*+F*************************************************************************
  * Function:
@@ -1698,13 +1570,17 @@ aic7xxx_setup(char *s, int *dummy)
  *   is important since the sequencer can disable pausing for critical
  *   sections.
  *-F*************************************************************************/
-static inline void
+static void
 pause_sequencer(struct aic7xxx_host *p)
 {
   aic_outb(p, p->pause, HCNTRL);
   while ((aic_inb(p, HCNTRL) & PAUSE) == 0)
   {
     ;
+  }
+  if(p->features & AHC_ULTRA2)
+  {
+    aic_inb(p, CCSCBCTL);
   }
 }
 
@@ -1716,7 +1592,7 @@ pause_sequencer(struct aic7xxx_host *p)
  *   Unpause the sequencer. Unremarkable, yet done often enough to
  *   warrant an easy way to do it.
  *-F*************************************************************************/
-static inline void
+static void
 unpause_sequencer(struct aic7xxx_host *p, int unpause_always)
 {
   if (unpause_always ||
@@ -1735,7 +1611,7 @@ unpause_sequencer(struct aic7xxx_host *p, int unpause_always)
  *   Restart the sequencer program from address zero.  This assumes
  *   that the sequencer is already paused.
  *-F*************************************************************************/
-static inline void
+static void
 restart_sequencer(struct aic7xxx_host *p)
 {
   aic_outb(p, 0, SEQADDR0);
@@ -1920,6 +1796,7 @@ aic7xxx_download_instr(struct aic7xxx_host *p, int instrptr,
       aic_outb(p, ((instr.integer >> 8) & 0xff), SEQRAM);
       aic_outb(p, ((instr.integer >> 16) & 0xff), SEQRAM);
       aic_outb(p, ((instr.integer >> 24) & 0xff), SEQRAM);
+      udelay(10);
       break;
 
     default:
@@ -2033,21 +1910,6 @@ aic7xxx_print_sequencer(struct aic7xxx_host *p, int downloaded)
 
 /*+F*************************************************************************
  * Function:
- *   aic7xxx_delay
- *
- * Description:
- *   Delay for specified amount of time.  We use mdelay because the timer
- *   interrupt is not guaranteed to be enabled.  This will cause an
- *   infinite loop since jiffies (clock ticks) is not updated.
- *-F*************************************************************************/
-static void
-aic7xxx_delay(int seconds)
-{
-  mdelay(seconds * 1000);
-}
-
-/*+F*************************************************************************
- * Function:
  *   aic7xxx_info
  *
  * Description:
@@ -2084,28 +1946,101 @@ aic7xxx_info(struct Scsi_Host *dooh)
  *-F*************************************************************************/
 static struct aic7xxx_syncrate *
 aic7xxx_find_syncrate(struct aic7xxx_host *p, unsigned int *period,
-  unsigned int maxsync)
+  unsigned int maxsync, unsigned char *options)
 {
   struct aic7xxx_syncrate *syncrate;
+  int done = FALSE;
 
+  switch(*options)
+  {
+    case MSG_EXT_PPR_OPTION_DT_CRC:
+    case MSG_EXT_PPR_OPTION_DT_UNITS:
+      if(!(p->features & AHC_ULTRA3))
+      {
+        *options = 0;
+        maxsync = MAX(maxsync, AHC_SYNCRATE_ULTRA2);
+      }
+      break;
+    case MSG_EXT_PPR_OPTION_DT_CRC_QUICK:
+    case MSG_EXT_PPR_OPTION_DT_UNITS_QUICK:
+      if(!(p->features & AHC_ULTRA3))
+      {
+        *options = 0;
+        maxsync = MAX(maxsync, AHC_SYNCRATE_ULTRA2);
+      }
+      else
+      {
+        /*
+         * we don't support the Quick Arbitration variants of dual edge
+         * clocking.  As it turns out, we want to send back the
+         * same basic option, but without the QA attribute.
+         * We know that we are responding because we would never set
+         * these options ourself, we would only respond to them.
+         */
+        switch(*options)
+        {
+          case MSG_EXT_PPR_OPTION_DT_CRC_QUICK:
+            *options = MSG_EXT_PPR_OPTION_DT_CRC;
+            break;
+          case MSG_EXT_PPR_OPTION_DT_UNITS_QUICK:
+            *options = MSG_EXT_PPR_OPTION_DT_UNITS;
+            break;
+        }
+      }
+      break;
+    default:
+      *options = 0;
+      maxsync = MAX(maxsync, AHC_SYNCRATE_ULTRA2);
+      break;
+  }
   syncrate = &aic7xxx_syncrates[maxsync];
   while ( (syncrate->rate[0] != NULL) &&
          (!(p->features & AHC_ULTRA2) || syncrate->sxfr_ultra2) )
   {
-    if ( *period <= syncrate->period )
+    if (*period <= syncrate->period) 
     {
-      /*
-       * When responding to a target that requests sync, the requested rate
-       * may fall between two rates that we can output, but still be a rate
-       * that we can receive.  Because of this, we want to respond with the
-       * same rate that it sent to us even if the persiod we use to send
-       * data to it is lower.  Only lower the response period if we must.
-       */
-      if(syncrate == &aic7xxx_syncrates[maxsync])
+      switch(*options)
       {
-        *period = syncrate->period;
+        case MSG_EXT_PPR_OPTION_DT_CRC:
+        case MSG_EXT_PPR_OPTION_DT_UNITS:
+          if(!(syncrate->sxfr_ultra2 & AHC_SYNCRATE_CRC))
+          {
+            done = TRUE;
+            /*
+             * oops, we went too low for the CRC/DualEdge signalling, so
+             * clear the options byte
+             */
+            *options = 0;
+            /*
+             * We'll be sending a reply to this packet to set the options
+             * properly, so unilaterally set the period as well.
+             */
+            *period = syncrate->period;
+          }
+          else
+          {
+            done = TRUE;
+            if(syncrate == &aic7xxx_syncrates[maxsync])
+            {
+              *period = syncrate->period;
+            }
+          }
+          break;
+        default:
+          if(!(syncrate->sxfr_ultra2 & AHC_SYNCRATE_CRC))
+          {
+            done = TRUE;
+            if(syncrate == &aic7xxx_syncrates[maxsync])
+            {
+              *period = syncrate->period;
+            }
+          }
+          break;
       }
-      break;
+      if(done)
+      {
+        break;
+      }
     }
     syncrate++;
   }
@@ -2115,7 +2050,8 @@ aic7xxx_find_syncrate(struct aic7xxx_host *p, unsigned int *period,
     /*
      * Use async transfers for this target
      */
-    *period = 0;
+    *options = 0;
+    *period = 255;
     syncrate = NULL;
   }
   return (syncrate);
@@ -2135,7 +2071,7 @@ aic7xxx_find_period(struct aic7xxx_host *p, unsigned int scsirate,
 {
   struct aic7xxx_syncrate *syncrate;
 
-  if ((p->features & AHC_ULTRA2) != 0)
+  if (p->features & AHC_ULTRA2)
   {
     scsirate &= SXFR_ULTRA2;
   }
@@ -2147,11 +2083,13 @@ aic7xxx_find_period(struct aic7xxx_host *p, unsigned int scsirate,
   syncrate = &aic7xxx_syncrates[maxsync];
   while (syncrate->rate[0] != NULL)
   {
-    if ((p->features & AHC_ULTRA2) != 0)
+    if (p->features & AHC_ULTRA2)
     {
       if (syncrate->sxfr_ultra2 == 0)
         break;
       else if (scsirate == syncrate->sxfr_ultra2)
+        return (syncrate->period);
+      else if (scsirate == (syncrate->sxfr_ultra2 & ~AHC_SYNCRATE_CRC))
         return (syncrate->period);
     }
     else if (scsirate == (syncrate->sxfr & ~ULTRA_SXFR))
@@ -2206,11 +2144,11 @@ aic7xxx_validate_offset(struct aic7xxx_host *p,
 static void
 aic7xxx_set_syncrate(struct aic7xxx_host *p, struct aic7xxx_syncrate *syncrate,
     int target, int channel, unsigned int period, unsigned int offset,
-    unsigned int type)
+    unsigned char options, unsigned int type)
 {
   unsigned char tindex;
   unsigned short target_mask;
-  unsigned char lun;
+  unsigned char lun, old_options;
   unsigned int old_period, old_offset;
 
   tindex = target | (channel << 3);
@@ -2225,6 +2163,7 @@ aic7xxx_set_syncrate(struct aic7xxx_host *p, struct aic7xxx_syncrate *syncrate,
 
   old_period = p->transinfo[tindex].cur_period;
   old_offset = p->transinfo[tindex].cur_offset;
+  old_options = p->transinfo[tindex].cur_options;
 
   
   if (type & AHC_TRANS_CUR)
@@ -2237,7 +2176,18 @@ aic7xxx_set_syncrate(struct aic7xxx_host *p, struct aic7xxx_syncrate *syncrate,
       scsirate &= ~SXFR_ULTRA2;
       if (syncrate != NULL)
       {
-        scsirate |= syncrate->sxfr_ultra2;
+        switch(options)
+        {
+          case MSG_EXT_PPR_OPTION_DT_UNITS:
+            /*
+             * mask off the CRC bit in the xfer settings
+             */
+            scsirate |= (syncrate->sxfr_ultra2 & ~AHC_SYNCRATE_CRC);
+            break;
+          default:
+            scsirate |= syncrate->sxfr_ultra2;
+            break;
+        }
       }
       if (type & AHC_TRANS_ACTIVE)
       {
@@ -2278,9 +2228,10 @@ aic7xxx_set_syncrate(struct aic7xxx_host *p, struct aic7xxx_syncrate *syncrate,
     aic_outb(p, scsirate, TARG_SCSIRATE + tindex);
     p->transinfo[tindex].cur_period = period;
     p->transinfo[tindex].cur_offset = offset;
+    p->transinfo[tindex].cur_options = options;
     if ( !(type & AHC_TRANS_QUITE) &&
          (aic7xxx_verbose & VERBOSE_NEGOTIATION) &&
-         (p->dev_flags[tindex] & DEVICE_PRINT_SDTR) )
+         (p->dev_flags[tindex] & DEVICE_PRINT_DTR) )
     {
       if (offset)
       {
@@ -2295,7 +2246,7 @@ aic7xxx_set_syncrate(struct aic7xxx_host *p, struct aic7xxx_syncrate *syncrate,
         printk(INFO_LEAD "Using asynchronous transfers.\n",
                p->host_no, channel, target, lun);
       }
-      p->dev_flags[tindex] &= ~DEVICE_PRINT_SDTR;
+      p->dev_flags[tindex] &= ~DEVICE_PRINT_DTR;
     }
   }
 
@@ -2303,12 +2254,14 @@ aic7xxx_set_syncrate(struct aic7xxx_host *p, struct aic7xxx_syncrate *syncrate,
   {
     p->transinfo[tindex].goal_period = period;
     p->transinfo[tindex].goal_offset = offset;
+    p->transinfo[tindex].goal_options = options;
   }
 
   if (type & AHC_TRANS_USER)
   {
     p->transinfo[tindex].user_period = period;
     p->transinfo[tindex].user_offset = offset;
+    p->transinfo[tindex].user_options = options;
   }
 }
 
@@ -2325,20 +2278,13 @@ aic7xxx_set_width(struct aic7xxx_host *p, int target, int channel, int lun,
 {
   unsigned char tindex;
   unsigned short target_mask;
-  unsigned int old_width, new_offset;
+  unsigned int old_width;
 
   tindex = target | (channel << 3);
   target_mask = 1 << tindex;
   
   old_width = p->transinfo[tindex].cur_width;
 
-  if (p->features & AHC_ULTRA2)
-    new_offset = MAX_OFFSET_ULTRA2;
-  else if (width == MSG_EXT_WDTR_BUS_16_BIT)
-    new_offset = MAX_OFFSET_16BIT;
-  else
-    new_offset = MAX_OFFSET_8BIT;
-  
   if (type & AHC_TRANS_CUR) 
   {
     unsigned char scsirate;
@@ -2356,12 +2302,12 @@ aic7xxx_set_width(struct aic7xxx_host *p, int target, int channel, int lun,
 
     p->transinfo[tindex].cur_width = width;
 
-    if ((aic7xxx_verbose & VERBOSE_NEGOTIATION2) && 
-        (p->dev_flags[tindex] & DEVICE_PRINT_WDTR))
+    if ( !(type & AHC_TRANS_QUITE) &&
+          (aic7xxx_verbose & VERBOSE_NEGOTIATION2) && 
+          (p->dev_flags[tindex] & DEVICE_PRINT_DTR) )
     {
       printk(INFO_LEAD "Using %s transfers\n", p->host_no, channel, target,
         lun, (scsirate & WIDEXFER) ? "Wide(16bit)" : "Narrow(8bit)" );
-      p->dev_flags[tindex] &= ~DEVICE_PRINT_WDTR;
     }
   }
 
@@ -2370,14 +2316,21 @@ aic7xxx_set_width(struct aic7xxx_host *p, int target, int channel, int lun,
   if (type & AHC_TRANS_USER)
     p->transinfo[tindex].user_width = width;
 
-  /*
-   * Having just set the width, the SDTR should come next, and we need a valid
-   * offset for the SDTR.  So, we make sure we put a valid one in here now as
-   * the goal_offset.
-   */
   if (p->transinfo[tindex].goal_offset)
-    p->transinfo[tindex].goal_offset = new_offset;
-
+  {
+    if (p->features & AHC_ULTRA2)
+    {
+      p->transinfo[tindex].goal_offset = MAX_OFFSET_ULTRA2;
+    }
+    else if (width == MSG_EXT_WDTR_BUS_16_BIT)
+    {
+      p->transinfo[tindex].goal_offset = MAX_OFFSET_16BIT;
+    }
+    else
+    {
+      p->transinfo[tindex].goal_offset = MAX_OFFSET_8BIT;
+    }
+  }
 }
       
 /*+F*************************************************************************
@@ -2543,14 +2496,6 @@ aic7xxx_match_scb(struct aic7xxx_host *p, struct aic7xxx_scb *scb,
   if (match != 0)
     match = ((tag == scb->hscb->tag) || (tag == SCB_LIST_NULL));
 
-  if (aic7xxx_verbose & (VERBOSE_ABORT_PROCESS | VERBOSE_RESET_PROCESS))
-  {
-    printk(KERN_INFO "(scsi%d:%d:%d:%d:tag%d) %s search criteria"
-      " (scsi%d:%d:%d:%d:tag%d)\n", p->host_no, CTL_OF_SCB(scb),
-      scb->hscb->tag, (match) ? "matches" : "doesn't match",
-      p->host_no, channel, target, lun, tag);
-  }
-
   return (match);
 }
 
@@ -2584,14 +2529,13 @@ aic7xxx_add_curscb_to_free_list(struct aic7xxx_host *p)
  *   to the free list.
  *-F*************************************************************************/
 static unsigned char
-aic7xxx_rem_scb_from_disc_list(struct aic7xxx_host *p, unsigned char scbptr)
+aic7xxx_rem_scb_from_disc_list(struct aic7xxx_host *p, unsigned char scbptr,
+                               unsigned char prev)
 {
   unsigned char next;
-  unsigned char prev;
 
   aic_outb(p, scbptr, SCBPTR);
   next = aic_inb(p, SCB_NEXT);
-  prev = aic_inb(p, SCB_PREV);
   aic7xxx_add_curscb_to_free_list(p);
 
   if (prev != SCB_LIST_NULL)
@@ -2604,11 +2548,6 @@ aic7xxx_rem_scb_from_disc_list(struct aic7xxx_host *p, unsigned char scbptr)
     aic_outb(p, next, DISCONNECTED_SCBH);
   }
 
-  if (next != SCB_LIST_NULL)
-  {
-    aic_outb(p, next, SCBPTR);
-    aic_outb(p, prev, SCB_PREV);
-  }
   return next;
 }
 
@@ -2693,15 +2632,14 @@ static int
 aic7xxx_allocate_scb(struct aic7xxx_host *p)
 {
   struct aic7xxx_scb   *scbp = NULL;
-  int scb_size = sizeof(struct aic7xxx_scb) +
-                 sizeof (struct hw_scatterlist) * AIC7XXX_MAX_SG;
+  int scb_size = (sizeof (struct hw_scatterlist) * AIC7XXX_MAX_SG) + 12 + 6;
   int i;
   int step = PAGE_SIZE / 1024;
   unsigned long scb_count = 0;
   struct hw_scatterlist *hsgp;
   struct aic7xxx_scb *scb_ap;
-  unsigned long temp;
-
+  struct aic7xxx_scb_dma *scb_dma;
+  unsigned char *bufs;
 
   if (p->scb_data->numscbs < p->scb_data->maxscbs)
   {
@@ -2715,6 +2653,11 @@ aic7xxx_allocate_scb(struct aic7xxx_host *p)
      * efficiency since scb_size * (i -1) is growing slightly faster
      * than the right hand side.  If the number of SG array elements
      * is changed, this function may not be near so efficient any more.
+     *
+     * Since the DMA'able buffers are now allocated in a seperate
+     * chunk this algorithm has been modified to match.  The '12'
+     * and '6' factors in scb_size are for the DMA'able command byte
+     * and sensebuffers respectively.  -DaveM
      */
     for ( i=step;; i *= 2 )
     {
@@ -2725,44 +2668,53 @@ aic7xxx_allocate_scb(struct aic7xxx_host *p)
       }
     }
     scb_count = MIN( (i-1), p->scb_data->maxscbs - p->scb_data->numscbs);
-    scb_ap = (struct aic7xxx_scb *)kmalloc(scb_size * scb_count, GFP_ATOMIC);
-    if (scb_ap != NULL)
+    scb_ap = (struct aic7xxx_scb *)kmalloc(sizeof (struct aic7xxx_scb) * scb_count
+					   + sizeof(struct aic7xxx_scb_dma), GFP_ATOMIC);
+    if (scb_ap == NULL)
+      return(0);
+    scb_dma = (struct aic7xxx_scb_dma *)&scb_ap[scb_count];
+    hsgp = (struct hw_scatterlist *)
+      pci_alloc_consistent(p->pdev, scb_size * scb_count,
+			   &scb_dma->dma_address);
+    if (hsgp == NULL)
     {
-#ifdef AIC7XXX_VERBOSE_DEBUGGING
-      if (aic7xxx_verbose > 0xffff)
-      {
-        if (p->scb_data->numscbs == 0)
-          printk(INFO_LEAD "Allocating initial %ld SCB structures.\n",
-            p->host_no, -1, -1, -1, scb_count);
-        else
-          printk(INFO_LEAD "Allocating %ld additional SCB structures.\n",
-            p->host_no, -1, -1, -1, scb_count);
-      }
-#endif
-      memset(scb_ap, 0, scb_count * scb_size);
-      temp = (unsigned long) &scb_ap[scb_count];
-      temp += 1023;
-      temp &= ~1023;
-      hsgp = (struct hw_scatterlist *)temp;
-      for (i=0; i < scb_count; i++)
-      {
-        scbp = &scb_ap[i];
-        scbp->hscb = &p->scb_data->hscbs[p->scb_data->numscbs];
-        scbp->sg_list = &hsgp[i * AIC7XXX_MAX_SG];
-        memset(scbp->hscb, 0, sizeof(struct aic7xxx_hwscb));
-        scbp->hscb->tag = p->scb_data->numscbs;
-        /*
-         * Place in the scb array; never is removed
-         */
-        p->scb_data->scb_array[p->scb_data->numscbs++] = scbp;
-        scbq_insert_head(&p->scb_data->free_scbs, scbp);
-      }
-      scbp->kmalloc_ptr = scb_ap;
-    }
-    else
-    {
+      kfree(scb_ap);
       return(0);
     }
+    bufs = (unsigned char *)&hsgp[scb_count * AIC7XXX_MAX_SG];
+#ifdef AIC7XXX_VERBOSE_DEBUGGING
+    if (aic7xxx_verbose > 0xffff)
+    {
+      if (p->scb_data->numscbs == 0)
+	printk(INFO_LEAD "Allocating initial %ld SCB structures.\n",
+	  p->host_no, -1, -1, -1, scb_count);
+      else
+	printk(INFO_LEAD "Allocating %ld additional SCB structures.\n",
+	  p->host_no, -1, -1, -1, scb_count);
+    }
+#endif
+    memset(scb_ap, 0, sizeof (struct aic7xxx_scb) * scb_count);
+    scb_dma->dma_offset = (unsigned long)scb_dma->dma_address
+			  - (unsigned long)hsgp;
+    scb_dma->dma_len = scb_size * scb_count;
+    for (i=0; i < scb_count; i++)
+    {
+      scbp = &scb_ap[i];
+      scbp->hscb = &p->scb_data->hscbs[p->scb_data->numscbs];
+      scbp->sg_list = &hsgp[i * AIC7XXX_MAX_SG];
+      scbp->sense_cmd = bufs;
+      scbp->cmnd = bufs + 6;
+      bufs += 12 + 6;
+      scbp->scb_dma = scb_dma;
+      memset(scbp->hscb, 0, sizeof(struct aic7xxx_hwscb));
+      scbp->hscb->tag = p->scb_data->numscbs;
+      /*
+       * Place in the scb array; never is removed
+       */
+      p->scb_data->scb_array[p->scb_data->numscbs++] = scbp;
+      scbq_insert_tail(&p->scb_data->free_scbs, scbp);
+    }
+    scbp->kmalloc_ptr = scb_ap;
   }
   return(scb_count);
 }
@@ -2796,6 +2748,7 @@ aic7xxx_done_cmds_complete(struct aic7xxx_host *p)
   Scsi_Cmnd *cmd;
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2,1,95)
   unsigned int cpu_flags = 0;
+#endif
   
   DRIVER_LOCK
   while (p->completeq.head != NULL)
@@ -2803,20 +2756,9 @@ aic7xxx_done_cmds_complete(struct aic7xxx_host *p)
     cmd = p->completeq.head;
     p->completeq.head = (Scsi_Cmnd *)cmd->host_scribble;
     cmd->host_scribble = NULL;
-    sti();
     cmd->scsi_done(cmd);
-    cli();
   }
   DRIVER_UNLOCK
-#else
-  while (p->completeq.head != NULL)
-  {
-    cmd = p->completeq.head;
-    p->completeq.head = (Scsi_Cmnd *)cmd->host_scribble;
-    cmd->host_scribble = NULL;
-    cmd->scsi_done(cmd);
-  }
-#endif
 }
 
 /*+F*************************************************************************
@@ -2857,6 +2799,24 @@ aic7xxx_done(struct aic7xxx_host *p, struct aic7xxx_scb *scb)
   struct aic7xxx_scb *scbp;
   unsigned char queue_depth;
 
+  if (cmd->use_sg > 1)
+  {
+    struct scatterlist *sg;
+
+    sg = (struct scatterlist *)cmd->request_buffer;
+    pci_unmap_sg(p->pdev, sg, cmd->use_sg, scsi_to_pci_dma_dir(cmd->sc_data_direction));
+  }
+  else if (cmd->request_bufflen)
+    pci_unmap_single(p->pdev, aic7xxx_mapping(cmd),
+		     cmd->request_bufflen,
+                     scsi_to_pci_dma_dir(cmd->sc_data_direction));
+  if (scb->flags & SCB_SENSE)
+  {
+    pci_unmap_single(p->pdev,
+                     le32_to_cpu(scb->sg_list[0].address),
+                     sizeof(cmd->sense_buffer),
+                     PCI_DMA_FROMDEVICE);
+  }
   if (scb->flags & SCB_RECOVERY_SCB)
   {
     p->flags &= ~AHC_ABORT_PENDING;
@@ -2889,16 +2849,14 @@ aic7xxx_done(struct aic7xxx_host *p, struct aic7xxx_scb *scb)
       }
 #define WIDE_INQUIRY_BITS 0x60
 #define SYNC_INQUIRY_BITS 0x10
+#define SCSI_VERSION_BITS 0x07
+#define SCSI_DT_BIT       0x04
       if ( (buffer[7] & WIDE_INQUIRY_BITS) &&
            (p->features & AHC_WIDE) )
       {
         p->needwdtr |= (1<<tindex);
         p->needwdtr_copy |= (1<<tindex);
-        if ( (p->flags & AHC_SEEPROM_FOUND) &&
-             (p->transinfo[tindex].user_width != MSG_EXT_WDTR_BUS_16_BIT) )
-          p->transinfo[tindex].goal_width = MSG_EXT_WDTR_BUS_8_BIT;
-        else
-          p->transinfo[tindex].goal_width = MSG_EXT_WDTR_BUS_16_BIT;
+        p->transinfo[tindex].goal_width = p->transinfo[tindex].user_width;
       }
       else
       {
@@ -2911,55 +2869,99 @@ aic7xxx_done(struct aic7xxx_host *p, struct aic7xxx_scb *scb)
                                                    AHC_TRANS_CUR) );
         unpause_sequencer(p, FALSE);
       }
-      if (buffer[7] & SYNC_INQUIRY_BITS)
+      if ( (buffer[7] & SYNC_INQUIRY_BITS) &&
+            p->transinfo[tindex].user_offset )
       {
-        p->needsdtr |= (1<<tindex);
-        p->needsdtr_copy |= (1<<tindex);
-
-        if (p->flags & AHC_SEEPROM_FOUND)
+        p->transinfo[tindex].goal_period = p->transinfo[tindex].user_period;
+        p->transinfo[tindex].goal_options = p->transinfo[tindex].user_options;
+        if (p->features & AHC_ULTRA2)
+          p->transinfo[tindex].goal_offset = MAX_OFFSET_ULTRA2;
+        else if (p->transinfo[tindex].goal_width == MSG_EXT_WDTR_BUS_16_BIT)
+          p->transinfo[tindex].goal_offset = MAX_OFFSET_16BIT;
+        else
+          p->transinfo[tindex].goal_offset = MAX_OFFSET_8BIT;
+        if ( (((buffer[2] & SCSI_VERSION_BITS) == 3) ||
+               (buffer[56] & SCSI_DT_BIT) ||
+	       (p->dev_flags[tindex] & DEVICE_SCSI_3) ) &&
+               (p->transinfo[tindex].user_period <= 9) &&
+               (p->transinfo[tindex].user_options) )
         {
-          p->transinfo[tindex].goal_period = p->transinfo[tindex].user_period;
-          p->transinfo[tindex].goal_offset = p->transinfo[tindex].user_offset;
+          p->needppr |= (1<<tindex);
+          p->needppr_copy |= (1<<tindex);
+          p->needsdtr &= ~(1<<tindex);
+          p->needsdtr_copy &= ~(1<<tindex);
+          p->needwdtr &= ~(1<<tindex);
+          p->needwdtr_copy &= ~(1<<tindex);
+          p->dev_flags[tindex] |= DEVICE_SCSI_3;
         }
         else
         {
-          if (p->features & AHC_ULTRA2)
-          {
-            p->transinfo[tindex].goal_period =
-              aic7xxx_syncrates[AHC_SYNCRATE_ULTRA2].period;
-          }
-          else if (p->features & AHC_ULTRA)
-          {
-            p->transinfo[tindex].goal_period =
-              aic7xxx_syncrates[AHC_SYNCRATE_ULTRA].period;
-          }
-          else
-          {
-            p->transinfo[tindex].goal_period =
-              aic7xxx_syncrates[AHC_SYNCRATE_FAST].period;
-          }
-          if (p->features & AHC_ULTRA2)
-            p->transinfo[tindex].goal_offset = MAX_OFFSET_ULTRA2;
-          else if (p->transinfo[tindex].goal_width == MSG_EXT_WDTR_BUS_16_BIT)
-            p->transinfo[tindex].goal_offset = MAX_OFFSET_16BIT;
-          else
-            p->transinfo[tindex].goal_offset = MAX_OFFSET_8BIT;
+          p->needsdtr |= (1<<tindex);
+          p->needsdtr_copy |= (1<<tindex);
+          p->transinfo[tindex].goal_period = 
+            MAX(10, p->transinfo[tindex].goal_period);
+          p->transinfo[tindex].goal_options = 0;
         }
       }
       else
       {
         p->needsdtr &= ~(1<<tindex);
         p->needsdtr_copy &= ~(1<<tindex);
-        p->transinfo[tindex].goal_period = 0;
+        p->transinfo[tindex].goal_period = 255;
         p->transinfo[tindex].goal_offset = 0;
+        p->transinfo[tindex].goal_options = 0;
       }
-      p->dev_flags[tindex] |= DEVICE_SCANNED;
-      p->dev_flags[tindex] |= DEVICE_PRINT_WDTR | DEVICE_PRINT_SDTR;
+      /*
+       * This is needed to work around a sequencer bug for now.  Regardless
+       * of the controller in use, if we have a Quantum drive, we need to
+       * limit the speed to 80MByte/sec.  As soon as I get a fixed version
+       * of the sequencer, this code will get yanked.
+       */
+      if(!strncmp(buffer + 8, "QUANTUM", 7) &&
+         p->transinfo[tindex].goal_options )
+      {
+        p->transinfo[tindex].goal_period = 
+          MAX(p->transinfo[tindex].goal_period, 10);
+        p->transinfo[tindex].goal_options = 0;
+        p->needppr &= ~(1<<tindex);
+        p->needppr_copy &= ~(1<<tindex);
+        p->needsdtr |= (1<<tindex);
+        p->needsdtr_copy |= (1<<tindex);
+        p->needwdtr |= (1<<tindex);
+        p->needwdtr_copy |= (1<<tindex);
+      }
+      /*
+       * Get the INQUIRY checksum.  We use this on Ultra 160/m
+       * and older devices both.  It allows us to drop speed on any bus type
+       * while at the same time giving us the needed domain validation for
+       * Ultra 160/m
+       *
+       * Note: We only get the checksum and set the SCANNED bit if this is
+       * one of our dtr commands.  If we don't do this, then we end up
+       * getting bad checksum results on the mid-level SCSI code's INQUIRY
+       * commands.
+       */
+      if(p->dev_dtr_cmnd[tindex] == cmd) {
+        unsigned int checksum = 0;
+        int *ibuffer;
+        int i=0;
+
+        ibuffer = (int *)buffer;
+        for( i = 0; i < (cmd->request_bufflen >> 2); i++)
+        {
+          checksum += ibuffer[i];
+        }
+        p->dev_checksum[tindex] = checksum;
+        p->dev_flags[tindex] |= DEVICE_SCANNED;
+        p->dev_flags[tindex] |= DEVICE_PRINT_DTR;
+      }
 #undef WIDE_INQUIRY_BITS
 #undef SYNC_INQUIRY_BITS
+#undef SCSI_VERSION_BITS
+#undef SCSI_DT_BIT
     }
   }
-  else if ((scb->flags & (SCB_MSGOUT_WDTR | SCB_MSGOUT_SDTR)) != 0)
+  else if ((scb->flags & SCB_MSGOUT_BITS) != 0)
   {
     unsigned short mask;
     int message_error = FALSE;
@@ -2979,11 +2981,11 @@ aic7xxx_done(struct aic7xxx_host *p, struct aic7xxx_scb *scb)
 
     if (scb->flags & SCB_MSGOUT_WDTR)
     {
-      p->wdtr_pending &= ~mask;
+      p->dtr_pending &= ~mask;
       if (message_error)
       {
         if ( (aic7xxx_verbose & VERBOSE_NEGOTIATION2) &&
-             (p->dev_flags[tindex] & DEVICE_PRINT_WDTR) )
+             (p->dev_flags[tindex] & DEVICE_PRINT_DTR) )
         {
           printk(INFO_LEAD "Device failed to complete Wide Negotiation "
             "processing and\n", p->host_no, CTL_OF_SCB(scb));
@@ -2991,7 +2993,6 @@ aic7xxx_done(struct aic7xxx_host *p, struct aic7xxx_scb *scb)
             "disabling future\n", p->host_no, CTL_OF_SCB(scb));
           printk(INFO_LEAD "Wide negotiation to this device.\n", p->host_no,
             CTL_OF_SCB(scb));
-          p->dev_flags[tindex] &= ~DEVICE_PRINT_WDTR;
         }
         p->needwdtr &= ~mask;
         p->needwdtr_copy &= ~mask;
@@ -2999,11 +3000,11 @@ aic7xxx_done(struct aic7xxx_host *p, struct aic7xxx_scb *scb)
     }
     if (scb->flags & SCB_MSGOUT_SDTR)
     {
-      p->sdtr_pending &= ~mask;
+      p->dtr_pending &= ~mask;
       if (message_error)
       {
         if ( (aic7xxx_verbose & VERBOSE_NEGOTIATION2) &&
-             (p->dev_flags[tindex] & DEVICE_PRINT_SDTR) )
+             (p->dev_flags[tindex] & DEVICE_PRINT_DTR) )
         {
           printk(INFO_LEAD "Device failed to complete Sync Negotiation "
             "processing and\n", p->host_no, CTL_OF_SCB(scb));
@@ -3011,10 +3012,36 @@ aic7xxx_done(struct aic7xxx_host *p, struct aic7xxx_scb *scb)
             "disabling future\n", p->host_no, CTL_OF_SCB(scb));
           printk(INFO_LEAD "Sync negotiation to this device.\n", p->host_no,
             CTL_OF_SCB(scb));
-          p->dev_flags[tindex] &= ~DEVICE_PRINT_SDTR;
+          p->dev_flags[tindex] &= ~DEVICE_PRINT_DTR;
         }
         p->needsdtr &= ~mask;
         p->needsdtr_copy &= ~mask;
+      }
+    }
+    if (scb->flags & SCB_MSGOUT_PPR)
+    {
+      p->dtr_pending &= ~mask;
+      if(message_error)
+      {
+        if ( (aic7xxx_verbose & VERBOSE_NEGOTIATION2) &&
+             (p->dev_flags[tindex] & DEVICE_PRINT_DTR) )
+        {
+          printk(INFO_LEAD "Device failed to complete Parallel Protocol "
+            "Request processing and\n", p->host_no, CTL_OF_SCB(scb));
+          printk(INFO_LEAD "returned a sense error code for invalid message, "
+            "disabling future\n", p->host_no, CTL_OF_SCB(scb));
+          printk(INFO_LEAD "Parallel Protocol Request negotiation to this "
+            "device.\n", p->host_no, CTL_OF_SCB(scb));
+        }
+        /*
+         * Disable PPR negotiation and revert back to WDTR and SDTR setup
+         */
+        p->needppr &= ~mask;
+        p->needppr_copy &= ~mask;
+        p->needsdtr |= mask;
+        p->needsdtr_copy |= mask;
+        p->needwdtr |= mask;
+        p->needwdtr_copy |= mask;
       }
     }
   }
@@ -3057,16 +3084,6 @@ aic7xxx_done(struct aic7xxx_host *p, struct aic7xxx_scb *scb)
   }
   p->dev_active_cmds[tindex]--;
   p->activescbs--;
-
-  /*
-   * If this was an untagged I/O, unbusy the target so the sequencer won't
-   * mistake things later
-   */
-  if (aic7xxx_index_busy_target(p, scb->hscb->target_channel_lun, FALSE) ==
-      scb->hscb->tag)
-  {
-    aic7xxx_index_busy_target(p, scb->hscb->target_channel_lun, TRUE);
-  }
 
   {
     int actual;
@@ -3122,7 +3139,7 @@ aic7xxx_done(struct aic7xxx_host *p, struct aic7xxx_scb *scb)
 #endif /* AIC7XXX_PROC_STATS */
       }
 #ifdef AIC7XXX_PROC_STATS
-      x = -10;
+      x = -11;
       while(actual)
       {
         actual >>= 1;
@@ -3429,11 +3446,10 @@ aic7xxx_reset_device(struct aic7xxx_host *p, int target, int channel,
       if (aic7xxx_verbose & (VERBOSE_ABORT_PROCESS | VERBOSE_RESET_PROCESS))
         printk(INFO_LEAD "Cleaning up status information "
           "and delayed_scbs.\n", p->host_no, channel, i, lun);
-      p->dev_flags[i] &= ~BUS_DEVICE_RESET_PENDING;
+      p->dev_flags[i] &= ~(BUS_DEVICE_RESET_PENDING | DEVICE_PARITY_ERROR);
       if ( tag == SCB_LIST_NULL )
       {
-        p->dev_flags[i] |= DEVICE_PRINT_WDTR | DEVICE_PRINT_SDTR |
-                           DEVICE_RESET_DELAY;
+        p->dev_flags[i] |= DEVICE_PRINT_DTR | DEVICE_RESET_DELAY;
         p->dev_expires[i] = jiffies + (4 * HZ);
         p->dev_timer_active |= (0x01 << i);
         p->dev_last_queue_full_count[i] = 0;
@@ -3489,9 +3505,7 @@ aic7xxx_reset_device(struct aic7xxx_host *p, int target, int channel,
       if ( !(p->dev_timer_active & (0x01 << MAX_TARGETS)) ||
             time_after_eq(p->dev_timer.expires, p->dev_expires[i]) )
       {
-        del_timer(&p->dev_timer);
-        p->dev_timer.expires = p->dev_expires[i];
-        add_timer(&p->dev_timer);
+        mod_timer(&p->dev_timer, p->dev_expires[i]);
         p->dev_timer_active |= (0x01 << MAX_TARGETS);
       }
     }
@@ -3625,7 +3639,7 @@ aic7xxx_reset_device(struct aic7xxx_host *p, int target, int channel,
   if (aic7xxx_verbose & (VERBOSE_ABORT_PROCESS | VERBOSE_RESET_PROCESS))
     printk(INFO_LEAD "Cleaning disconnected scbs "
       "list.\n", p->host_no, channel, target, lun);
-  if (p->features & AHC_PAGESCBS)
+  if (p->flags & AHC_PAGESCBS)
   {
     unsigned char next, prev, scb_index;
 
@@ -3641,14 +3655,14 @@ aic7xxx_reset_device(struct aic7xxx_host *p, int target, int channel,
         printk(WARN_LEAD "Disconnected List inconsistency; SCB index=%d, "
           "numscbs=%d\n", p->host_no, channel, target, lun, scb_index,
           p->scb_data->numscbs);
-        next = aic7xxx_rem_scb_from_disc_list(p, next);
+        next = aic7xxx_rem_scb_from_disc_list(p, next, prev);
       }
       else
       {
         scbp = p->scb_data->scb_array[scb_index];
         if (aic7xxx_match_scb(p, scbp, target, channel, lun, tag))
         {
-          next = aic7xxx_rem_scb_from_disc_list(p, next);
+          next = aic7xxx_rem_scb_from_disc_list(p, next, prev);
           if (scbp->flags & SCB_WAITINGQ)
           {
             p->dev_active_cmds[TARGET_INDEX(scbp->cmd)]++;
@@ -3677,7 +3691,7 @@ aic7xxx_reset_device(struct aic7xxx_host *p, int target, int channel,
    * Walk the free list making sure no entries on the free list have
    * a valid SCB_TAG value or SCB_CONTROL byte.
    */
-  if (p->features & AHC_PAGESCBS)
+  if (p->flags & AHC_PAGESCBS)
   {
     unsigned char next;
 
@@ -3734,7 +3748,6 @@ aic7xxx_reset_device(struct aic7xxx_host *p, int target, int channel,
     {
       aic_outb(p, SCB_LIST_NULL, SCB_TAG);
       aic_outb(p, SCB_LIST_NULL, SCB_NEXT);
-      aic_outb(p, SCB_LIST_NULL, SCB_PREV);
       aic_outb(p, 0, SCB_CONTROL);
       aic7xxx_add_curscb_to_free_list(p);
     }
@@ -3829,11 +3842,19 @@ aic7xxx_reset_current_bus(struct aic7xxx_host *p)
   while ( (aic_inb(p, SCSISEQ) & SCSIRSTO) == 0)
     mdelay(5);
 
-  mdelay(10);
+  /*
+   * Some of the new Ultra2 chipsets need a longer delay after a chip
+   * reset than just the init setup creates, so we have to delay here
+   * before we go into a reset in order to make the chips happy.
+   */
+  if (p->features & AHC_ULTRA2)
+    mdelay(250);
+  else
+    mdelay(50);
 
   /* Turn off the bus reset. */
   aic_outb(p, 0, SCSISEQ);
-  mdelay(5);
+  mdelay(10);
 
   aic7xxx_clear_intstat(p);
   /* Re-enable reset interrupts. */
@@ -3863,28 +3884,35 @@ aic7xxx_reset_channel(struct aic7xxx_host *p, int channel, int initiate_reset)
   if (channel == 1)
   {
     p->needsdtr |= (p->needsdtr_copy & 0xFF00);
-    p->sdtr_pending &= 0x00FF;
+    p->dtr_pending &= 0x00FF;
     offset_min = 8;
     offset_max = 16;
   }
   else
   {
-    if (p->features & AHC_WIDE)
-    {
-      p->needsdtr = p->needsdtr_copy;
-      p->needwdtr = p->needwdtr_copy;
-      p->sdtr_pending = 0x0;
-      p->wdtr_pending = 0x0;
-      offset_min = 0;
-      offset_max = 16;
-    }
-    else
+    if (p->features & AHC_TWIN)
     {
       /* Channel A */
       p->needsdtr |= (p->needsdtr_copy & 0x00FF);
-      p->sdtr_pending &= 0xFF00;
+      p->dtr_pending &= 0xFF00;
       offset_min = 0;
       offset_max = 8;
+    }
+    else
+    {
+      p->needppr = p->needppr_copy;
+      p->needsdtr = p->needsdtr_copy;
+      p->needwdtr = p->needwdtr_copy;
+      p->dtr_pending = 0x0;
+      offset_min = 0;
+      if (p->features & AHC_WIDE)
+      {
+        offset_max = 16;
+      }
+      else
+      {
+        offset_max = 8;
+      }
     }
   }
 
@@ -4062,12 +4090,7 @@ aic7xxx_pci_intr(struct aic7xxx_host *p)
 {
   unsigned char status1;
 
-#if LINUX_VERSION_CODE > KERNEL_VERSION(2,1,92)
   pci_read_config_byte(p->pdev, PCI_STATUS + 1, &status1);
-#else
-  pcibios_read_config_byte(p->pci_bus, p->pci_device_fn,
-                           PCI_STATUS + 1, &status1);
-#endif
 
   if ( (status1 & DPE) && (aic7xxx_verbose & VERBOSE_MINOR_ERROR) )
     printk(WARN_LEAD "Data Parity Error during PCI address or PCI write"
@@ -4088,12 +4111,7 @@ aic7xxx_pci_intr(struct aic7xxx_host *p)
     printk(WARN_LEAD "Data Parity Error has been reported via PCI pin "
       "PERR#\n", p->host_no, -1, -1, -1);
   
-#if LINUX_VERSION_CODE > KERNEL_VERSION(2,1,92)
   pci_write_config_byte(p->pdev, PCI_STATUS + 1, status1);
-#else
-  pcibios_write_config_byte(p->pci_bus, p->pci_device_fn,
-                            PCI_STATUS + 1, status1);
-#endif
   if (status1 & (DPR|RMA|RTA))
     aic_outb(p,  CLRPARERR, CLRINT);
 
@@ -4118,11 +4136,7 @@ aic7xxx_timer(struct aic7xxx_host *p)
   unsigned long cpu_flags = 0;
   struct aic7xxx_scb *scb;
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,1,95)   
-  DRIVER_LOCK
-#else
   spin_lock_irqsave(&io_request_lock, cpu_flags);
-#endif
   p->dev_timer_active &= ~(0x01 << MAX_TARGETS);
   if ( (p->dev_timer_active & (0x01 << p->scsi_id)) &&
        time_after_eq(jiffies, p->dev_expires[p->scsi_id]) )
@@ -4179,11 +4193,31 @@ aic7xxx_timer(struct aic7xxx_host *p)
   }
 
   aic7xxx_run_waiting_queues(p);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,1,95)   
-  DRIVER_UNLOCK
-#else
   spin_unlock_irqrestore(&io_request_lock, cpu_flags);
-#endif
+}
+
+/*+F*************************************************************************
+ * Function:
+ *   aic7xxx_construct_ppr
+ *
+ * Description:
+ *   Build up a Parallel Protocol Request message for use with SCSI-3
+ *   devices.
+ *-F*************************************************************************/
+static void
+aic7xxx_construct_ppr(struct aic7xxx_host *p, struct aic7xxx_scb *scb)
+{
+  int tindex = TARGET_INDEX(scb->cmd);
+
+  p->msg_buf[p->msg_index++] = MSG_EXTENDED;
+  p->msg_buf[p->msg_index++] = MSG_EXT_PPR_LEN;
+  p->msg_buf[p->msg_index++] = MSG_EXT_PPR;
+  p->msg_buf[p->msg_index++] = p->transinfo[tindex].goal_period;
+  p->msg_buf[p->msg_index++] = 0;
+  p->msg_buf[p->msg_index++] = p->transinfo[tindex].goal_offset;
+  p->msg_buf[p->msg_index++] = p->transinfo[tindex].goal_width;
+  p->msg_buf[p->msg_index++] = p->transinfo[tindex].goal_options;
+  p->msg_len += 8;
 }
 
 /*+F*************************************************************************
@@ -4304,10 +4338,10 @@ aic7xxx_handle_device_reset(struct aic7xxx_host *p, int target, int channel)
   /*
    * Go back to async/narrow transfers and renegotiate.
    */
+  p->needppr |= (p->needppr_copy & targ_mask);
   p->needsdtr |= (p->needsdtr_copy & targ_mask);
   p->needwdtr |= (p->needwdtr_copy & targ_mask);
-  p->sdtr_pending &= ~targ_mask;
-  p->wdtr_pending &= ~targ_mask;
+  p->dtr_pending &= ~targ_mask;
   aic_outb(p, 0, TARG_SCSIRATE + tindex);
   if (p->features & AHC_ULTRA2)
     aic_outb(p, 0, TARG_OFFSET + tindex);
@@ -4315,7 +4349,7 @@ aic7xxx_handle_device_reset(struct aic7xxx_host *p, int target, int channel)
   if (aic7xxx_verbose & VERBOSE_RESET_PROCESS)
     printk(INFO_LEAD "Bus Device Reset delivered.\n", p->host_no, channel,
       target, -1);
-  aic7xxx_run_done_queue(p, /*complete*/ FALSE);
+  aic7xxx_run_done_queue(p, /*complete*/ TRUE);
 }
 
 /*+F*************************************************************************
@@ -4360,6 +4394,8 @@ aic7xxx_handle_seqint(struct aic7xxx_host *p, unsigned char intstat)
                p->host_no, channel, target, lun,
                aic_inb(p, SAVED_TCL), aic_inb(p, ARG_1),
                (aic_inb(p, SEQADDR1) << 8) | aic_inb(p, SEQADDR0));
+        if (aic7xxx_panic_on_abort)
+          aic7xxx_panic_abort(p, NULL);
       }
       break;
 
@@ -4387,7 +4423,7 @@ aic7xxx_handle_seqint(struct aic7xxx_host *p, unsigned char intstat)
             lun, aic_inb(p, LASTPHASE), aic_inb(p, SAVED_TCL));
 
         aic7xxx_reset_channel(p, channel, /*initiate reset*/ TRUE);
-        aic7xxx_run_done_queue(p, FALSE);
+        aic7xxx_run_done_queue(p, TRUE);
 
       }
       break;
@@ -4517,7 +4553,7 @@ aic7xxx_handle_seqint(struct aic7xxx_host *p, unsigned char intstat)
                   aic7xxx_reset_device(p, target, channel, lun, i);
                   reset++;
                 }
-                aic7xxx_run_done_queue(p, FALSE);
+                aic7xxx_run_done_queue(p, TRUE);
               }
             }
             aic7xxx_verbose = old_verbose;
@@ -4533,6 +4569,53 @@ aic7xxx_handle_seqint(struct aic7xxx_host *p, unsigned char intstat)
             aic_outb(p, aic_inb(p, SCSISIGI) | ATNO, SCSISIGO);
           }
         }
+        else if (scb->flags & SCB_MSGOUT_PPR)
+        {
+          /*
+           * As per the draft specs, any device capable of supporting any of
+           * the option values other than 0 are not allowed to reject the
+           * PPR message.  Instead, they must negotiate out what they do
+           * support instead of rejecting our offering or else they cause
+           * a parity error during msg_out phase to signal that they don't
+           * like our settings.
+           */
+          p->needppr &= ~target_mask;
+          p->needppr_copy &= ~target_mask;
+          aic7xxx_set_width(p, target, channel, lun, MSG_EXT_WDTR_BUS_8_BIT,
+            (AHC_TRANS_ACTIVE|AHC_TRANS_CUR|AHC_TRANS_QUITE));
+          aic7xxx_set_syncrate(p, NULL, target, channel, 0, 0, 0,
+                               AHC_TRANS_ACTIVE|AHC_TRANS_CUR|AHC_TRANS_QUITE);
+          p->transinfo[tindex].goal_options = 0;
+          p->dtr_pending &= ~target_mask;
+          scb->flags &= ~SCB_MSGOUT_BITS;
+          if(aic7xxx_verbose & VERBOSE_NEGOTIATION2)
+          {
+            printk(INFO_LEAD "Device is rejecting PPR messages, falling "
+              "back.\n", p->host_no, channel, target, lun);
+          }
+          if ( p->transinfo[tindex].goal_width )
+          {
+            p->needwdtr |= target_mask;
+            p->needwdtr_copy |= target_mask;
+            p->dtr_pending |= target_mask;
+            scb->flags |= SCB_MSGOUT_WDTR;
+          }
+          if ( p->transinfo[tindex].goal_offset )
+          {
+            p->needsdtr |= target_mask;
+            p->needsdtr_copy |= target_mask;
+            if( !(p->dtr_pending & target_mask) )
+            {
+              p->dtr_pending |= target_mask;
+              scb->flags |= SCB_MSGOUT_SDTR;
+            }
+          }
+          if ( p->dtr_pending & target_mask )
+          {
+            aic_outb(p, HOST_MSG, MSG_OUT);
+            aic_outb(p, aic_inb(p, SCSISIGI) | ATNO, SCSISIGO);
+          }
+        }
         else if (scb->flags & SCB_MSGOUT_WDTR)
         {
           /*
@@ -4540,20 +4623,18 @@ aic7xxx_handle_seqint(struct aic7xxx_host *p, unsigned char intstat)
            */
           p->needwdtr &= ~target_mask;
           p->needwdtr_copy &= ~target_mask;
-          p->wdtr_pending &= ~target_mask;
+          p->dtr_pending &= ~target_mask;
           scb->flags &= ~SCB_MSGOUT_BITS;
           aic7xxx_set_width(p, target, channel, lun, MSG_EXT_WDTR_BUS_8_BIT,
             (AHC_TRANS_ACTIVE|AHC_TRANS_GOAL|AHC_TRANS_CUR));
-          aic7xxx_set_syncrate(p, NULL, target, channel, 0, 0,
+          aic7xxx_set_syncrate(p, NULL, target, channel, 0, 0, 0,
                                AHC_TRANS_ACTIVE|AHC_TRANS_CUR|AHC_TRANS_QUITE);
-          if ( (p->needsdtr_copy & target_mask) &&
-               !(p->sdtr_pending & target_mask) )
+          if(aic7xxx_verbose & VERBOSE_NEGOTIATION2)
           {
-            p->sdtr_pending |= target_mask;
-            scb->flags |= SCB_MSGOUT_SDTR;
-            aic_outb(p, HOST_MSG, MSG_OUT);
-            aic_outb(p, aic_inb(p, SCSISIGO) | ATNO, SCSISIGO);
+            printk(INFO_LEAD "Device is rejecting WDTR messages, using "
+              "narrow transfers.\n", p->host_no, channel, target, lun);
           }
+          p->needsdtr |= (p->needsdtr_copy & target_mask);
         }
         else if (scb->flags & SCB_MSGOUT_SDTR)
         {
@@ -4562,10 +4643,15 @@ aic7xxx_handle_seqint(struct aic7xxx_host *p, unsigned char intstat)
           */
           p->needsdtr &= ~target_mask;
           p->needsdtr_copy &= ~target_mask;
-          p->sdtr_pending &= ~target_mask;
+          p->dtr_pending &= ~target_mask;
           scb->flags &= ~SCB_MSGOUT_SDTR;
-          aic7xxx_set_syncrate(p, NULL, target, channel, 0, 0,
+          aic7xxx_set_syncrate(p, NULL, target, channel, 0, 0, 0,
             (AHC_TRANS_CUR|AHC_TRANS_ACTIVE|AHC_TRANS_GOAL));
+          if(aic7xxx_verbose & VERBOSE_NEGOTIATION2)
+          {
+            printk(INFO_LEAD "Device is rejecting SDTR messages, using "
+              "async transfers.\n", p->host_no, channel, target, lun);
+          }
         }
         else if (aic7xxx_verbose & VERBOSE_SEQINT)
         {
@@ -4632,39 +4718,35 @@ aic7xxx_handle_seqint(struct aic7xxx_host *p, unsigned char intstat)
               if ( !(scb->flags & SCB_SENSE) )
               {
                 /*
-                 * XXX - How do we save the residual (if there is one).
-                 */
-                if ( hscb->residual_SG_segment_count != 0 )
-                  aic7xxx_calculate_residual(p, scb);
-
-                /*
-                   * Send a sense command to the requesting target.
+                 * Send a sense command to the requesting target.
                  * XXX - revisit this and get rid of the memcopys.
-                   */
-                memcpy(&scb->sense_cmd[0], &generic_sense[0],
+                 */
+                memcpy(scb->sense_cmd, &generic_sense[0],
                        sizeof(generic_sense));
 
                 scb->sense_cmd[1] = (cmd->lun << 5);
                 scb->sense_cmd[4] = sizeof(cmd->sense_buffer);
 
-                scb->sg_list[0].address = 
-                  cpu_to_le32(VIRT_TO_BUS(&cmd->sense_buffer[0]));
                 scb->sg_list[0].length = 
                   cpu_to_le32(sizeof(cmd->sense_buffer));
+		scb->sg_list[0].address =
+                        cpu_to_le32(pci_map_single(p->pdev, cmd->sense_buffer,
+                                                   sizeof(cmd->sense_buffer),
+                                                   PCI_DMA_FROMDEVICE));
 
                 /*
                  * XXX - We should allow disconnection, but can't as it
                  * might allow overlapped tagged commands.
                  */
-                  /* hscb->control &= DISCENB; */
+                /* hscb->control &= DISCENB; */
                 hscb->control = 0;
                 hscb->target_status = 0;
                 hscb->SG_list_pointer = 
-                  cpu_to_le32(VIRT_TO_BUS(&scb->sg_list[0]));
-                hscb->data_pointer = scb->sg_list[0].address;
-                hscb->data_count = scb->sg_list[0].length;
+		  cpu_to_le32(SCB_DMA_ADDR(scb, scb->sg_list));
                 hscb->SCSI_cmd_pointer = 
-                  cpu_to_le32(VIRT_TO_BUS(&scb->sense_cmd[0]));
+                  cpu_to_le32(SCB_DMA_ADDR(scb, scb->sense_cmd));
+                hscb->data_count = scb->sg_list[0].length;
+                hscb->data_pointer = scb->sg_list[0].address;
                 hscb->SCSI_cmd_length = COMMAND_SIZE(scb->sense_cmd[0]);
                 hscb->residual_SG_segment_count = 0;
                 hscb->residual_data_count[0] = 0;
@@ -4674,105 +4756,13 @@ aic7xxx_handle_seqint(struct aic7xxx_host *p, unsigned char intstat)
                 scb->sg_count = hscb->SG_segment_count = 1;
                 scb->sg_length = sizeof(cmd->sense_buffer);
                 scb->tag_action = 0;
-                /*
-                 * This problem could be caused if the target has lost power
-                 * or found some other way to loose the negotiation settings,
-                 * so if needed, we'll re-negotiate while doing the sense cmd.
-                 * However, if this SCB already was attempting to negotiate,
-                 * then we assume this isn't the problem and skip this part.
-                 */
-#ifdef AIC7XXX_FAKE_NEGOTIATION_CMDS
-                if ( (scb->cmd->cmnd[0] != TEST_UNIT_READY) &&
-                     (p->dev_flags[tindex] & DEVICE_SCANNED) &&
-                     !(p->wdtr_pending & target_mask) && 
-                     !(p->sdtr_pending & target_mask) )
-                {
-                  p->needwdtr |= (p->needwdtr_copy & target_mask);
-                  p->needsdtr |= (p->needsdtr_copy & target_mask);
-                }
-                else if ( (scb->cmd == p->dev_wdtr_cmnd[tindex]) ||
-                          (scb->cmd == p->dev_sdtr_cmnd[tindex]) )
-                {
-                  /*
-                   * This is already a negotiation command, so we must have
-                   * already done either WDTR or SDTR (or maybe both).  So
-                   * we simply check sdtr_pending and needsdtr to see if we
-                   * should throw out SDTR on this command.
-                   *
-                   * Note: Don't check the needsdtr_copy here, instead just
-                   * check to see if WDTR wiped out our SDTR and set needsdtr.
-                   * Even if WDTR did wipe out SDTR and set needsdtr, if
-                   * parse_msg() then turned around and started our SDTR
-                   * in back to back fasion, then conclusion of that should
-                   * have negated any needsdtr setting.  That's why we only
-                   * check needsdtr and sdtr_pending.
-                   */
-                  scb->flags &= ~SCB_MSGOUT_BITS;
-                  if ( (scb->cmd == p->dev_wdtr_cmnd[tindex]) &&
-                       !(p->sdtr_pending & target_mask) &&
-                       (p->needsdtr & target_mask) )
-                  {
-                    p->sdtr_pending |= target_mask;
-                    hscb->control |= MK_MESSAGE;
-                    scb->flags |= SCB_MSGOUT_SDTR;
-                  }
-
-                  /*
-                   * This is the important part though.  We are getting sense
-                   * info back from this device.  It's going into a fake
-                   * command.  We need to put that into the real command
-                   * instead so that the mid level SCSI code can act upon it.
-                   * So, when we set up these fake commands, the next pointer
-                   * is used to point to the real command.  Use that to change
-                   * the address of our sense_buffer[] to the real command.
-                   * However, don't do this if the real command is also a
-                   * TEST_UNIT_READY as it will most likely pull down its own
-                   * SENSE information anyway.
-                   */
-                  if (cmd->next->cmnd[0] != TEST_UNIT_READY)
-                  {
-                    scb->sg_list[0].address = 
-                      cpu_to_le32(VIRT_TO_BUS(&cmd->next->sense_buffer[0]));
-                    hscb->data_pointer = scb->sg_list[0].address;
-                  }
-                }
-#else
-                if (  (scb->cmd->cmnd[0] != TEST_UNIT_READY) &&
-                     !(scb->flags & SCB_MSGOUT_BITS) && 
-                      (scb->cmd->lun == 0) &&
-                      (p->dev_flags[TARGET_INDEX(scb->cmd)] & DEVICE_SCANNED) )
-                {
-                  if ( (p->needwdtr_copy & target_mask) &&
-                      !(p->wdtr_pending & target_mask) &&
-                      !(p->sdtr_pending & target_mask) )
-                  {
-                    p->needwdtr |= target_mask;
-                    p->wdtr_pending |= target_mask;
-                    hscb->control |= MK_MESSAGE;
-                    scb->flags |= SCB_MSGOUT_WDTR;
-                  }
-                  if ( p->needsdtr_copy & target_mask )
-                  {
-                    p->needsdtr |= target_mask;
-                    if ( !(p->wdtr_pending & target_mask) &&
-                         !(p->sdtr_pending & target_mask) )
-                    {
-                      p->sdtr_pending |= target_mask;
-                      hscb->control |= MK_MESSAGE;
-                      scb->flags |= SCB_MSGOUT_SDTR;
-                    }
-                  }
-                }
-                else
-                  scb->flags &= ~SCB_MSGOUT_BITS;
-#endif /* AIC7XXX_FAKE_NEGOTIATION_CMDS */
                 scb->flags |= SCB_SENSE;
                 /*
                  * Ensure the target is busy since this will be an
                  * an untagged request.
                  */
 #ifdef AIC7XXX_VERBOSE_DEBUGGING
-                if (aic7xxx_verbose > 0xffff)
+                if (aic7xxx_verbose & VERBOSE_NEGOTIATION2)
                 {
                   if (scb->flags & SCB_MSGOUT_BITS)
                     printk(INFO_LEAD "Requesting SENSE with %s\n", p->host_no,
@@ -4788,7 +4778,7 @@ aic7xxx_handle_seqint(struct aic7xxx_host *p, unsigned char intstat)
                 aic7xxx_error(cmd) = DID_OK;
                 break;
               }  /* first time sense, no errors */
-              aic7xxx_error(cmd) = DID_OK;
+              aic7xxx_error(cmd) = DID_ERROR;
               scb->flags &= ~SCB_SENSE;
               break;
 
@@ -4907,14 +4897,11 @@ aic7xxx_handle_seqint(struct aic7xxx_host *p, unsigned char intstat)
                 }
                 else if ( time_after_eq(p->dev_timer.expires,
                                         p->dev_expires[tindex]) )
-                {
-                  del_timer(&p->dev_timer);
-                  p->dev_timer.expires = p->dev_expires[tindex];
-                  add_timer(&p->dev_timer);
-                }
+                  mod_timer(&p->dev_timer, p->dev_expires[tindex]);
               }
 #ifdef AIC7XXX_VERBOSE_DEBUGGING
-              if (aic7xxx_verbose & VERBOSE_MINOR_ERROR)
+              if( (aic7xxx_verbose & VERBOSE_MINOR_ERROR) ||
+                  (aic7xxx_verbose > 0xffff) )
               {
                 if (queue_flag)
                   printk(INFO_LEAD "Queue full received; queue depth %d, "
@@ -4928,8 +4915,6 @@ aic7xxx_handle_seqint(struct aic7xxx_host *p, unsigned char intstat)
 #endif
               if (queue_flag)
               {
-                p->dev_temp_queue_depth[tindex] = 
-                  p->dev_active_cmds[tindex];
                 if ( p->dev_last_queue_full[tindex] !=
                      p->dev_active_cmds[tindex] )
                 {
@@ -4951,10 +4936,28 @@ aic7xxx_handle_seqint(struct aic7xxx_host *p, unsigned char intstat)
                       p->dev_active_cmds[tindex];
                   p->dev_last_queue_full[tindex] = 0;
                   p->dev_last_queue_full_count[tindex] = 0;
+                  p->dev_temp_queue_depth[tindex] = 
+                    p->dev_active_cmds[tindex];
+                }
+                else if (p->dev_active_cmds[tindex] == 0)
+                {
+                  if (aic7xxx_verbose & VERBOSE_NEGOTIATION)
+                  {
+                    printk(INFO_LEAD "QUEUE_FULL status received with 0 "
+                           "commands active.\n", p->host_no, CTL_OF_SCB(scb));
+                    printk(INFO_LEAD "Tagged Command Queueing disabled\n",
+                           p->host_no, CTL_OF_SCB(scb));
+                  }
+                  p->dev_max_queue_depth[tindex] = 1;
+                  p->dev_temp_queue_depth[tindex] = 1;
+                  scb->tag_action = 0;
+                  scb->hscb->control &= ~(MSG_ORDERED_Q_TAG|MSG_SIMPLE_Q_TAG);
                 }
                 else
                 {
                   p->dev_flags[tindex] |= DEVICE_WAS_BUSY;
+                  p->dev_temp_queue_depth[tindex] = 
+                    p->dev_active_cmds[tindex];
                 }
               }
               break;
@@ -4989,7 +4992,7 @@ aic7xxx_handle_seqint(struct aic7xxx_host *p, unsigned char intstat)
          */
 
         if ( !(scb->flags & SCB_DEVICE_RESET) &&
-              (aic_inb(p, MSG_OUT) == MSG_IDENTIFYFLAG) &&
+              (msg_out == MSG_IDENTIFYFLAG) &&
               (scb->hscb->control & TAG_ENB) )
         {
           p->msg_buf[p->msg_index++] = scb->tag_action;
@@ -5020,34 +5023,32 @@ aic7xxx_handle_seqint(struct aic7xxx_host *p, unsigned char intstat)
             printk(INFO_LEAD "Abort message mailed.\n", p->host_no,
               CTL_OF_SCB(scb));
         }
+        else if (scb->flags & SCB_MSGOUT_PPR)
+        {
+          if (aic7xxx_verbose & VERBOSE_NEGOTIATION2)
+          {
+            printk(INFO_LEAD "Sending PPR (%d/%d/%d/%d) message.\n",
+                   p->host_no, CTL_OF_SCB(scb),
+                   p->transinfo[tindex].goal_period,
+                   p->transinfo[tindex].goal_offset,
+                   p->transinfo[tindex].goal_width,
+                   p->transinfo[tindex].goal_options);
+          }
+          aic7xxx_construct_ppr(p, scb);
+        }
         else if (scb->flags & SCB_MSGOUT_WDTR)
         {
-#ifdef AIC7XXX_VERBOSE_DEBUGGING
-          if (aic7xxx_verbose > 0xffff)
+          if (aic7xxx_verbose & VERBOSE_NEGOTIATION2)
+          {
             printk(INFO_LEAD "Sending WDTR message.\n", p->host_no,
                    CTL_OF_SCB(scb));
-#endif
-          aic7xxx_construct_wdtr(p,
-            p->transinfo[TARGET_INDEX(scb->cmd)].goal_width);
+          }
+          aic7xxx_construct_wdtr(p, p->transinfo[tindex].goal_width);
         }
         else if (scb->flags & SCB_MSGOUT_SDTR)
         {
           unsigned int max_sync, period;
-          /*
-           * We need to set an accurate goal_offset instead of
-           * the ridiculously high one we default to.  We should
-           * now know if we are wide.  Plus, the WDTR code will 
-           * set our goal_offset for us as well.
-           */
-          if (p->transinfo[tindex].goal_offset)
-          {
-            if (p->features & AHC_ULTRA2)
-              p->transinfo[tindex].goal_offset = MAX_OFFSET_ULTRA2;
-            else if (p->transinfo[tindex].cur_width == MSG_EXT_WDTR_BUS_16_BIT)
-              p->transinfo[tindex].goal_offset = MAX_OFFSET_16BIT;
-            else
-              p->transinfo[tindex].goal_offset = MAX_OFFSET_8BIT;
-          }
+          unsigned char options = 0;
           /*
            * Now that the device is selected, use the bits in SBLKCTL and
            * SSTAT2 to determine the max sync rate for this device.
@@ -5073,14 +5074,13 @@ aic7xxx_handle_seqint(struct aic7xxx_host *p, unsigned char intstat)
             max_sync = AHC_SYNCRATE_FAST;
           }
           period = p->transinfo[tindex].goal_period;
-          aic7xxx_find_syncrate(p, &period, max_sync);
-#ifdef AIC7XXX_VERBOSE_DEBUGGING
-          if (aic7xxx_verbose > 0xffff)
+          aic7xxx_find_syncrate(p, &period, max_sync, &options);
+          if (aic7xxx_verbose & VERBOSE_NEGOTIATION2)
+          {
             printk(INFO_LEAD "Sending SDTR %d/%d message.\n", p->host_no,
-                   CTL_OF_SCB(scb),
-                   p->transinfo[tindex].goal_period,
+                   CTL_OF_SCB(scb), period,
                    p->transinfo[tindex].goal_offset);
-#endif
+          }
           aic7xxx_construct_sdtr(p, period,
             p->transinfo[tindex].goal_offset);
         }
@@ -5151,18 +5151,200 @@ aic7xxx_handle_seqint(struct aic7xxx_host *p, unsigned char intstat)
       }
       break;
 
+    case WIDE_RESIDUE:
+      {
+        unsigned char resid_sgcnt, index;
+        unsigned char scb_index = aic_inb(p, SCB_TAG);
+        unsigned int cur_addr, resid_dcnt;
+        unsigned int native_addr, native_length;
+        int i;
+
+        if(scb_index > p->scb_data->numscbs)
+        {
+          printk(WARN_LEAD "invalid scb_index during WIDE_RESIDUE.\n",
+            p->host_no, -1, -1, -1);
+          /*
+           * XXX: Add error handling here
+           */
+          break;
+        }
+        scb = p->scb_data->scb_array[scb_index];
+        if(!(scb->flags & SCB_ACTIVE) || (scb->cmd == NULL))
+        {
+          printk(WARN_LEAD "invalid scb during WIDE_RESIDUE flags:0x%x "
+                 "scb->cmd:0x%lx\n", p->host_no, CTL_OF_SCB(scb),
+                 scb->flags, (unsigned long)scb->cmd);
+          break;
+        }
+
+        /*
+         * We have a valid scb to use on this WIDE_RESIDUE message, so
+         * we need to walk the sg list looking for this particular sg
+         * segment, then see if we happen to be at the very beginning of
+         * the segment.  If we are, then we have to back things up to
+         * the previous segment.  If not, then we simply need to remove
+         * one byte from this segments address and add one to the byte
+         * count.
+         */
+        cur_addr = aic_inb(p, SHADDR) | (aic_inb(p, SHADDR + 1) << 8) |
+          (aic_inb(p, SHADDR + 2) << 16) | (aic_inb(p, SHADDR + 3) << 24);
+        resid_sgcnt = aic_inb(p, SCB_RESID_SGCNT);
+        resid_dcnt = aic_inb(p, SCB_RESID_DCNT) |
+          (aic_inb(p, SCB_RESID_DCNT + 1) << 8) |
+          (aic_inb(p, SCB_RESID_DCNT + 2) << 16);
+        index = scb->sg_count - (resid_sgcnt + 1);
+        native_addr = le32_to_cpu(scb->sg_list[index].address);
+        native_length = le32_to_cpu(scb->sg_list[index].length);
+        /*
+         * Make sure this is a valid sg_seg for the given pointer
+         */
+        if(cur_addr < native_addr ||
+           cur_addr > (native_addr + native_length + 1))
+        {
+          printk(WARN_LEAD "invalid cur_addr:0x%x during WIDE_RESIDUE\n",
+                 p->host_no, CTL_OF_SCB(scb), cur_addr);
+          if(index > 0)
+            printk(WARN_LEAD "  sg_address[-1]:0x%x sg_length[-1]:%d\n",
+                   p->host_no, CTL_OF_SCB(scb),
+                   le32_to_cpu(scb->sg_list[index - 1].address),
+                   le32_to_cpu(scb->sg_list[index - 1].length));
+          printk(WARN_LEAD "  sg_address:0x%x sg_length:%d\n",
+                 p->host_no, CTL_OF_SCB(scb),
+                 native_addr, native_length);
+          if(resid_sgcnt > 1)
+            printk(WARN_LEAD "  sg_address[1]:0x%x sg_length[1]:%d\n",
+                   p->host_no, CTL_OF_SCB(scb),
+                   le32_to_cpu(scb->sg_list[index + 1].address),
+                   le32_to_cpu(scb->sg_list[index + 1].length));
+          printk(WARN_LEAD "  cur_address:0x%x resid_dcnt:0x%06x\n",
+                 p->host_no, CTL_OF_SCB(scb),
+                 cur_addr, resid_dcnt);
+          break;
+        }
+
+        if( (resid_sgcnt == 0) &&
+            ((resid_dcnt == 0) || (resid_dcnt == 0xffffff)))
+        {
+          /*
+           * We are at the end of the transfer and this is about a byte
+           * we ignored already (because the sequencer knew this was
+           * the last segment and set the adapter to ignore any wide
+           * residue bytes that might come through, which is only done
+           * on the last scatter gather segment of transfers).
+           */
+          break;
+        }
+        else if(cur_addr == native_addr)
+        {
+          /*
+           * If our current address matches the sg_seg->address then we
+           * have to back up the sg array to the previous segment and set
+           * it up to have only one byte of transfer left to go.
+           */
+          if(index == 0)
+          {
+            printk(WARN_LEAD "bogus WIDE_RESIDUE message, no data has been "
+                   "transferred.\n", p->host_no, CTL_OF_SCB(scb));
+            break;
+          }
+          resid_sgcnt++;
+          index--;
+          cur_addr = le32_to_cpu(scb->sg_list[index].address) + 
+            le32_to_cpu(scb->sg_list[index].length) - 1;
+          native_addr = aic_inb(p, SG_NEXT) | (aic_inb(p, SG_NEXT + 1) << 8)
+            | (aic_inb(p, SG_NEXT + 2) << 16) | (aic_inb(p, SG_NEXT + 3) << 24);
+          native_addr -= SG_SIZEOF;
+          aic_outb(p, resid_sgcnt, SG_COUNT);
+          aic_outb(p, resid_sgcnt, SCB_RESID_SGCNT);
+          aic_outb(p, native_addr & 0xff, SG_NEXT);
+          aic_outb(p, (native_addr >> 8) & 0xff, SG_NEXT + 1);
+          aic_outb(p, (native_addr >> 16) & 0xff, SG_NEXT + 2);
+          aic_outb(p, (native_addr >> 24) & 0xff, SG_NEXT + 3);
+          aic_outb(p, 1, SCB_RESID_DCNT); 
+          aic_outb(p, 0, SCB_RESID_DCNT + 1); 
+          aic_outb(p, 0, SCB_RESID_DCNT + 2); 
+          aic_outb(p, 1, HCNT); 
+          aic_outb(p, 0, HCNT + 1); 
+          aic_outb(p, 0, HCNT + 2); 
+          aic_outb(p, cur_addr & 0xff, HADDR);
+          aic_outb(p, (cur_addr >> 8) & 0xff, HADDR + 1);
+          aic_outb(p, (cur_addr >> 16) & 0xff, HADDR + 2);
+          aic_outb(p, (cur_addr >> 24) & 0xff, HADDR + 3);
+        }
+        else
+        {
+          /*
+           * Back the data pointer up by one and add one to the remaining
+           * byte count.  Then store that in the HCNT and HADDR registers.
+           */
+          cur_addr--;
+          resid_dcnt++;
+          aic_outb(p, resid_dcnt & 0xff, SCB_RESID_DCNT); 
+          aic_outb(p, (resid_dcnt >> 8) & 0xff, SCB_RESID_DCNT + 1); 
+          aic_outb(p, (resid_dcnt >> 16) & 0xff, SCB_RESID_DCNT + 2); 
+          aic_outb(p, resid_dcnt & 0xff, HCNT); 
+          aic_outb(p, (resid_dcnt >> 8) & 0xff, HCNT + 1); 
+          aic_outb(p, (resid_dcnt >> 16) & 0xff, HCNT + 2); 
+          aic_outb(p, cur_addr & 0xff, HADDR);
+          aic_outb(p, (cur_addr >> 8) & 0xff, HADDR + 1);
+          aic_outb(p, (cur_addr >> 16) & 0xff, HADDR + 2);
+          aic_outb(p, (cur_addr >> 24) & 0xff, HADDR + 3);
+        }
+        /*
+         * The sequencer actually wants to find the new address and byte
+         * count in the SHCNT and SHADDR register sets.  These registers
+         * are a shadow of the regular HCNT and HADDR registers.  On the
+         * Ultra2 controllers, these registers are read only and the way
+         * we have to set their values is to put the values we want into
+         * the HCNT and HADDR registers and then output PRELOADEN into
+         * the DFCNTRL register which causes the card to latch the current
+         * values in the HADDR and HCNT registers and drop it through to
+         * the shadow registers.  On older cards we copy them directly
+         * across by hand.
+         */
+        if(p->features & AHC_ULTRA2)
+        {
+          aic_outb(p, aic_inb(p, DMAPARAMS), DFCNTRL);
+          i=0;
+          udelay(1);
+          while(((aic_inb(p, SSTAT0) & SDONE) != 0) && (i++ < 1000))
+          {
+            udelay(1);
+          }
+          aic_outb(p, aic_inb(p, DMAPARAMS) & ~(SCSIEN|HDMAEN), DFCNTRL);
+          i=0;
+          udelay(1);
+          while(((aic_inb(p, DFCNTRL) & (SCSIEN|HDMAEN)) != 0) && (i++ < 1000))
+          {
+            udelay(1);
+          }
+        }
+        else
+        {
+          aic_outb(p, resid_dcnt & 0xff, STCNT); 
+          aic_outb(p, (resid_dcnt >> 8) & 0xff, STCNT + 1); 
+          aic_outb(p, (resid_dcnt >> 16) & 0xff, STCNT + 2); 
+          aic_outb(p, cur_addr & 0xff, SHADDR);
+          aic_outb(p, (cur_addr >> 8) & 0xff, SHADDR + 1);
+          aic_outb(p, (cur_addr >> 16) & 0xff, SHADDR + 2);
+          aic_outb(p, (cur_addr >> 24) & 0xff, SHADDR + 3);
+        }
+      }
+      break;
+
+        
 #if AIC7XXX_NOT_YET 
     case TRACEPOINT:
       {
-        printk(INFO_LEAD "Tracepoint #1 reached.\n", p->host_no, channel,
-          target, lun);
+        printk(INFO_LEAD "Tracepoint #1 reached.\n", p->host_no,
+               channel, target, lun);
       }
       break;
 
     case TRACEPOINT2:
       {
-        printk(INFO_LEAD "Tracepoint #2 reached.\n", p->host_no, channel,
-          target, lun);
+        printk(INFO_LEAD "Tracepoint #2 reached.\n", p->host_no,
+               channel, target, lun);
       }
       break;
 
@@ -5237,7 +5419,7 @@ aic7xxx_parse_msg(struct aic7xxx_host *p, struct aic7xxx_scb *scb)
       case MSG_EXT_SDTR:
       {
         unsigned int period, offset;
-        unsigned char maxsync, saved_offset;
+        unsigned char maxsync, saved_offset, options;
         struct aic7xxx_syncrate *syncrate;
         
         if (p->msg_buf[1] != MSG_EXT_SDTR_LEN)
@@ -5253,7 +5435,13 @@ aic7xxx_parse_msg(struct aic7xxx_host *p, struct aic7xxx_scb *scb)
 
         period = p->msg_buf[3];
         saved_offset = offset = p->msg_buf[4];
+        options = 0;
 
+        /*
+         * Even if we are an Ultra3 card, don't allow Ultra3 sync rates when
+         * using the SDTR messages.  We need the PPR messages to enable the
+         * higher speeds that include things like Dual Edge clocking.
+         */
         if (p->features & AHC_ULTRA2)
         {
           if ( (aic_inb(p, SBLKCTL) & ENAB40) &&
@@ -5283,7 +5471,9 @@ aic7xxx_parse_msg(struct aic7xxx_host *p, struct aic7xxx_scb *scb)
         if ( (scb->flags & (SCB_MSGOUT_SENT|SCB_MSGOUT_SDTR)) !=
              (SCB_MSGOUT_SENT|SCB_MSGOUT_SDTR) )
         {
-          if (!(p->dev_flags[tindex] & DEVICE_SCANNED))
+          if (!(p->dev_flags[tindex] & DEVICE_SCANNED) &&
+              !(p->needsdtr_copy & target_mask) &&
+               (p->transinfo[tindex].user_offset) )
           {
             /*
              * Not only is the device starting this up, but it also hasn't
@@ -5295,9 +5485,24 @@ aic7xxx_parse_msg(struct aic7xxx_host *p, struct aic7xxx_scb *scb)
              */
             p->transinfo[tindex].goal_period =
               p->transinfo[tindex].user_period;
-            p->transinfo[tindex].goal_offset =
-              p->transinfo[tindex].user_offset;
+            if(p->features & AHC_ULTRA2)
+            {
+              p->transinfo[tindex].goal_offset = MAX_OFFSET_ULTRA2;
+            }
+            else if (p->transinfo[tindex].cur_width)
+            {
+              p->transinfo[tindex].goal_offset = MAX_OFFSET_16BIT;
+            }
+            else
+            {
+              p->transinfo[tindex].goal_offset = MAX_OFFSET_8BIT;
+            }
             p->needsdtr_copy |= target_mask;
+          }
+          if (aic7xxx_verbose & VERBOSE_NEGOTIATION2)
+          {
+            printk(INFO_LEAD "Received pre-emptive SDTR message from "
+                   "target.\n", p->host_no, CTL_OF_SCB(scb));
           }
           if ( !p->transinfo[tindex].goal_offset )
             period = 255;
@@ -5305,28 +5510,24 @@ aic7xxx_parse_msg(struct aic7xxx_host *p, struct aic7xxx_scb *scb)
             period = p->transinfo[tindex].goal_period;
         }
   
-        syncrate = aic7xxx_find_syncrate(p, &period, maxsync);
+        syncrate = aic7xxx_find_syncrate(p, &period, maxsync, &options);
         aic7xxx_validate_offset(p, syncrate, &offset,
                                 target_scsirate & WIDEXFER);
         aic7xxx_set_syncrate(p, syncrate, target, channel, period,
-                             offset, AHC_TRANS_ACTIVE|AHC_TRANS_CUR);
+                             offset, options, AHC_TRANS_ACTIVE|AHC_TRANS_CUR);
 
         /*
-         * Did we drop to async?  If so, are we sending a reply?  If we are,
+         * Did we drop to async?  Or are we sending a reply?  If we are,
          * then we have to make sure that the reply value reflects the proper
          * settings so we need to set the goal values according to what
          * we need to send.
          */
-        if ( (offset == 0) || (offset != saved_offset) ||
+        if ( (offset != saved_offset) ||
              ((scb->flags & (SCB_MSGOUT_SENT|SCB_MSGOUT_SDTR)) !=
               (SCB_MSGOUT_SENT|SCB_MSGOUT_SDTR) ) )
         {
-          aic7xxx_set_syncrate(p, syncrate, target, channel, period,
-                               offset, AHC_TRANS_GOAL|AHC_TRANS_QUITE);
-          if ( offset == 0 )
-          {
-            p->needsdtr_copy &= ~target_mask;
-          }
+          aic7xxx_set_syncrate(p, syncrate, target, channel, period, offset,
+                               options, AHC_TRANS_GOAL|AHC_TRANS_QUITE);
         }
         
         /*
@@ -5334,15 +5535,13 @@ aic7xxx_parse_msg(struct aic7xxx_host *p, struct aic7xxx_scb *scb)
          * go async, then send an SDTR back to the target
          */
         p->needsdtr &= ~target_mask;
-        p->sdtr_pending &= ~target_mask;
-        if ( ((scb->flags & (SCB_MSGOUT_SENT|SCB_MSGOUT_SDTR)) ==
-              (SCB_MSGOUT_SENT|SCB_MSGOUT_SDTR)) &&
-             (offset == saved_offset) )
+        p->dtr_pending &= ~target_mask;
+        if ( ((scb->flags & (SCB_MSGOUT_SENT|SCB_MSGOUT_SDTR)) !=
+              (SCB_MSGOUT_SENT|SCB_MSGOUT_SDTR)) ||
+             (offset != saved_offset) )
         {
-          scb->flags &= ~SCB_MSGOUT_BITS;
-        }
-        else
-        {
+          reply = TRUE;
+          p->dtr_pending |= target_mask;
           scb->flags &= ~SCB_MSGOUT_BITS;
           scb->flags |= SCB_MSGOUT_SDTR;
           aic_outb(p, HOST_MSG, MSG_OUT);
@@ -5376,12 +5575,11 @@ aic7xxx_parse_msg(struct aic7xxx_host *p, struct aic7xxx_scb *scb)
             {
               reject = TRUE;
               if ( (aic7xxx_verbose & VERBOSE_NEGOTIATION2) &&
-                   ((p->dev_flags[tindex] & DEVICE_PRINT_WDTR) ||
+                   ((p->dev_flags[tindex] & DEVICE_PRINT_DTR) ||
                     (aic7xxx_verbose > 0xffff)) )
               {
                 printk(INFO_LEAD "Requesting %d bit transfers, rejecting.\n",
                   p->host_no, CTL_OF_SCB(scb), 8 * (0x01 << bus_width));
-                p->dev_flags[tindex] &= ~DEVICE_PRINT_WDTR;
               }
             } /* We fall through on purpose */
             case MSG_EXT_WDTR_BUS_8_BIT:
@@ -5395,15 +5593,11 @@ aic7xxx_parse_msg(struct aic7xxx_host *p, struct aic7xxx_scb *scb)
               break;
             }
           }
-          scb->flags &= ~SCB_MSGOUT_BITS;
-          p->wdtr_pending &= ~target_mask;
+          p->dtr_pending &= ~target_mask;
           p->needwdtr &= ~target_mask;
         }
         else
         {
-          scb->flags &= ~SCB_MSGOUT_BITS;
-          scb->flags |= SCB_MSGOUT_WDTR;
-          reply = TRUE;
           if ( !(p->dev_flags[tindex] & DEVICE_SCANNED) )
           {
             /* 
@@ -5413,12 +5607,32 @@ aic7xxx_parse_msg(struct aic7xxx_host *p, struct aic7xxx_scb *scb)
              */
             p->transinfo[tindex].goal_period =
               p->transinfo[tindex].user_period;
-            p->transinfo[tindex].goal_offset =
-              p->transinfo[tindex].user_offset;
+            if(p->transinfo[tindex].user_offset)
+            {
+              if(p->features & AHC_ULTRA2)
+              {
+                p->transinfo[tindex].goal_offset = MAX_OFFSET_ULTRA2;
+              }
+              else if( p->transinfo[tindex].user_width &&
+                       (bus_width == MSG_EXT_WDTR_BUS_16_BIT) &&
+                       p->features & AHC_WIDE )
+              {
+                p->transinfo[tindex].goal_offset = MAX_OFFSET_16BIT;
+              }
+              else
+              {
+                p->transinfo[tindex].goal_offset = MAX_OFFSET_8BIT;
+              }
+            }
             p->transinfo[tindex].goal_width =
               p->transinfo[tindex].user_width;
             p->needwdtr_copy |= target_mask;
             p->needsdtr_copy |= target_mask;
+          }
+          if (aic7xxx_verbose & VERBOSE_NEGOTIATION2)
+          {
+            printk(INFO_LEAD "Received pre-emptive WDTR message from "
+                   "target.\n", p->host_no, CTL_OF_SCB(scb));
           }
           switch(bus_width)
           {
@@ -5441,8 +5655,11 @@ aic7xxx_parse_msg(struct aic7xxx_host *p, struct aic7xxx_scb *scb)
               break;
             }
           }
+          reply = TRUE;
+          scb->flags &= ~SCB_MSGOUT_BITS;
+          scb->flags |= SCB_MSGOUT_WDTR;
           p->needwdtr &= ~target_mask;
-          p->wdtr_pending &= ~target_mask;
+          p->dtr_pending |= target_mask;
           aic_outb(p, HOST_MSG, MSG_OUT);
           aic_outb(p, aic_inb(p, SCSISIGO) | ATNO, SCSISIGO);
         }
@@ -5456,23 +5673,210 @@ aic7xxx_parse_msg(struct aic7xxx_host *p, struct aic7xxx_scb *scb)
          * supports SDTR at all.  Therefore, we check needsdtr_copy instead
          * of needstr.
          */
-        aic7xxx_set_syncrate(p, NULL, target, channel, 0, 0,
+        aic7xxx_set_syncrate(p, NULL, target, channel, 0, 0, 0,
                              AHC_TRANS_ACTIVE|AHC_TRANS_CUR|AHC_TRANS_QUITE);
-        if ( (p->needsdtr_copy & target_mask) &&
-            !(p->sdtr_pending & target_mask))
+        p->needsdtr |= (p->needsdtr_copy & target_mask);
+        done = TRUE;
+        break;
+      }
+      case MSG_EXT_PPR:
+      {
+        unsigned char bus_width, trans_options, new_trans_options;
+        unsigned int period, offset;
+        unsigned char maxsync, saved_offset;
+        struct aic7xxx_syncrate *syncrate;
+        
+        if (p->msg_buf[1] != MSG_EXT_PPR_LEN)
         {
-          p->needsdtr |= target_mask;
-          if ( !reject && !reply )
+          reject = TRUE;
+          break;
+        }
+
+        if (p->msg_len < (MSG_EXT_PPR_LEN + 2))
+        {
+          break;
+        }
+
+        period = p->msg_buf[3];
+        offset = saved_offset = p->msg_buf[5];
+        bus_width = p->msg_buf[6];
+        trans_options = new_trans_options = p->msg_buf[7] & 0xf;
+
+        if(aic7xxx_verbose & VERBOSE_NEGOTIATION2)
+        {
+          printk(INFO_LEAD "Parsing PPR message (%d/%d/%d/%d)\n",
+                 p->host_no, CTL_OF_SCB(scb), period, offset, bus_width,
+                 trans_options);
+        }
+
+        if ( (aic_inb(p, SBLKCTL) & ENAB40) &&
+            !(aic_inb(p, SSTAT2) & EXP_ACTIVE) )
+        {
+          if(p->features & AHC_ULTRA3)
           {
-            scb->flags &= ~SCB_MSGOUT_WDTR;
-            if (p->transinfo[tindex].goal_period)
+            maxsync = AHC_SYNCRATE_ULTRA3;
+          }
+          else
+          {
+            maxsync = AHC_SYNCRATE_ULTRA2;
+          }
+        }
+        else
+        {
+          maxsync = AHC_SYNCRATE_ULTRA;
+        }
+        /*
+         * We might have a device that is starting negotiation with us
+         * before we can start up negotiation with it....be prepared to
+         * have a device ask for a higher speed then we want to give it
+         * in that case
+         */
+        if ( (scb->flags & (SCB_MSGOUT_SENT|SCB_MSGOUT_PPR)) !=
+             (SCB_MSGOUT_SENT|SCB_MSGOUT_PPR) )
+        {
+          reply = TRUE;
+          scb->flags &= ~SCB_MSGOUT_BITS;
+          scb->flags |= SCB_MSGOUT_PPR;
+	  p->dev_flags[tindex] |= DEVICE_SCSI_3;
+          if (!(p->dev_flags[tindex] & DEVICE_SCANNED))
+          {
+            /*
+             * Not only is the device starting this up, but it also hasn't
+             * been scanned yet, so this would likely be our TUR or our
+             * INQUIRY command at scan time, so we need to use the
+             * settings from the SEEPROM if they existed.  Of course, even
+             * if we didn't find a SEEPROM, we stuffed default values into
+             * the user settings anyway, so use those in all cases.
+             */
+            p->transinfo[tindex].goal_period =
+              p->transinfo[tindex].user_period;
+            if(p->transinfo[tindex].user_offset)
             {
-              p->sdtr_pending |= target_mask;
-              scb->flags |= SCB_MSGOUT_SDTR;
-              aic_outb(p, HOST_MSG, MSG_OUT);
-              aic_outb(p, aic_inb(p, SCSISIGO) | ATNO, SCSISIGO);
+              if(p->features & AHC_ULTRA2)
+              {
+                p->transinfo[tindex].goal_offset = MAX_OFFSET_ULTRA2;
+              }
+              else if( p->transinfo[tindex].user_width &&
+                       (bus_width == MSG_EXT_WDTR_BUS_16_BIT) &&
+                       p->features & AHC_WIDE )
+              {
+                p->transinfo[tindex].goal_offset = MAX_OFFSET_16BIT;
+              }
+              else
+              {
+                p->transinfo[tindex].goal_offset = MAX_OFFSET_8BIT;
+              }
+            }
+            p->transinfo[tindex].goal_width =
+              p->transinfo[tindex].user_width;
+            p->transinfo[tindex].goal_options =
+              p->transinfo[tindex].user_options;
+          }
+          if (aic7xxx_verbose & VERBOSE_NEGOTIATION2)
+          {
+            printk(INFO_LEAD "Received pre-emptive PPR message from "
+                   "target.\n", p->host_no, CTL_OF_SCB(scb));
+          }
+          if ( !p->transinfo[tindex].goal_offset )
+            period = 255;
+          if ( p->transinfo[tindex].goal_period > period )
+            period = p->transinfo[tindex].goal_period;
+          if ( p->transinfo[tindex].goal_options == 0 )
+            new_trans_options = 0;
+          switch(bus_width)
+          {
+            default:
+            {
+              if ( (p->features & AHC_WIDE) &&
+                   (p->transinfo[tindex].goal_width ==
+                    MSG_EXT_WDTR_BUS_16_BIT) )
+              {
+                bus_width = MSG_EXT_WDTR_BUS_16_BIT;
+                break;
+              }
+            } /* Fall through if we aren't a wide card */
+            case MSG_EXT_WDTR_BUS_8_BIT:
+            {
+              p->needwdtr_copy &= ~target_mask;
+              bus_width = MSG_EXT_WDTR_BUS_8_BIT;
+              aic7xxx_set_width(p, target, channel, lun, bus_width,
+                                AHC_TRANS_GOAL|AHC_TRANS_QUITE);
+              break;
             }
           }
+          if ( (p->transinfo[tindex].goal_period > 9) ||
+               (p->transinfo[tindex].goal_options == 0) )
+          {
+            scb->flags &= ~SCB_MSGOUT_BITS;
+            reject = TRUE;
+            reply = FALSE;
+            p->needppr &= ~(1 << tindex);
+            p->needppr_copy &= ~(1 << tindex);
+            if ( p->transinfo[tindex].goal_offset )
+            {
+              p->needsdtr |= (1 << tindex);
+              p->needsdtr_copy |= (1 << tindex);
+            }
+            if ( p->transinfo[tindex].goal_width )
+            {
+              p->needwdtr |= (1 << tindex);
+              p->needwdtr_copy |= (1 << tindex);
+            }
+          }
+        }
+        else
+        {
+          switch(bus_width)
+          {
+            default:
+            {
+              reject = TRUE;
+              if ( (aic7xxx_verbose & VERBOSE_NEGOTIATION2) &&
+                   ((p->dev_flags[tindex] & DEVICE_PRINT_DTR) ||
+                    (aic7xxx_verbose > 0xffff)) )
+              {
+                printk(INFO_LEAD "Requesting %d bit transfers, rejecting.\n",
+                  p->host_no, CTL_OF_SCB(scb), 8 * (0x01 << bus_width));
+              }
+            } /* We fall through on purpose */
+            case MSG_EXT_WDTR_BUS_8_BIT:
+            {
+              /*
+               * According to the spec, if we aren't wide, we also can't be
+               * Dual Edge so clear the options byte
+               */
+              new_trans_options = 0;
+              bus_width = MSG_EXT_WDTR_BUS_8_BIT;
+              break;
+            }
+            case MSG_EXT_WDTR_BUS_16_BIT:
+            {
+              break;
+            }
+          }
+        }
+
+        if ( !reject )
+        {
+          aic7xxx_set_width(p, target, channel, lun, bus_width,
+                            AHC_TRANS_ACTIVE|AHC_TRANS_CUR);
+          syncrate = aic7xxx_find_syncrate(p, &period, maxsync,
+                                           &new_trans_options);
+          aic7xxx_validate_offset(p, syncrate, &offset, bus_width);
+          aic7xxx_set_syncrate(p, syncrate, target, channel, period,
+                               offset, new_trans_options,
+                               AHC_TRANS_ACTIVE|AHC_TRANS_CUR);
+        }
+
+        p->dtr_pending &= ~target_mask;
+        p->needppr &= ~target_mask;
+        if(reply)
+        {
+          p->dtr_pending |= target_mask;
+          scb->flags &= ~SCB_MSGOUT_BITS;
+          scb->flags |= SCB_MSGOUT_PPR;
+          aic_outb(p, HOST_MSG, MSG_OUT);
+          aic_outb(p, aic_inb(p, SCSISIGO) | ATNO, SCSISIGO);
         }
         done = TRUE;
         break;
@@ -5485,7 +5889,7 @@ aic7xxx_parse_msg(struct aic7xxx_host *p, struct aic7xxx_scb *scb)
     } /* end of switch(p->msg_type) */
   } /* end of if (!reject && (p->msg_len > 2)) */
 
-  if (reject)
+  if (!reply && reject)
   {
     aic_outb(p, MSG_MESSAGE_REJECT, MSG_OUT);
     aic_outb(p, aic_inb(p, SCSISIGO) | ATNO, SCSISIGO);
@@ -5657,12 +6061,14 @@ aic7xxx_handle_scsiint(struct aic7xxx_host *p, unsigned char intstat)
     if (aic7xxx_verbose & VERBOSE_RESET)
       printk(WARN_LEAD "Someone else reset the channel!!\n",
            p->host_no, channel, -1, -1);
+    if (aic7xxx_panic_on_abort)
+      aic7xxx_panic_abort(p, NULL);
     /*
      * Go through and abort all commands for the channel, but do not
      * reset the channel again.
      */
     aic7xxx_reset_channel(p, channel, /* Initiate Reset */ FALSE);
-    aic7xxx_run_done_queue(p, FALSE);
+    aic7xxx_run_done_queue(p, TRUE);
     scb = NULL;
   }
   else if ( ((status & BUSFREE) != 0) && ((status & SELTO) == 0) )
@@ -5698,7 +6104,7 @@ aic7xxx_handle_scsiint(struct aic7xxx_host *p, unsigned char intstat)
             CTL_OF_SCB(scb), scb->hscb->tag);
         aic7xxx_reset_device(p, target, channel, ALL_LUNS,
                 (message == MSG_ABORT) ? SCB_LIST_NULL : scb->hscb->tag );
-        aic7xxx_run_done_queue(p, FALSE);
+        aic7xxx_run_done_queue(p, TRUE);
         scb = NULL;
         printerror = 0;
       }
@@ -5708,6 +6114,22 @@ aic7xxx_handle_scsiint(struct aic7xxx_host *p, unsigned char intstat)
         scb = NULL;
         printerror = 0;
       }
+    }
+    if ( (scb != NULL) &&
+         (scb->cmd == p->dev_dtr_cmnd[TARGET_INDEX(scb->cmd)]) )
+    {
+      /*
+       * This might be a SCSI-3 device that is dropping the bus due to
+       * errors and signalling that we should reduce the transfer speed.
+       * All we have to do is complete this command (since it's a negotiation
+       * command already) and the checksum routine should flag an error and
+       * reduce the speed setting and renegotiate.  We call the reset routing
+       * just to clean out the hardware from this scb.
+       */
+      printerror = 0;
+      aic7xxx_reset_device(p, target, channel, ALL_LUNS, scb->hscb->tag);
+      aic7xxx_run_done_queue(p, TRUE);
+      scb = NULL;
     }
     if (printerror != 0)
     {
@@ -5724,7 +6146,12 @@ aic7xxx_handle_scsiint(struct aic7xxx_host *p, unsigned char intstat)
           tag = SCB_LIST_NULL;
         }
         aic7xxx_reset_device(p, target, channel, ALL_LUNS, tag);
-        aic7xxx_run_done_queue(p, FALSE);
+        aic7xxx_run_done_queue(p, TRUE);
+      }
+      else
+      {
+        aic7xxx_reset_device(p, target, channel, ALL_LUNS, SCB_LIST_NULL);
+        aic7xxx_run_done_queue(p, TRUE);
       }
       printk(INFO_LEAD "Unexpected busfree, LASTPHASE = 0x%x, "
              "SEQADDR = 0x%x\n", p->host_no, channel, target, -1, lastphase,
@@ -5829,16 +6256,48 @@ aic7xxx_handle_scsiint(struct aic7xxx_host *p, unsigned char intstat)
         cmd->result = 0;
         scb = NULL;
       }
+      else if (scb->cmd == p->dev_dtr_cmnd[TARGET_INDEX(scb->cmd)])
+      {
+        /*
+         * Turn off the needsdtr, needwdtr, and needppr bits since this device
+         * doesn't seem to exist.
+         */
+        p->needppr &= ~(0x01 << TARGET_INDEX(scb->cmd));
+        p->needppr_copy &= ~(0x01 << TARGET_INDEX(scb->cmd));
+        p->needsdtr &= ~(0x01 << TARGET_INDEX(scb->cmd));
+        p->needsdtr_copy &= ~(0x01 << TARGET_INDEX(scb->cmd));
+        p->needwdtr &= ~(0x01 << TARGET_INDEX(scb->cmd));
+        p->needwdtr_copy &= ~(0x01 << TARGET_INDEX(scb->cmd));
+      }
     }
     /*
-     * Restarting the sequencer will stop the selection and make sure devices
-     * are allowed to reselect in.
+     * Keep the sequencer from trying to restart any selections
      */
-    aic_outb(p, 0, SCSISEQ);
+    aic_outb(p, aic_inb(p, SCSISEQ) & ~ENSELO, SCSISEQ);
+    /*
+     * Make sure the data bits on the bus are released
+     * Don't do this on 7770 chipsets, it makes them give us
+     * a BRKADDRINT and kills the card.
+     */
+    if( (p->chip & ~AHC_CHIPID_MASK) == AHC_PCI )
+      aic_outb(p, 0, SCSIBUSL);
+
+    /*
+     * Delay for the selection timeout delay period then stop the selection
+     */
+    udelay(301);
+    aic_outb(p, CLRSELINGO, CLRSINT0);
+    /*
+     * Clear out all the interrupt status bits
+     */
     aic_outb(p, aic_inb(p, SIMODE1) & ~(ENREQINIT|ENBUSFREE), SIMODE1);
     p->flags &= ~AHC_HANDLING_REQINITS;
     aic_outb(p, CLRSELTIMEO | CLRBUSFREE, CLRSINT1);
     aic_outb(p, CLRSCSIINT, CLRINT);
+    /*
+     * Restarting the sequencer will stop the selection and make sure devices
+     * are allowed to reselect in.
+     */
     restart_sequencer(p);
     unpause_sequencer(p, TRUE);
   }
@@ -5868,6 +6327,8 @@ aic7xxx_handle_scsiint(struct aic7xxx_host *p, unsigned char intstat)
     Scsi_Cmnd *cmd;
     unsigned char mesg_out = MSG_NOOP;
     unsigned char lastphase = aic_inb(p, LASTPHASE);
+    unsigned char sstat2 = aic_inb(p, SSTAT2);
+    unsigned char tindex = TARGET_INDEX(scb->cmd);
 
     cmd = scb->cmd;
     switch (lastphase)
@@ -5902,8 +6363,157 @@ aic7xxx_handle_scsiint(struct aic7xxx_host *p, unsigned char intstat)
      * A parity error has occurred during a data
      * transfer phase. Flag it and continue.
      */
-    printk(WARN_LEAD "Parity error during %s phase.\n",
-           p->host_no, CTL_OF_SCB(scb), phase);
+    if( (p->features & AHC_ULTRA3) && 
+        (aic_inb(p, SCSIRATE) & AHC_SYNCRATE_CRC) &&
+        (lastphase == P_DATAIN) )
+    {
+      printk(WARN_LEAD "CRC error during %s phase.\n",
+             p->host_no, CTL_OF_SCB(scb), phase);
+      if(sstat2 & CRCVALERR)
+      {
+        printk(WARN_LEAD "  CRC error in intermediate CRC packet.\n",
+               p->host_no, CTL_OF_SCB(scb));
+      }
+      if(sstat2 & CRCENDERR)
+      {
+        printk(WARN_LEAD "  CRC error in ending CRC packet.\n",
+               p->host_no, CTL_OF_SCB(scb));
+      }
+      if(sstat2 & CRCREQERR)
+      {
+        printk(WARN_LEAD "  Target incorrectly requested a CRC packet.\n",
+               p->host_no, CTL_OF_SCB(scb));
+      }
+      if(sstat2 & DUAL_EDGE_ERROR)
+      {
+        printk(WARN_LEAD "  Dual Edge transmission error.\n",
+               p->host_no, CTL_OF_SCB(scb));
+      }
+    }
+    else if( (lastphase == P_MESGOUT) &&
+             (cmd == p->dev_dtr_cmnd[tindex]) &&
+             (scb->flags & SCB_MSGOUT_PPR) )
+    {
+      /*
+       * As per the draft specs, any device capable of supporting any of
+       * the option values other than 0 are not allowed to reject the
+       * PPR message.  Instead, they must negotiate out what they do
+       * support instead of rejecting our offering or else they cause
+       * a parity error during msg_out phase to signal that they don't
+       * like our settings.
+       */
+      p->needppr &= ~(1 << tindex);
+      p->needppr_copy &= ~(1 << tindex);
+      aic7xxx_set_width(p, scb->cmd->target, scb->cmd->channel, scb->cmd->lun,
+                        MSG_EXT_WDTR_BUS_8_BIT,
+                        (AHC_TRANS_ACTIVE|AHC_TRANS_CUR|AHC_TRANS_QUITE));
+      aic7xxx_set_syncrate(p, NULL, scb->cmd->target, scb->cmd->channel, 0, 0,
+                           0, AHC_TRANS_ACTIVE|AHC_TRANS_CUR|AHC_TRANS_QUITE);
+      p->transinfo[tindex].goal_options = 0;
+      p->dtr_pending &= ~(1 << tindex);
+      scb->flags &= ~SCB_MSGOUT_BITS;
+      if(aic7xxx_verbose & VERBOSE_NEGOTIATION2)
+      {
+        printk(INFO_LEAD "parity error during PPR message, reverting "
+               "to WDTR/SDTR\n", p->host_no, CTL_OF_SCB(scb));
+      }
+      if ( p->transinfo[tindex].goal_width )
+      {
+        p->needwdtr |= (1 << tindex);
+        p->needwdtr_copy |= (1 << tindex);
+      }
+      if ( p->transinfo[tindex].goal_offset )
+      {
+        if( p->transinfo[tindex].goal_period <= 9 )
+        {
+          p->transinfo[tindex].goal_period = 10;
+        }
+        p->needsdtr |= (1 << tindex);
+        p->needsdtr_copy |= (1 << tindex);
+      }
+      scb = NULL;
+    }
+    else if(p->dev_flags[tindex] & DEVICE_PARITY_ERROR)
+    {
+      struct aic7xxx_syncrate *syncrate;
+      unsigned int period = p->transinfo[tindex].cur_period;
+      unsigned char options = p->transinfo[tindex].cur_options;
+      /*
+       * oops, we had a failure, lower the transfer rate and try again.  It's
+       * worth noting here that it might be wise to also check for typical
+       * wide setting on narrow cable type problems and try disabling wide
+       * instead of slowing down if those exist.  That's hard to do with simple
+       * checksums though.
+       */
+      printk(WARN_LEAD "Parity error during %s phase.\n",
+             p->host_no, CTL_OF_SCB(scb), phase);
+      if((syncrate = aic7xxx_find_syncrate(p, &period, 0, &options)) != NULL)
+      {
+        syncrate++;
+        if( (syncrate->rate[0] != NULL) &&
+            (!(p->features & AHC_ULTRA2) || (syncrate->sxfr_ultra2 == 0)) )
+        {
+          p->transinfo[tindex].goal_period = syncrate->period;
+          if( p->transinfo[tindex].goal_period > 9 )
+          {
+            p->transinfo[tindex].goal_options = 0;
+            p->needppr &= ~(1<<tindex);
+            p->needsdtr |= (1<<tindex);
+            p->needppr_copy &= ~(1<<tindex);
+            p->needsdtr_copy |= (1<<tindex);
+            if (p->transinfo[tindex].goal_width)
+            {
+              p->needwdtr |= (1<<tindex);
+              p->needwdtr_copy |= (1<<tindex);
+            }
+          }
+        }
+        else if (p->transinfo[tindex].goal_width)
+        {
+          p->transinfo[tindex].goal_width = 0;
+          p->needwdtr &= ~(1<<tindex);
+          p->needwdtr_copy &= ~(1<<tindex);
+          p->transinfo[tindex].goal_offset =
+            p->transinfo[tindex].user_offset;
+          p->transinfo[tindex].goal_period =
+            p->transinfo[tindex].user_period;
+          p->transinfo[tindex].goal_options =
+            p->transinfo[tindex].user_options;
+          if( p->transinfo[tindex].goal_period <= 9 )
+          {
+            p->needppr |= (1<<tindex);
+            p->needsdtr &= ~(1<<tindex);
+            p->needppr_copy |= (1<<tindex);
+            p->needsdtr_copy &= ~(1<<tindex);
+          }
+          else
+          {
+            p->needppr &= ~(1<<tindex);
+            p->needsdtr |= (1<<tindex);
+            p->needppr_copy &= ~(1<<tindex);
+            p->needsdtr_copy |= (1<<tindex);
+          }
+        }
+        else
+        {
+          p->transinfo[tindex].goal_offset = 0;
+          p->transinfo[tindex].goal_period = 255;
+          p->transinfo[tindex].goal_options = 0;
+          p->transinfo[tindex].goal_width = 0;
+          p->needppr &= ~(1<<tindex);
+          p->needsdtr &= ~(1<<tindex);
+          p->needwdtr &= ~(1<<tindex);
+          p->needppr_copy &= ~(1<<tindex);
+          p->needsdtr_copy &= ~(1<<tindex);
+          p->needwdtr_copy &= ~(1<<tindex);
+        }
+      }
+      p->dev_flags[tindex] &= ~DEVICE_PARITY_ERROR;
+    }
+    else
+    {
+      p->dev_flags[tindex] |= DEVICE_PARITY_ERROR;
+    }
 
     /*
      * We've set the hardware to assert ATN if we get a parity
@@ -5914,6 +6524,7 @@ aic7xxx_handle_scsiint(struct aic7xxx_host *p, unsigned char intstat)
     if (mesg_out != MSG_NOOP)
     {
       aic_outb(p, mesg_out, MSG_OUT);
+      aic_outb(p, aic_inb(p, SCSISIGI) | ATNO, SCSISIGO);
       scb = NULL;
     }
     aic_outb(p, CLRSCSIPERR, CLRSINT1);
@@ -6072,13 +6683,6 @@ aic7xxx_check_scbs(struct aic7xxx_host *p, char *buffer)
       printk("HSCB %d bad, SCB_NEXT points to self.\n", i);
       bogus = TRUE;
     }
-    temp = aic_inb(p, SCB_PREV);
-    if ((temp != SCB_LIST_NULL) &&
-        (temp >= p->scb_data->maxhscbs))
-    {
-      printk("HSCB %d bad, SCB_PREV invalid(%d).\n", i, temp);
-      bogus = TRUE;
-    }
     if (scb_status[i] == 0)
       lost++;
     if (lost > 1)
@@ -6098,6 +6702,140 @@ aic7xxx_check_scbs(struct aic7xxx_host *p, char *buffer)
   return;
 }
 #endif
+
+
+/*+F*************************************************************************
+ * Function:
+ *   aic7xxx_handle_command_completion_intr
+ *
+ * Description:
+ *   SCSI command completion interrupt handler.
+ *-F*************************************************************************/
+static void
+aic7xxx_handle_command_completion_intr(struct aic7xxx_host *p)
+{
+  struct aic7xxx_scb *scb = NULL;
+  Scsi_Cmnd *cmd;
+  unsigned char scb_index, tindex;
+
+#ifdef AIC7XXX_VERBOSE_DEBUGGING
+  if( (p->isr_count < 16) && (aic7xxx_verbose > 0xffff) )
+    printk(INFO_LEAD "Command Complete Int.\n", p->host_no, -1, -1, -1);
+#endif
+    
+  /*
+   * Read the INTSTAT location after clearing the CMDINT bit.  This forces
+   * any posted PCI writes to flush to memory.  Gerard Roudier suggested
+   * this fix to the possible race of clearing the CMDINT bit but not
+   * having all command bytes flushed onto the qoutfifo.
+   */
+  aic_outb(p, CLRCMDINT, CLRINT);
+  aic_inb(p, INTSTAT);
+  /*
+   * The sequencer will continue running when it
+   * issues this interrupt. There may be >1 commands
+   * finished, so loop until we've processed them all.
+   */
+
+  while (p->qoutfifo[p->qoutfifonext] != SCB_LIST_NULL)
+  {
+    scb_index = p->qoutfifo[p->qoutfifonext];
+    p->qoutfifo[p->qoutfifonext++] = SCB_LIST_NULL;
+    if ( scb_index >= p->scb_data->numscbs )
+    {
+      printk(WARN_LEAD "CMDCMPLT with invalid SCB index %d\n", p->host_no,
+        -1, -1, -1, scb_index);
+      continue;
+    }
+    scb = p->scb_data->scb_array[scb_index];
+    if (!(scb->flags & SCB_ACTIVE) || (scb->cmd == NULL))
+    {
+      printk(WARN_LEAD "CMDCMPLT without command for SCB %d, SCB flags "
+        "0x%x, cmd 0x%lx\n", p->host_no, -1, -1, -1, scb_index, scb->flags,
+        (unsigned long) scb->cmd);
+      continue;
+    }
+    tindex = TARGET_INDEX(scb->cmd);
+    if (scb->flags & SCB_QUEUED_ABORT)
+    {
+      pause_sequencer(p);
+      if ( ((aic_inb(p, LASTPHASE) & PHASE_MASK) != P_BUSFREE) &&
+           (aic_inb(p, SCB_TAG) == scb->hscb->tag) )
+      {
+        unpause_sequencer(p, FALSE);
+        continue;
+      }
+      aic7xxx_reset_device(p, scb->cmd->target, scb->cmd->channel,
+        scb->cmd->lun, scb->hscb->tag);
+      scb->flags &= ~(SCB_QUEUED_FOR_DONE | SCB_RESET | SCB_ABORT |
+        SCB_QUEUED_ABORT);
+      unpause_sequencer(p, FALSE);
+    }
+    else if (scb->flags & SCB_ABORT)
+    {
+      /*
+       * We started to abort this, but it completed on us, let it
+       * through as successful
+       */
+      scb->flags &= ~(SCB_ABORT|SCB_RESET);
+    }
+    else if (scb->flags & SCB_SENSE)
+    {
+      char *buffer = &scb->cmd->sense_buffer[0];
+      if (scb->cmd == p->dev_dtr_cmnd[tindex])
+      {
+        struct aic7xxx_scb *old_scb;
+        /*
+         * We have valid sense data, send it back immediately.
+         */
+        old_scb = p->scb_data->scb_array[scb->cmd->next->tag];
+        *old_scb->cmd->sense_buffer = *scb->cmd->sense_buffer;
+        old_scb->hscb->target_status = scb->hscb->target_status;
+        old_scb->cmd->result = scb->hscb->target_status;
+        old_scb->cmd->result |= (DID_ERROR << 16);
+        aic7xxx_status(old_scb->cmd) = scb->hscb->target_status;
+        scbq_remove(&p->waiting_scbs, old_scb);
+        scbq_remove(&p->delayed_scbs[tindex], old_scb);
+        scb->cmd->next = NULL;
+	aic7xxx_done(p, scb);
+        aic7xxx_done(p, old_scb);
+	continue;
+      } 
+      else if (buffer[12] == 0x47 || buffer[12] == 0x54)
+      {
+        /*
+         * SCSI errors, run domain validation and re-run negotiation
+         */
+        p->needdv |= (1<<tindex);
+        /*
+         * Signal that we need to re-negotiate things, this also gets us our
+         * INQUIRY command to re-checksum off of.
+         */
+        p->needppr |= (p->needppr_copy & (1<<tindex));
+        p->needsdtr |= (p->needsdtr_copy & (1<<tindex));
+        p->needwdtr |= (p->needwdtr_copy & (1<<tindex));
+      }
+    }
+    switch (status_byte(scb->hscb->target_status))
+    {
+      case QUEUE_FULL:
+      case BUSY:
+        scb->hscb->target_status = 0;
+        scb->cmd->result = 0;
+        aic7xxx_error(scb->cmd) = DID_OK;
+        break;
+      default:
+        cmd = scb->cmd;
+        if (scb->hscb->residual_SG_segment_count != 0)
+        {
+          aic7xxx_calculate_residual(p, scb);
+        }
+        cmd->result |= (aic7xxx_error(cmd) << 16);
+        aic7xxx_done(p, scb);
+        break;
+    }      
+  }
+}
 
 /*+F*************************************************************************
  * Function:
@@ -6158,95 +6896,7 @@ aic7xxx_isr(int irq, void *dev_id, struct pt_regs *regs)
    */
   if (intstat & CMDCMPLT)
   {
-    struct aic7xxx_scb *scb = NULL;
-    Scsi_Cmnd *cmd;
-    unsigned char scb_index;
-
-#ifdef AIC7XXX_VERBOSE_DEBUGGING
-    if(aic7xxx_verbose > 0xffff)
-      printk(INFO_LEAD "Command Complete Int.\n", p->host_no, -1, -1, -1);
-#endif
-    
-    /*
-     * Clear interrupt status before running the completion loop.
-     * This eliminates a race condition whereby a command could
-     * complete between the last check of qoutfifo and the
-     * CLRCMDINT statement.  This would result in us thinking the
-     * qoutfifo was empty when it wasn't, and in actuality be a lost
-     * completion interrupt.  With multiple devices or tagged queueing
-     * this could be very bad if we caught all but the last completion
-     * and no more are imediately sent.
-     */
-    aic_outb(p, CLRCMDINT, CLRINT);
-    /*
-     * The sequencer will continue running when it
-     * issues this interrupt. There may be >1 commands
-     * finished, so loop until we've processed them all.
-     */
-
-    while (p->qoutfifo[p->qoutfifonext] != SCB_LIST_NULL)
-    {
-      scb_index = p->qoutfifo[p->qoutfifonext];
-      p->qoutfifo[p->qoutfifonext++] = SCB_LIST_NULL;
-      if ( scb_index >= p->scb_data->numscbs )
-        scb = NULL;
-      else
-        scb = p->scb_data->scb_array[scb_index];
-      if (scb == NULL)
-      {
-        printk(WARN_LEAD "CMDCMPLT with invalid SCB index %d\n", p->host_no,
-          -1, -1, -1, scb_index);
-        continue;
-      }
-      else if (!(scb->flags & SCB_ACTIVE) || (scb->cmd == NULL))
-      {
-        printk(WARN_LEAD "CMDCMPLT without command for SCB %d, SCB flags "
-          "0x%x, cmd 0x%lx\n", p->host_no, -1, -1, -1, scb_index, scb->flags,
-          (unsigned long) scb->cmd);
-        continue;
-      }
-      else if (scb->flags & SCB_QUEUED_ABORT)
-      {
-        pause_sequencer(p);
-        if ( ((aic_inb(p, LASTPHASE) & PHASE_MASK) != P_BUSFREE) &&
-             (aic_inb(p, SCB_TAG) == scb->hscb->tag) )
-        {
-          unpause_sequencer(p, FALSE);
-          continue;
-        }
-        aic7xxx_reset_device(p, scb->cmd->target, scb->cmd->channel,
-          scb->cmd->lun, scb->hscb->tag);
-        scb->flags &= ~(SCB_QUEUED_FOR_DONE | SCB_RESET | SCB_ABORT |
-          SCB_QUEUED_ABORT);
-        unpause_sequencer(p, FALSE);
-      }
-      else if (scb->flags & SCB_ABORT)
-      {
-        /*
-         * We started to abort this, but it completed on us, let it
-         * through as successful
-         */
-        scb->flags &= ~(SCB_ABORT|SCB_RESET);
-      }
-      switch (status_byte(scb->hscb->target_status))
-      {
-        case QUEUE_FULL:
-        case BUSY:
-          scb->hscb->target_status = 0;
-          scb->cmd->result = 0;
-          aic7xxx_error(scb->cmd) = DID_OK;
-          break;
-        default:
-          cmd = scb->cmd;
-          if (scb->hscb->residual_SG_segment_count != 0)
-          {
-            aic7xxx_calculate_residual(p, scb);
-          }
-          cmd->result |= (aic7xxx_error(cmd) << 16);
-          aic7xxx_done(p, scb);
-          break;
-      }      
-    }
+    aic7xxx_handle_command_completion_intr(p);
   }
 
   if (intstat & BRKADRINT)
@@ -6295,6 +6945,13 @@ aic7xxx_isr(int irq, void *dev_id, struct pt_regs *regs)
 
   if (intstat & SEQINT)
   {
+    /*
+     * Read the CCSCBCTL register to work around a bug in the Ultra2 cards
+     */
+    if(p->features & AHC_ULTRA2)
+    {
+      aic_inb(p, CCSCBCTL);
+    }
     aic7xxx_handle_seqint(p, intstat);
   }
 
@@ -6329,10 +6986,10 @@ do_aic7xxx_isr(int irq, void *dev_id, struct pt_regs *regs)
   p = (struct aic7xxx_host *)dev_id;
   if(!p)
     return;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,1,95)
   spin_lock_irqsave(&io_request_lock, cpu_flags);
-  if(test_and_set_bit(AHC_IN_ISR_BIT, &p->flags))
+  if(test_and_set_bit(AHC_IN_ISR_BIT, (void *)&p->flags))
   {
+    spin_unlock_irqrestore(&io_request_lock, cpu_flags);
     return;
   }
   do
@@ -6341,23 +6998,8 @@ do_aic7xxx_isr(int irq, void *dev_id, struct pt_regs *regs)
   } while ( (aic_inb(p, INTSTAT) & INT_PEND) );
   aic7xxx_done_cmds_complete(p);
   aic7xxx_run_waiting_queues(p);
-  clear_bit(AHC_IN_ISR_BIT, &p->flags);
+  clear_bit(AHC_IN_ISR_BIT, (void *)&p->flags);
   spin_unlock_irqrestore(&io_request_lock, cpu_flags);
-#else
-  if(set_bit(AHC_IN_ISR_BIT, (int *)&p->flags))
-  {
-    return;
-  }
-  DRIVER_LOCK
-  do
-  {
-    aic7xxx_isr(irq, dev_id, regs);
-  } while ( (aic_inb(p, INTSTAT) & INT_PEND) );
-  DRIVER_UNLOCK
-  aic7xxx_done_cmds_complete(p);
-  aic7xxx_run_waiting_queues(p);
-  clear_bit(AHC_IN_ISR_BIT, (int *)&p->flags);
-#endif
 }
 
 /*+F*************************************************************************
@@ -6368,7 +7010,7 @@ do_aic7xxx_isr(int irq, void *dev_id, struct pt_regs *regs)
  *   Determines the queue depth for a given device.  There are two ways
  *   a queue depth can be obtained for a tagged queueing device.  One
  *   way is the default queue depth which is determined by whether
- *   AIC7XXX_CMDS_PER_LUN is defined.  If it is defined, then it is used
+ *   AIC7XXX_CMDS_PER_DEVICE is defined.  If it is defined, then it is used
  *   as the default queue depth.  Otherwise, we use either 4 or 8 as the
  *   default queue depth (dependent on the number of hardware SCBs).
  *   The other way we determine queue depth is through the use of the
@@ -6377,7 +7019,7 @@ do_aic7xxx_isr(int irq, void *dev_id, struct pt_regs *regs)
  *   with queue depths for individual devices.  It also allows tagged
  *   queueing to be [en|dis]abled for a specific adapter.
  *-F*************************************************************************/
-static void
+static int
 aic7xxx_device_queue_depth(struct aic7xxx_host *p, Scsi_Device *device)
 {
   int default_depth = 3;
@@ -6386,6 +7028,14 @@ aic7xxx_device_queue_depth(struct aic7xxx_host *p, Scsi_Device *device)
 
   tindex = device->id | (device->channel << 3);
   target_mask = (1 << tindex);
+
+  if (p->dev_max_queue_depth[tindex] > 1)
+  {
+    /*
+     * We've already scanned this device, leave it alone
+     */
+    return(p->dev_max_queue_depth[tindex]);
+  }
 
   device->queue_depth = default_depth;
   p->dev_temp_queue_depth[tindex] = 1;
@@ -6396,7 +7046,7 @@ aic7xxx_device_queue_depth(struct aic7xxx_host *p, Scsi_Device *device)
   {
     int tag_enabled = TRUE;
 
-    default_depth = AIC7XXX_CMDS_PER_LUN;
+    default_depth = AIC7XXX_CMDS_PER_DEVICE;
  
     if (!(p->discenable & target_mask))
     {
@@ -6455,6 +7105,7 @@ aic7xxx_device_queue_depth(struct aic7xxx_host *p, Scsi_Device *device)
       }
     }
   }
+  return(p->dev_max_queue_depth[tindex]);
 }
 
 /*+F*************************************************************************
@@ -6482,8 +7133,7 @@ aic7xxx_select_queue_depth(struct Scsi_Host *host,
   {
     if (device->host == host)
     {
-      aic7xxx_device_queue_depth(p, device);
-      scbnum += device->queue_depth;
+      scbnum += aic7xxx_device_queue_depth(p, device);
     }
   }
   while (scbnum > p->scb_data->numscbs)
@@ -6733,6 +7383,21 @@ read_284x_seeprom(struct aic7xxx_host *p, struct seeprom_config *sc)
 #undef CLOCK_PULSE
 }
 
+#define CLOCK_PULSE(p)                                               \
+  do {                                                               \
+    int limit = 0;                                                   \
+    do {                                                             \
+      mb();                                                          \
+      pause_sequencer(p);  /* This is just to generate some PCI */   \
+                           /* traffic so the PCI read is flushed */  \
+                           /* it shouldn't be needed, but some */    \
+                           /* chipsets do indeed appear to need */   \
+                           /* something to force PCI reads to get */ \
+                           /* flushed */                             \
+      udelay(1);           /* Do nothing */                          \
+    } while (((aic_inb(p, SEECTL) & SEERDY) == 0) && (++limit < 1000)); \
+  } while(0)
+
 /*+F*************************************************************************
  * Function:
  *   acquire_seeprom
@@ -6743,7 +7408,6 @@ read_284x_seeprom(struct aic7xxx_host *p, struct seeprom_config *sc)
 static int
 acquire_seeprom(struct aic7xxx_host *p)
 {
-  int wait;
 
   /*
    * Request access of the memory port.  When access is
@@ -6753,12 +7417,7 @@ acquire_seeprom(struct aic7xxx_host *p)
    * should be no contention.
    */
   aic_outb(p, SEEMS, SEECTL);
-  wait = 1000;  /* 1000 msec = 1 second */
-  while ((wait > 0) && ((aic_inb(p, SEECTL) & SEERDY) == 0))
-  {
-    wait--;
-    mdelay(1);  /* 1 msec */
-  }
+  CLOCK_PULSE(p);
   if ((aic_inb(p, SEECTL) & SEERDY) == 0)
   {
     aic_outb(p, 0, SEECTL);
@@ -6777,6 +7436,10 @@ acquire_seeprom(struct aic7xxx_host *p)
 static void
 release_seeprom(struct aic7xxx_host *p)
 {
+  /*
+   * Make sure the SEEPROM is ready before we release it.
+   */
+  CLOCK_PULSE(p);
   aic_outb(p, 0, SEECTL);
 }
 
@@ -6842,12 +7505,6 @@ read_seeprom(struct aic7xxx_host *p, int offset,
     unsigned char bits[3];
   };
   struct seeprom_cmd seeprom_read = {3, {1, 1, 0}};
-
-#define CLOCK_PULSE(p) \
-  while ((aic_inb(p, SEECTL) & SEERDY) == 0)        \
-  {                                                \
-    ;  /* Do nothing */                                \
-  }
 
   /*
    * Request access of the memory port.
@@ -6958,54 +7615,12 @@ read_seeprom(struct aic7xxx_host *p, int offset,
   }
   printk("\n");
 #endif
-  if (checksum != scarray[len - 1])
+  if ( (checksum != scarray[len - 1]) || (checksum == 0) )
   {
     return (0);
   }
 
   return (1);
-#undef CLOCK_PULSE
-}
-
-/*+F*************************************************************************
- * Function:
- *   write_brdctl
- *
- * Description:
- *   Writes a value to the BRDCTL register.
- *-F*************************************************************************/
-static void
-write_brdctl(struct aic7xxx_host *p, unsigned char value)
-{
-  unsigned char brdctl;
-
-  if ((p->chip & AHC_CHIPID_MASK) == AHC_AIC7895)
-  {
-    brdctl = BRDSTB;
-    if (p->flags & AHC_CHNLB)
-      brdctl |= BRDCS;
-  }
-  else if (p->features & AHC_ULTRA2)
-    brdctl = 0;
-  else
-    brdctl = BRDSTB | BRDCS;
-  aic_outb(p, brdctl, BRDCTL);
-  udelay(1);
-  brdctl |= value;
-  aic_outb(p, brdctl, BRDCTL);
-  udelay(1);
-  if (p->features & AHC_ULTRA2)
-    brdctl |= BRDSTB_ULTRA2;
-  else
-    brdctl &= ~BRDSTB;
-  aic_outb(p, brdctl, BRDCTL);
-  udelay(1);
-  if (p->features & AHC_ULTRA2)
-    brdctl = 0;
-  else
-    brdctl &= ~BRDCS;
-  aic_outb(p, brdctl, BRDCTL);
-  udelay(1);
 }
 
 /*+F*************************************************************************
@@ -7020,22 +7635,85 @@ read_brdctl(struct aic7xxx_host *p)
 {
   unsigned char brdctl, value;
 
-  if ((p->chip & AHC_CHIPID_MASK) == AHC_AIC7895)
+  /*
+   * Make sure the SEEPROM is ready before we access it
+   */
+  CLOCK_PULSE(p);
+  if (p->features & AHC_ULTRA2)
   {
-    brdctl = BRDRW;
-    if (p->flags & AHC_CHNLB)
-      brdctl |= BRDCS;
-  }
-  else if (p->features & AHC_ULTRA2)
     brdctl = BRDRW_ULTRA2;
-  else
-    brdctl = BRDRW | BRDCS;
+    aic_outb(p, brdctl, BRDCTL);
+    CLOCK_PULSE(p);
+    value = aic_inb(p, BRDCTL);
+    CLOCK_PULSE(p);
+    return(value);
+  }
+  brdctl = BRDRW;
+  if ( !((p->chip & AHC_CHIPID_MASK) == AHC_AIC7895) ||
+        (p->flags & AHC_CHNLB) )
+  {
+    brdctl |= BRDCS;
+  }
   aic_outb(p, brdctl, BRDCTL);
-  udelay(1);
+  CLOCK_PULSE(p);
   value = aic_inb(p, BRDCTL);
+  CLOCK_PULSE(p);
   aic_outb(p, 0, BRDCTL);
-  udelay(1);
+  CLOCK_PULSE(p);
   return (value);
+}
+
+/*+F*************************************************************************
+ * Function:
+ *   write_brdctl
+ *
+ * Description:
+ *   Writes a value to the BRDCTL register.
+ *-F*************************************************************************/
+static void
+write_brdctl(struct aic7xxx_host *p, unsigned char value)
+{
+  unsigned char brdctl;
+
+  /*
+   * Make sure the SEEPROM is ready before we access it
+   */
+  CLOCK_PULSE(p);
+  if (p->features & AHC_ULTRA2)
+  {
+    brdctl = value;
+    aic_outb(p, brdctl, BRDCTL);
+    CLOCK_PULSE(p);
+    brdctl |= BRDSTB_ULTRA2;
+    aic_outb(p, brdctl, BRDCTL);
+    CLOCK_PULSE(p);
+    brdctl &= ~BRDSTB_ULTRA2;
+    aic_outb(p, brdctl, BRDCTL);
+    CLOCK_PULSE(p);
+    read_brdctl(p);
+    CLOCK_PULSE(p);
+  }
+  else
+  {
+    brdctl = BRDSTB;
+    if ( !((p->chip & AHC_CHIPID_MASK) == AHC_AIC7895) ||
+          (p->flags & AHC_CHNLB) )
+    {
+      brdctl |= BRDCS;
+    }
+    brdctl = BRDSTB | BRDCS;
+    aic_outb(p, brdctl, BRDCTL);
+    CLOCK_PULSE(p);
+    brdctl |= value;
+    aic_outb(p, brdctl, BRDCTL);
+    CLOCK_PULSE(p);
+    brdctl &= ~BRDSTB;
+    aic_outb(p, brdctl, BRDCTL);
+    CLOCK_PULSE(p);
+    brdctl &= ~BRDCS;
+    aic_outb(p, brdctl, BRDCTL);
+    CLOCK_PULSE(p);
+  }
 }
 
 /*+F*************************************************************************
@@ -7052,14 +7730,62 @@ aic785x_cable_detect(struct aic7xxx_host *p, int *int_50,
   unsigned char brdctl;
 
   aic_outb(p, BRDRW | BRDCS, BRDCTL);
-  udelay(1);
+  CLOCK_PULSE(p);
   aic_outb(p, 0, BRDCTL);
-  udelay(1);
+  CLOCK_PULSE(p);
   brdctl = aic_inb(p, BRDCTL);
-  udelay(1);
+  CLOCK_PULSE(p);
   *int_50 = !(brdctl & BRDDAT5);
   *ext_present = !(brdctl & BRDDAT6);
   *eeprom = (aic_inb(p, SPIOCAP) & EEPROM);
+}
+
+#undef CLOCK_PULSE
+
+/*+F*************************************************************************
+ * Function:
+ *   aic2940_uwpro_cable_detect
+ *
+ * Description:
+ *   Detect the cables that are present on the 2940-UWPro cards
+ *
+ * NOTE: This function assumes the SEEPROM will have already been acquired
+ *       prior to invocation of this function.
+ *-F*************************************************************************/
+static void
+aic2940_uwpro_wide_cable_detect(struct aic7xxx_host *p, int *int_68,
+    int *ext_68, int *eeprom)
+{
+  unsigned char brdctl;
+
+  /*
+   * First read the status of our cables.  Set the rom bank to
+   * 0 since the bank setting serves as a multiplexor for the
+   * cable detection logic.  BRDDAT5 controls the bank switch.
+   */
+  write_brdctl(p, 0);
+
+  /*
+   * Now we read the state of the internal 68 connector.  BRDDAT6
+   * is don't care, BRDDAT7 is internal 68.  The cable is
+   * present if the bit is 0
+   */
+  brdctl = read_brdctl(p);
+  *int_68 = !(brdctl & BRDDAT7);
+
+  /*
+   * Set the bank bit in brdctl and then read the external cable state
+   * and the EEPROM status
+   */
+  write_brdctl(p, BRDDAT5);
+  brdctl = read_brdctl(p);
+
+  *ext_68 = !(brdctl & BRDDAT6);
+  *eeprom = !(brdctl & BRDDAT7);
+
+  /*
+   * We're done, the calling function will release the SEEPROM for us
+   */
 }
 
 /*+F*************************************************************************
@@ -7069,7 +7795,7 @@ aic785x_cable_detect(struct aic7xxx_host *p, int *int_50,
  * Description:
  *   Detect the cables that are present on aic787x class controller chips
  *
- * NOTE: This functions assumes the SEEPROM will have already been aquired
+ * NOTE: This function assumes the SEEPROM will have already been acquired
  *       prior to invocation of this function.
  *-F*************************************************************************/
 static void
@@ -7116,7 +7842,7 @@ aic787x_cable_detect(struct aic7xxx_host *p, int *int_50, int *int_68,
  * Description:
  *   Detect the termination settings present on ultra2 class controllers
  *
- * NOTE: This functions assumes the SEEPROM will have already been aquired
+ * NOTE: This function assumes the SEEPROM will have already been acquired
  *       prior to invocation of this function.
  *-F*************************************************************************/
 static void
@@ -7166,58 +7892,182 @@ configure_termination(struct aic7xxx_host *p)
       max_target = 8;
     aic_outb(p, SEEMS | SEECS, SEECTL);
     sxfrctl1 &= ~STPWEN;
-    if ( (p->adapter_control & CFAUTOTERM) ||
-         (p->features & AHC_ULTRA2) )
+    /*
+     * The termination/cable detection logic is split into three distinct
+     * groups.  Ultra2 and later controllers, 2940UW-Pro controllers, and
+     * older 7850, 7860, 7870, 7880, and 7895 controllers.  Each has its
+     * own unique way of detecting their cables and writing the results
+     * back to the card.
+     */
+    if (p->features & AHC_ULTRA2)
     {
-      if ( (p->adapter_control & CFAUTOTERM) && !(p->features & AHC_ULTRA2) )
+      /*
+       * As long as user hasn't overridden term settings, always check the
+       * cable detection logic
+       */
+      if (aic7xxx_override_term == -1)
       {
-        printk(KERN_INFO "(scsi%d) Warning - detected auto-termination\n",
-               p->host_no);
-        printk(KERN_INFO "(scsi%d) Please verify driver detected settings are "
-          "correct.\n", p->host_no);
-        printk(KERN_INFO "(scsi%d) If not, then please properly set the device "
-          "termination\n", p->host_no);
-        printk(KERN_INFO "(scsi%d) in the Adaptec SCSI BIOS by hitting CTRL-A "
-          "when prompted\n", p->host_no);
-        printk(KERN_INFO "(scsi%d) during machine bootup.\n", p->host_no);
+        aic7xxx_ultra2_term_detect(p, &enableSE_low, &enableSE_high,
+                                   &enableLVD_low, &enableLVD_high,
+                                   &eprom_present);
       }
-      /* Configure auto termination. */
+      
+      /*
+       * If the user is overriding settings, then they have been preserved
+       * to here as fake adapter_control entries.  Parse them and allow
+       * them to override the detected settings (if we even did detection).
+       */
+      if (!(p->adapter_control & CFSEAUTOTERM))
+      {
+        enableSE_low = (p->adapter_control & CFSTERM);
+        enableSE_high = (p->adapter_control & CFWSTERM);
+      }
+      if (!(p->adapter_control & CFAUTOTERM))
+      {
+        enableLVD_low = enableLVD_high = (p->adapter_control & CFLVDSTERM);
+      }
 
-      if (p->features & AHC_ULTRA2)
+      /*
+       * Now take those settings that we have and translate them into the
+       * values that must be written into the registers.
+       *
+       * Flash Enable = BRDDAT7
+       * Secondary High Term Enable = BRDDAT6
+       * Secondary Low Term Enable = BRDDAT5
+       * LVD/Primary High Term Enable = BRDDAT4
+       * LVD/Primary Low Term Enable = STPWEN bit in SXFRCTL1
+       */
+      if (enableLVD_low != 0)
       {
-        if (aic7xxx_override_term == -1)
-          aic7xxx_ultra2_term_detect(p, &enableSE_low, &enableSE_high,
-                                     &enableLVD_low, &enableLVD_high,
-                                     &eprom_present);
-        if (!(p->adapter_control & CFSEAUTOTERM))
-        {
-          enableSE_low = (p->adapter_control & CFSTERM);
-          enableSE_high = (p->adapter_control & CFWSTERM);
-        }
-        if (!(p->adapter_control & CFAUTOTERM))
-        {
-          enableLVD_low = enableLVD_high = (p->adapter_control & CFLVDSTERM);
-        }
-        internal50_present = 0;
-        internal68_present = 1;
-        external_present = 1;
+        sxfrctl1 |= STPWEN;
+        p->flags |= AHC_TERM_ENB_LVD;
+        if (aic7xxx_verbose & VERBOSE_PROBE2)
+          printk(KERN_INFO "(scsi%d) LVD/Primary Low byte termination "
+                 "Enabled\n", p->host_no);
       }
-      else if ( (p->chip & AHC_CHIPID_MASK) >= AHC_AIC7870 )
+          
+      if (enableLVD_high != 0)
       {
-        aic787x_cable_detect(p, &internal50_present, &internal68_present,
-          &external_present, &eprom_present);
+        brddat |= BRDDAT4;
+        if (aic7xxx_verbose & VERBOSE_PROBE2)
+          printk(KERN_INFO "(scsi%d) LVD/Primary High byte termination "
+                 "Enabled\n", p->host_no);
+      }
+
+      if (enableSE_low != 0)
+      {
+        brddat |= BRDDAT5;
+        if (aic7xxx_verbose & VERBOSE_PROBE2)
+          printk(KERN_INFO "(scsi%d) Secondary Low byte termination "
+                 "Enabled\n", p->host_no);
+      }
+
+      if (enableSE_high != 0)
+      {
+        brddat |= BRDDAT6;
+        if (aic7xxx_verbose & VERBOSE_PROBE2)
+          printk(KERN_INFO "(scsi%d) Secondary High byte termination "
+                 "Enabled\n", p->host_no);
+      }
+    }
+    else if (p->features & AHC_NEW_AUTOTERM)
+    {
+      /*
+       * The 50 pin connector termination is controlled by STPWEN in the
+       * SXFRCTL1 register.  Since the Adaptec docs typically say the
+       * controller is not allowed to be in the middle of a cable and
+       * this is the only connection on that stub of the bus, there is
+       * no need to even check for narrow termination, it's simply
+       * always on.
+       */
+      sxfrctl1 |= STPWEN;
+      if (aic7xxx_verbose & VERBOSE_PROBE2)
+        printk(KERN_INFO "(scsi%d) Narrow channel termination Enabled\n",
+               p->host_no);
+
+      if (p->adapter_control & CFAUTOTERM)
+      {
+        aic2940_uwpro_wide_cable_detect(p, &internal68_present,
+                                        &external_present,
+                                        &eprom_present);
+        printk(KERN_INFO "(scsi%d) Cables present (Int-50 %s, Int-68 %s, "
+               "Ext-68 %s)\n", p->host_no,
+               "Don't Care",
+               internal68_present ? "YES" : "NO",
+               external_present ? "YES" : "NO");
+        if (aic7xxx_verbose & VERBOSE_PROBE2)
+          printk(KERN_INFO "(scsi%d) EEPROM %s present.\n", p->host_no,
+               eprom_present ? "is" : "is not");
+        if (internal68_present && external_present)
+        {
+          brddat = 0;
+          p->flags &= ~AHC_TERM_ENB_SE_HIGH;
+          if (aic7xxx_verbose & VERBOSE_PROBE2)
+            printk(KERN_INFO "(scsi%d) Wide channel termination Disabled\n",
+                   p->host_no);
+        }
+        else
+        {
+          brddat = BRDDAT6;
+          p->flags |= AHC_TERM_ENB_SE_HIGH;
+          if (aic7xxx_verbose & VERBOSE_PROBE2)
+            printk(KERN_INFO "(scsi%d) Wide channel termination Enabled\n",
+                   p->host_no);
+        }
       }
       else
       {
-        aic785x_cable_detect(p, &internal50_present, &external_present,
-          &eprom_present);
+        /*
+         * The termination of the Wide channel is done more like normal
+         * though, and the setting of this termination is done by writing
+         * either a 0 or 1 to BRDDAT6 of the BRDDAT register
+         */
+        if (p->adapter_control & CFWSTERM)
+        {
+          brddat = BRDDAT6;
+          p->flags |= AHC_TERM_ENB_SE_HIGH;
+          if (aic7xxx_verbose & VERBOSE_PROBE2)
+            printk(KERN_INFO "(scsi%d) Wide channel termination Enabled\n",
+                   p->host_no);
+        }
+        else
+        {
+          brddat = 0;
+        }
       }
-      
-      if (max_target <= 8)
-        internal68_present = 0;
-
-      if ( !(p->features & AHC_ULTRA2) )
+    }
+    else
+    {
+      if (p->adapter_control & CFAUTOTERM)
       {
+        if (p->flags & AHC_MOTHERBOARD)
+        {
+          printk(KERN_INFO "(scsi%d) Warning - detected auto-termination\n",
+                 p->host_no);
+          printk(KERN_INFO "(scsi%d) Please verify driver detected settings "
+            "are correct.\n", p->host_no);
+          printk(KERN_INFO "(scsi%d) If not, then please properly set the "
+            "device termination\n", p->host_no);
+          printk(KERN_INFO "(scsi%d) in the Adaptec SCSI BIOS by hitting "
+            "CTRL-A when prompted\n", p->host_no);
+          printk(KERN_INFO "(scsi%d) during machine bootup.\n", p->host_no);
+        }
+        /* Configure auto termination. */
+
+        if ( (p->chip & AHC_CHIPID_MASK) >= AHC_AIC7870 )
+        {
+          aic787x_cable_detect(p, &internal50_present, &internal68_present,
+            &external_present, &eprom_present);
+        }
+        else
+        {
+          aic785x_cable_detect(p, &internal50_present, &external_present,
+            &eprom_present);
+        }
+
+        if (max_target <= 8)
+          internal68_present = 0;
+
         if (max_target > 8)
         {
           printk(KERN_INFO "(scsi%d) Cables present (Int-50 %s, Int-68 %s, "
@@ -7233,103 +8083,76 @@ configure_termination(struct aic7xxx_host *p)
                  internal50_present ? "YES" : "NO",
                  external_present ? "YES" : "NO");
         }
-      }
-      if (aic7xxx_verbose & VERBOSE_PROBE2)
-        printk(KERN_INFO "(scsi%d) EEPROM %s present.\n", p->host_no,
-             eprom_present ? "is" : "is not");
+        if (aic7xxx_verbose & VERBOSE_PROBE2)
+          printk(KERN_INFO "(scsi%d) EEPROM %s present.\n", p->host_no,
+               eprom_present ? "is" : "is not");
 
-      /*
-       * Now set the termination based on what we found.  BRDDAT6
-       * controls wide termination enable.
-       * Flash Enable = BRDDAT7
-       * SE High Term Enable = BRDDAT6
-       * SE Low Term Enable = BRDDAT5 (7890)
-       * LVD High Term Enable = BRDDAT4 (7890)
-       */
-      if ( !(p->features & AHC_ULTRA2) &&
-           (internal50_present && internal68_present && external_present) )
-      {
-        printk(KERN_INFO "(scsi%d) Illegal cable configuration!!  Only two\n",
-               p->host_no);
-        printk(KERN_INFO "(scsi%d) connectors on the SCSI controller may be "
-               "in use at a time!\n", p->host_no);
         /*
-         * Force termination (low and high byte) on.  This is safer than
-         * leaving it completely off, especially since this message comes
-         * most often from motherboard controllers that don't even have 3
-         * connectors, but instead are failing the cable detection.
+         * Now set the termination based on what we found.  BRDDAT6
+         * controls wide termination enable.
+         * Flash Enable = BRDDAT7
+         * SE High Term Enable = BRDDAT6
          */
-        internal50_present = external_present = 0;
-        enableSE_high = enableSE_low = 1;
-      }
-
-      if ((max_target > 8) &&
-          ((external_present == 0) || (internal68_present == 0) ||
-           (enableSE_high != 0)))
-      {
-        brddat |= BRDDAT6;
-        p->flags |= AHC_TERM_ENB_SE_HIGH;
-        if (aic7xxx_verbose & VERBOSE_PROBE2)
-          printk(KERN_INFO "(scsi%d) SE High byte termination Enabled\n",
+        if (internal50_present && internal68_present && external_present)
+        {
+          printk(KERN_INFO "(scsi%d) Illegal cable configuration!!  Only two\n",
                  p->host_no);
-      }
+          printk(KERN_INFO "(scsi%d) connectors on the SCSI controller may be "
+                 "in use at a time!\n", p->host_no);
+          /*
+           * Force termination (low and high byte) on.  This is safer than
+           * leaving it completely off, especially since this message comes
+           * most often from motherboard controllers that don't even have 3
+           * connectors, but instead are failing the cable detection.
+           */
+          internal50_present = external_present = 0;
+          enableSE_high = enableSE_low = 1;
+        }
 
-      if ( (((internal50_present ? 1 : 0) +
-             (internal68_present ? 1 : 0) +
-             (external_present   ? 1 : 0)) <= 1) ||
-           (enableSE_low != 0) )
-      {
-        if (p->features & AHC_ULTRA2)
-          brddat |= BRDDAT5;
-        else
+        if ((max_target > 8) &&
+            ((external_present == 0) || (internal68_present == 0)) )
+        {
+          brddat |= BRDDAT6;
+          p->flags |= AHC_TERM_ENB_SE_HIGH;
+          if (aic7xxx_verbose & VERBOSE_PROBE2)
+            printk(KERN_INFO "(scsi%d) SE High byte termination Enabled\n",
+                   p->host_no);
+        }
+
+        if ( ((internal50_present ? 1 : 0) +
+              (internal68_present ? 1 : 0) +
+              (external_present   ? 1 : 0)) <= 1 )
+        {
           sxfrctl1 |= STPWEN;
-        p->flags |= AHC_TERM_ENB_SE_LOW;
-        if (aic7xxx_verbose & VERBOSE_PROBE2)
-          printk(KERN_INFO "(scsi%d) SE Low byte termination Enabled\n",
-                 p->host_no);
+          p->flags |= AHC_TERM_ENB_SE_LOW;
+          if (aic7xxx_verbose & VERBOSE_PROBE2)
+            printk(KERN_INFO "(scsi%d) SE Low byte termination Enabled\n",
+                   p->host_no);
+        }
       }
+      else /* p->adapter_control & CFAUTOTERM */
+      {
+        if (p->adapter_control & CFSTERM)
+        {
+          sxfrctl1 |= STPWEN;
+          if (aic7xxx_verbose & VERBOSE_PROBE2)
+            printk(KERN_INFO "(scsi%d) SE Low byte termination Enabled\n",
+                   p->host_no);
+        }
 
-      if (enableLVD_low != 0)
-      {
-        sxfrctl1 |= STPWEN;
-        p->flags |= AHC_TERM_ENB_LVD;
-        if (aic7xxx_verbose & VERBOSE_PROBE2)
-          printk(KERN_INFO "(scsi%d) LVD Low byte termination Enabled\n",
-                 p->host_no);
-      }
-          
-      if (enableLVD_high != 0)
-      {
-        brddat |= BRDDAT4;
-        if (aic7xxx_verbose & VERBOSE_PROBE2)
-          printk(KERN_INFO "(scsi%d) LVD High byte termination Enabled\n",
-                 p->host_no);
+        if (p->adapter_control & CFWSTERM)
+        {
+          brddat |= BRDDAT6;
+          if (aic7xxx_verbose & VERBOSE_PROBE2)
+            printk(KERN_INFO "(scsi%d) SE High byte termination Enabled\n",
+                   p->host_no);
+        }
       }
     }
-    else
-    {
-      if (p->adapter_control & CFSTERM)
-      {
-        if (p->features & AHC_ULTRA2)
-          brddat |= BRDDAT5;
-        else
-          sxfrctl1 |= STPWEN;
-        if (aic7xxx_verbose & VERBOSE_PROBE2)
-          printk(KERN_INFO "(scsi%d) SE Low byte termination Enabled\n",
-                 p->host_no);
-      }
 
-      if (p->adapter_control & CFWSTERM)
-      {
-        brddat |= BRDDAT6;
-        if (aic7xxx_verbose & VERBOSE_PROBE2)
-          printk(KERN_INFO "(scsi%d) SE High byte termination Enabled\n",
-                 p->host_no);
-      }
-    }
+    aic_outb(p, sxfrctl1, SXFRCTL1);
     write_brdctl(p, brddat);
     release_seeprom(p);
-    aic_outb(p, sxfrctl1, SXFRCTL1);
   }
 }
 
@@ -7371,7 +8194,6 @@ detect_maxscb(struct aic7xxx_host *p)
       aic_outb(p, i, SCBPTR);
       aic_outb(p, 0, SCB_CONTROL);   /* Clear the control byte. */
       aic_outb(p, i + 1, SCB_NEXT);  /* Set the next pointer. */
-      aic_outb(p, i - 1, SCB_PREV);  /* Set the prev pointer. */
       aic_outb(p, SCB_LIST_NULL, SCB_TAG);  /* Make the tag invalid. */
       aic_outb(p, SCB_LIST_NULL, SCB_BUSYTARGETS);  /* no busy untagged */
       aic_outb(p, SCB_LIST_NULL, SCB_BUSYTARGETS+1);/* targets active yet */
@@ -7414,12 +8236,6 @@ aic7xxx_register(Scsi_Host_Template *template, struct aic7xxx_host *p,
   unsigned char term, scsi_conf;
   struct Scsi_Host *host;
 
-  /*
-   * Lock out other contenders for our i/o space.
-   */
-  request_region(p->base, MAXREG - MINREG, "aic7xxx");
-
-
   host = p->host;
 
   p->scb_data->maxscbs = AIC7XXX_MAXSCB;
@@ -7430,7 +8246,7 @@ aic7xxx_register(Scsi_Host_Template *template, struct aic7xxx_host *p,
   host->this_id = p->scsi_id;
   host->io_port = p->base;
   host->n_io_port = 0xFF;
-  host->base = (unsigned char *) p->mbase;
+  host->base = p->mbase;
   host->irq = p->irq;
   if (p->features & AHC_WIDE)
   {
@@ -7455,12 +8271,6 @@ aic7xxx_register(Scsi_Host_Template *template, struct aic7xxx_host *p,
   p->dev_timer.function = (void *)aic7xxx_timer;
   p->dev_timer_active = 0;
 
-  for (i = 0; i < NUMBER(p->untagged_scbs); i++)
-  {
-    p->untagged_scbs[i] = SCB_LIST_NULL;
-    p->qinfifo[i] = SCB_LIST_NULL;
-    p->qoutfifo[i] = SCB_LIST_NULL;
-  }
   /*
    * We currently have no commands of any type
    */
@@ -7491,7 +8301,7 @@ aic7xxx_register(Scsi_Host_Template *template, struct aic7xxx_host *p,
       printk("VLB slot %d\n", p->pci_device_fn);
       break;
     default:
-      printk("PCI %d/%d\n", PCI_SLOT(p->pci_device_fn),
+      printk("PCI %d/%d/%d\n", p->pci_bus, PCI_SLOT(p->pci_device_fn),
         PCI_FUNC(p->pci_device_fn));
       break;
   }
@@ -7529,7 +8339,6 @@ aic7xxx_register(Scsi_Host_Template *template, struct aic7xxx_host *p,
 
   detect_maxscb(p);
 
-
   printk("%d/%d SCBs\n", p->scb_data->maxhscbs, p->scb_data->maxscbs);
   if (aic7xxx_verbose & VERBOSE_PROBE2)
   {
@@ -7554,30 +8363,20 @@ aic7xxx_register(Scsi_Host_Template *template, struct aic7xxx_host *p,
     {
       unsigned char devconfig;
 
-#if LINUX_KERNEL_VERSION > KERNEL_VERSION(2,1,92)
       pci_read_config_byte(p->pdev, DEVCONFIG, &devconfig);
-#else
-      pcibios_read_config_byte(p->pci_bus, p->pci_device_fn,
-                               DEVCONFIG, &devconfig);
-#endif
       if ( (aic7xxx_stpwlev >> p->instance) & 0x01 )
       {
-        devconfig |= 0x02;
+        devconfig |= STPWLEVEL;
         if (aic7xxx_verbose & VERBOSE_PROBE2)
-          printk("(scsi%d) Force setting STPWLEV bit\n", p->host_no);
+          printk("(scsi%d) Force setting STPWLEVEL bit\n", p->host_no);
       }
       else
       {
-        devconfig &= ~0x02;
+        devconfig &= ~STPWLEVEL;
         if (aic7xxx_verbose & VERBOSE_PROBE2)
-          printk("(scsi%d) Force clearing STPWLEV bit\n", p->host_no);
+          printk("(scsi%d) Force clearing STPWLEVEL bit\n", p->host_no);
       }
-#if LINUX_KERNEL_VERSION > KERNEL_VERSION(2,1,92)
       pci_write_config_byte(p->pdev, DEVCONFIG, devconfig);
-#else
-      pcibios_write_config_byte(p->pci_bus, p->pci_device_fn,
-                                DEVCONFIG, devconfig);
-#endif
     }
   }
 #endif
@@ -7632,11 +8431,6 @@ aic7xxx_register(Scsi_Host_Template *template, struct aic7xxx_host *p,
   }
 
   /*
-   * Clear out any possible pending interrupts.
-   */
-  aic7xxx_clear_intstat(p);
-
-  /*
    * Set the SCSI Id, SXFRCTL0, SXFRCTL1, and SIMODE1, for both channels
    */
   if (p->features & AHC_TWIN)
@@ -7644,11 +8438,15 @@ aic7xxx_register(Scsi_Host_Template *template, struct aic7xxx_host *p,
     /* Select channel B */
     aic_outb(p, aic_inb(p, SBLKCTL) | SELBUSB, SBLKCTL);
 
-    term = ((p->flags & AHC_TERM_ENB_B) != 0) ? STPWEN : 0;
+    if ((p->flags & AHC_SEEPROM_FOUND) || (aic7xxx_override_term != -1))
+      term = (aic_inb(p, SXFRCTL1) & STPWEN);
+    else
+      term = ((p->flags & AHC_TERM_ENB_B) ? STPWEN : 0);
+
     aic_outb(p, p->scsi_id_b, SCSIID);
     scsi_conf = aic_inb(p, SCSICONF + 1);
     aic_outb(p, DFON | SPIOEN, SXFRCTL0);
-    aic_outb(p, (scsi_conf & ENSPCHK) | STIMESEL | term | 
+    aic_outb(p, (scsi_conf & ENSPCHK) | aic7xxx_seltime | term | 
          ENSTIMER | ACTNEGEN, SXFRCTL1);
     aic_outb(p, 0, SIMODE0);
     aic_outb(p, ENSELTIMO | ENSCSIRST | ENSCSIPERR, SIMODE1);
@@ -7658,17 +8456,34 @@ aic7xxx_register(Scsi_Host_Template *template, struct aic7xxx_host *p,
     aic_outb(p, aic_inb(p, SBLKCTL) & ~SELBUSB, SBLKCTL);
   }
 
-  term = ((p->flags & AHC_TERM_ENB_SE_LOW) != 0) ? STPWEN : 0;
   if (p->features & AHC_ULTRA2)
+  {
     aic_outb(p, p->scsi_id, SCSIID_ULTRA2);
+  }
   else
+  {
     aic_outb(p, p->scsi_id, SCSIID);
+  }
+  if ((p->flags & AHC_SEEPROM_FOUND) || (aic7xxx_override_term != -1))
+    term = (aic_inb(p, SXFRCTL1) & STPWEN);
+  else
+    term = ((p->flags & (AHC_TERM_ENB_A|AHC_TERM_ENB_LVD)) ? STPWEN : 0);
   scsi_conf = aic_inb(p, SCSICONF);
   aic_outb(p, DFON | SPIOEN, SXFRCTL0);
-  aic_outb(p, (scsi_conf & ENSPCHK) | STIMESEL | term | 
+  aic_outb(p, (scsi_conf & ENSPCHK) | aic7xxx_seltime | term | 
        ENSTIMER | ACTNEGEN, SXFRCTL1);
   aic_outb(p, 0, SIMODE0);
-  aic_outb(p, ENSELTIMO | ENSCSIRST | ENSCSIPERR, SIMODE1);
+  /*
+   * If we are a cardbus adapter then don't enable SCSI reset detection.
+   * We shouldn't likely be sharing SCSI busses with someone else, and
+   * if we don't have a cable currently plugged into the controller then
+   * we won't have a power source for the SCSI termination, which means
+   * we'll see infinite incoming bus resets.
+   */
+  if(p->flags & AHC_NO_STPWEN)
+    aic_outb(p, ENSELTIMO | ENSCSIPERR, SIMODE1);
+  else
+    aic_outb(p, ENSELTIMO | ENSCSIRST | ENSCSIPERR, SIMODE1);
   aic_outb(p, 0, SCSIRATE);
   if ( p->features & AHC_ULTRA2)
     aic_outb(p, 0, SCSIOFFSET);
@@ -7727,44 +8542,54 @@ aic7xxx_register(Scsi_Host_Template *template, struct aic7xxx_host *p,
   {
     size_t array_size;
     unsigned int hscb_physaddr;
-    unsigned long temp;
 
     array_size = p->scb_data->maxscbs * sizeof(struct aic7xxx_hwscb);
     if (p->scb_data->hscbs == NULL)
     {
-      /*
-       * A little padding so we can align thing the way we want
+      /* pci_alloc_consistent enforces the alignment already and
+       * clears the area as well.
        */
-      p->scb_data->hscbs = kmalloc(array_size + 0x1f, GFP_ATOMIC);
+      p->scb_data->hscbs = pci_alloc_consistent(p->pdev, array_size,
+						&p->scb_data->hscbs_dma);
+      /* We have to use pci_free_consistent, not kfree */
+      p->scb_data->hscb_kmalloc_ptr = NULL;
+      p->scb_data->hscbs_dma_len = array_size;
     }
     if (p->scb_data->hscbs == NULL)
     {
       printk("(scsi%d) Unable to allocate hardware SCB array; "
              "failing detection.\n", p->host_no);
+      aic_outb(p, 0, SIMODE1);
       p->irq = 0;
       return(0);
     }
-    /*
-     * Save the actual kmalloc buffer pointer off, then align our
-     * buffer to a 32 byte boundary
-     */
-    p->scb_data->hscb_kmalloc_ptr = p->scb_data->hscbs;
-    temp = (unsigned long)p->scb_data->hscbs;
-    temp += 0x1f;
-    temp &= ~0x1f;
-    p->scb_data->hscbs = (struct aic7xxx_hwscb *)temp;
-    /* At least the control byte of each SCB needs to be 0. */
-    memset(p->scb_data->hscbs, 0, array_size);
 
-    /* Tell the sequencer where it can find the hardware SCB array. */
-    hscb_physaddr = VIRT_TO_BUS(p->scb_data->hscbs);
+    hscb_physaddr = p->scb_data->hscbs_dma;
     aic_outb(p, hscb_physaddr & 0xFF, HSCB_ADDR);
     aic_outb(p, (hscb_physaddr >> 8) & 0xFF, HSCB_ADDR + 1);
     aic_outb(p, (hscb_physaddr >> 16) & 0xFF, HSCB_ADDR + 2);
     aic_outb(p, (hscb_physaddr >> 24) & 0xFF, HSCB_ADDR + 3);
 
     /* Set up the fifo areas at the same time */
-    hscb_physaddr = VIRT_TO_BUS(&p->untagged_scbs[0]);
+    p->untagged_scbs = pci_alloc_consistent(p->pdev, 3*256, &p->fifo_dma);
+    if (p->untagged_scbs == NULL)
+    {
+      printk("(scsi%d) Unable to allocate hardware FIFO arrays; "
+             "failing detection.\n", p->host_no);
+      p->irq = 0;
+      return(0);
+    }
+
+    p->qoutfifo = p->untagged_scbs + 256;
+    p->qinfifo = p->qoutfifo + 256;
+    for (i = 0; i < 256; i++)
+    {
+      p->untagged_scbs[i] = SCB_LIST_NULL;
+      p->qinfifo[i] = SCB_LIST_NULL;
+      p->qoutfifo[i] = SCB_LIST_NULL;
+    }
+
+    hscb_physaddr = p->fifo_dma;
     aic_outb(p, hscb_physaddr & 0xFF, SCBID_ADDR);
     aic_outb(p, (hscb_physaddr >> 8) & 0xFF, SCBID_ADDR + 1);
     aic_outb(p, (hscb_physaddr >> 16) & 0xFF, SCBID_ADDR + 2);
@@ -7815,11 +8640,6 @@ aic7xxx_register(Scsi_Host_Template *template, struct aic7xxx_host *p,
   first_aic7xxx = p;
 
   /*
-   * Clear out any possible pending interrupts, again.
-   */
-  aic7xxx_clear_intstat(p);
-
-  /*
    * Allocate the first set of scbs for this controller.  This is to stream-
    * line code elsewhere in the driver.  If we have to check for the existence
    * of scbs in certain code sections, it slows things down.  However, as
@@ -7839,6 +8659,11 @@ aic7xxx_register(Scsi_Host_Template *template, struct aic7xxx_host *p,
    * on with nobody home.
    */
   aic7xxx_loadseq(p);
+
+  /*
+   * Make sure the AUTOFLUSHDIS bit is *not* set in the SBLKCTL register
+   */
+  aic_outb(p, aic_inb(p, SBLKCTL) & ~AUTOFLUSHDIS, SBLKCTL);
 
   if ( (p->chip & AHC_CHIPID_MASK) == AHC_AIC7770 )
   {
@@ -7868,20 +8693,21 @@ aic7xxx_register(Scsi_Host_Template *template, struct aic7xxx_host *p,
       printk(KERN_INFO "(scsi%d) Resetting channel%s\n", p->host_no, channel);
     }
     
-    /*
-     * Some of the new Ultra2 chipsets need a longer delay after a chip
-     * reset than just the init setup creates, so we have to delay here
-     * before we go into a reset in order to make the chips happy.
-     */
-    if (p->features & AHC_ULTRA2)
-      mdelay(250);
     aic7xxx_reset_current_bus(p);
 
     /*
-     * Delay for the reset delay.
+     * Delay for the reset delay by setting the timer, this will delay
+     * future commands sent to any devices.
      */
-    if (!reset_delay)
-      aic7xxx_delay(AIC7XXX_RESET_DELAY);
+    p->flags |= AHC_RESET_DELAY;
+    for(i=0; i<MAX_TARGETS; i++)
+    {
+      p->dev_expires[i] = jiffies + (4 * HZ);
+      p->dev_timer_active |= (0x01 << i);
+    }
+    p->dev_timer.expires = p->dev_expires[p->scsi_id];
+    add_timer(&p->dev_timer);
+    p->dev_timer_active |= (0x01 << MAX_TARGETS);
   }
   else
   {
@@ -7891,11 +8717,6 @@ aic7xxx_register(Scsi_Host_Template *template, struct aic7xxx_host *p,
              "the no_reset\n", p->host_no);
       printk(KERN_INFO "(scsi%d) option unless you have a verifiable need "
              "for it.\n", p->host_no);
-      printk(KERN_INFO "(scsi%d) The no_reset option is known to break some "
-             "systems,\n", p->host_no);
-      printk(KERN_INFO "(scsi%d) and is not supported by the driver author\n",
-             p->host_no);
-      aic7xxx_delay(AIC7XXX_RESET_DELAY);
     }
   }
   
@@ -7921,9 +8742,15 @@ aic7xxx_register(Scsi_Host_Template *template, struct aic7xxx_host *p,
   {
     printk(KERN_WARNING "(scsi%d) Couldn't register IRQ %d, ignoring "
            "controller.\n", p->host_no, p->irq);
+    aic_outb(p, 0, SIMODE1);
     p->irq = 0;
     return (0);
   }
+
+  if(aic_inb(p, INTSTAT) & INT_PEND)
+    printk(INFO_LEAD "spurious interrupt during configuration, cleared.\n",
+      p->host_no, -1, -1 , -1);
+  aic7xxx_clear_intstat(p);
 
   unpause_sequencer(p, /* unpause_always */ TRUE);
 
@@ -7954,10 +8781,10 @@ aic7xxx_chip_reset(struct aic7xxx_host *p)
    * In the future, we may call this function as a last resort for
    * error handling.  Let's be nice and not do any unecessary delays.
    */
-  wait = 1000;  /* 1 second (1000 * 1 msec) */
+  wait = 1000;  /* 1 msec (1000 * 1 msec) */
   while (--wait && !(aic_inb(p, HCNTRL) & CHIPRSTACK))
   {
-    mdelay(1);  /* 1 msec */
+    udelay(1);  /* 1 usec */
   }
 
   pause_sequencer(p);
@@ -8033,8 +8860,9 @@ aic7xxx_alloc(Scsi_Host_Template *sht, struct aic7xxx_host *temp)
     p->orderedtag = 0;
     for (i=0; i<MAX_TARGETS; i++)
     {
-      p->transinfo[i].goal_period = 0;
+      p->transinfo[i].goal_period = 255;
       p->transinfo[i].goal_offset = 0;
+      p->transinfo[i].goal_options = 0;
       p->transinfo[i].goal_width = MSG_EXT_WDTR_BUS_8_BIT;
     }
     DRIVER_LOCK_INIT
@@ -8060,9 +8888,11 @@ aic7xxx_free(struct aic7xxx_host *p)
    */
   if (p->scb_data != NULL)
   {
+    struct aic7xxx_scb_dma *scb_dma = NULL;
     if (p->scb_data->hscbs != NULL)
     {
-      kfree(p->scb_data->hscb_kmalloc_ptr);
+      pci_free_consistent(p->pdev, p->scb_data->hscbs_dma_len,
+			  p->scb_data->hscbs, p->scb_data->hscbs_dma);
       p->scb_data->hscbs = p->scb_data->hscb_kmalloc_ptr = NULL;
     }
     /*
@@ -8073,6 +8903,14 @@ aic7xxx_free(struct aic7xxx_host *p)
      */
     for (i = 0; i < p->scb_data->numscbs; i++)
     {
+      if (p->scb_data->scb_array[i]->scb_dma != scb_dma)
+      {
+	scb_dma = p->scb_data->scb_array[i]->scb_dma;
+	pci_free_consistent(p->pdev, scb_dma->dma_len,
+			    (void *)((unsigned long)scb_dma->dma_address
+                                     - scb_dma->dma_offset),
+			    scb_dma->dma_address);
+      }
       if (p->scb_data->scb_array[i]->kmalloc_ptr != NULL)
         kfree(p->scb_data->scb_array[i]->kmalloc_ptr);
       p->scb_data->scb_array[i] = NULL;
@@ -8090,12 +8928,17 @@ aic7xxx_free(struct aic7xxx_host *p)
    */
   for (i = 0; i < MAX_TARGETS; i++)
   {
-    if(p->dev_wdtr_cmnd[i])
-      kfree(p->dev_wdtr_cmnd[i]);
-    if(p->dev_sdtr_cmnd[i])
-      kfree(p->dev_sdtr_cmnd[i]);
+    if(p->dev_dtr_cmnd[i])
+    {
+      if(p->dev_dtr_cmnd[i]->request_buffer)
+      {
+        kfree(p->dev_dtr_cmnd[i]->request_buffer);
+      }
+      kfree(p->dev_dtr_cmnd[i]);
+    }
   }
 
+  pci_free_consistent(p->pdev, 3*256, (void *)p->untagged_scbs, p->fifo_dma);
 }
 
 /*+F*************************************************************************
@@ -8147,15 +8990,15 @@ aic7xxx_load_seeprom(struct aic7xxx_host *p, unsigned char *sxfrctl1)
       if (!have_seeprom)
       {
         p->sc_size = 128;
-        have_seeprom = read_seeprom(p, (p->flags & (AHC_CHNLB|AHC_CHNLC)),
+        have_seeprom = read_seeprom(p, 4*(p->flags & (AHC_CHNLB|AHC_CHNLC)),
                                     scarray, p->sc_size, p->sc_type);
         if (!have_seeprom)
         {
           if(p->sc_type == C46)
-            have_seeprom = read_seeprom(p, (p->flags & (AHC_CHNLB|AHC_CHNLC)),
+            have_seeprom = read_seeprom(p, 4*(p->flags & (AHC_CHNLB|AHC_CHNLC)),
                                         scarray, p->sc_size, C56_66);
           else
-            have_seeprom = read_seeprom(p, (p->flags & (AHC_CHNLB|AHC_CHNLC)),
+            have_seeprom = read_seeprom(p, 4*(p->flags & (AHC_CHNLB|AHC_CHNLC)),
                                         scarray, p->sc_size, C46);
         }
       }
@@ -8184,14 +9027,16 @@ aic7xxx_load_seeprom(struct aic7xxx_host *p, unsigned char *sxfrctl1)
     {
       printk("aic7xxx: Using leftover BIOS values.\n");
     }
-    if ( *sxfrctl1 & STPWEN )
+    if ( ((p->chip & ~AHC_CHIPID_MASK) == AHC_PCI) && (*sxfrctl1 & STPWEN) )
     {
       p->flags |= AHC_TERM_ENB_SE_LOW | AHC_TERM_ENB_SE_HIGH;
       sc->adapter_control &= ~CFAUTOTERM;
       sc->adapter_control |= CFSTERM | CFWSTERM | CFLVDSTERM;
     }
     if (aic7xxx_extended)
-      p->flags |= AHC_EXTEND_TRANS_A | AHC_EXTEND_TRANS_B;
+      p->flags |= (AHC_EXTEND_TRANS_A | AHC_EXTEND_TRANS_B);
+    else
+      p->flags &= ~(AHC_EXTEND_TRANS_A | AHC_EXTEND_TRANS_B);
   }
   else
   {
@@ -8247,7 +9092,7 @@ aic7xxx_load_seeprom(struct aic7xxx_host *p, unsigned char *sxfrctl1)
         p->flags |= AHC_TERM_ENB_SE_LOW | AHC_TERM_ENB_SE_HIGH;
       }
     }
-    p->sc = *sc;
+    memcpy(&p->sc, sc, sizeof(struct seeprom_config));
   }
 
   p->discenable = 0;
@@ -8256,8 +9101,7 @@ aic7xxx_load_seeprom(struct aic7xxx_host *p, unsigned char *sxfrctl1)
    * Limit to 16 targets just in case.  The 2842 for one is known to
    * blow the max_targets setting, future cards might also.
    */
-  max_targets = MIN(sc->max_targets & CFMAXTARG,
-                   ((p->features & (AHC_TWIN | AHC_WIDE)) ? 16 : 8));
+  max_targets = ((p->features & (AHC_TWIN | AHC_WIDE)) ? 16 : 8);
 
   if (have_seeprom)
   {
@@ -8279,7 +9123,7 @@ aic7xxx_load_seeprom(struct aic7xxx_host *p, unsigned char *sxfrctl1)
     mask = (0x01 << i);
     if (!have_seeprom)
     {
-      if(aic_inb(p, SCSISEQ) != 0)
+      if (aic_inb(p, SCSISEQ) != 0)
       {
         /*
          * OK...the BIOS set things up and left behind the settings we need.
@@ -8323,7 +9167,9 @@ aic7xxx_load_seeprom(struct aic7xxx_host *p, unsigned char *sxfrctl1)
         sc->device_flags[i] = CFDISC;
         if (p->features & AHC_WIDE)
           sc->device_flags[i] |= CFWIDEB;
-        if (p->features & AHC_ULTRA2)
+        if (p->features & AHC_ULTRA3)
+          sc->device_flags[i] |= 2;
+        else if (p->features & AHC_ULTRA2)
           sc->device_flags[i] |= 3;
         else if (p->features & AHC_ULTRA)
           sc->device_flags[i] |= CFSYNCHISULTRA;
@@ -8339,19 +9185,35 @@ aic7xxx_load_seeprom(struct aic7xxx_host *p, unsigned char *sxfrctl1)
     }
     if (p->flags & AHC_NEWEEPROM_FMT)
     {
-      if (sc->device_flags[i] & CFSYNCHISULTRA)
+      if ( !(p->features & AHC_ULTRA2) )
       {
-        p->ultraenb |= mask;
-      }
-      else if (sc->device_flags[i] & CFNEWULTRAFORMAT)
-      {
-        if ( ((sc->device_flags[i] & (CFSYNCHISULTRA | CFXFER)) == 0x03) &&
-             !(p->features & AHC_ULTRA2) )
+        /*
+         * I know of two different Ultra BIOSes that do this differently.
+         * One on the Gigabyte 6BXU mb that wants flags[i] & CFXFER to
+         * be == to 0x03 and SYNCHISULTRA to be true to mean 40MByte/s
+         * while on the IBM Netfinity 5000 they want the same thing
+         * to be something else, while flags[i] & CFXFER == 0x03 and
+         * SYNCHISULTRA false should be 40MByte/s.  So, we set both to
+         * 40MByte/s and the lower speeds be damned.  People will have
+         * to select around the conversely mapped lower speeds in order
+         * to select lower speeds on these boards.
+         */
+        if ( (sc->device_flags[i] & CFNEWULTRAFORMAT) &&
+            ((sc->device_flags[i] & CFXFER) == 0x03) )
         {
           sc->device_flags[i] &= ~CFXFER;
           sc->device_flags[i] |= CFSYNCHISULTRA;
+        }
+        if (sc->device_flags[i] & CFSYNCHISULTRA)
+        {
           p->ultraenb |= mask;
         }
+      }
+      else if ( !(sc->device_flags[i] & CFNEWULTRAFORMAT) &&
+                 (p->features & AHC_ULTRA2) &&
+		 (sc->device_flags[i] & CFSYNCHISULTRA) )
+      {
+        p->ultraenb |= mask;
       }
     }
     else if (sc->adapter_control & CFULTRAEN)
@@ -8364,18 +9226,54 @@ aic7xxx_load_seeprom(struct aic7xxx_host *p, unsigned char *sxfrctl1)
       p->ultraenb &= ~mask;
       p->transinfo[i].user_offset = 0;
       p->transinfo[i].user_period = 0;
+      p->transinfo[i].user_options = 0;
       p->transinfo[i].cur_offset = 0;
       p->transinfo[i].cur_period = 0;
+      p->transinfo[i].cur_options = 0;
       p->needsdtr_copy &= ~mask;
     }
     else
     {
-      if (p->features & AHC_ULTRA2)
+      if (p->features & AHC_ULTRA3)
+      {
+        p->transinfo[i].user_offset = MAX_OFFSET_ULTRA2;
+        p->transinfo[i].cur_offset = aic_inb(p, TARG_OFFSET + i);
+        if( (sc->device_flags[i] & CFXFER) < 0x03 )
+        {
+          scsirate = (sc->device_flags[i] & CFXFER);
+          p->transinfo[i].user_options = MSG_EXT_PPR_OPTION_DT_CRC;
+          if( (aic_inb(p, TARG_SCSIRATE + i) & CFXFER) < 0x03 )
+          {
+            p->transinfo[i].cur_options = 
+              ((aic_inb(p, TARG_SCSIRATE + i) & 0x40) ?
+                 MSG_EXT_PPR_OPTION_DT_CRC : MSG_EXT_PPR_OPTION_DT_UNITS);
+          }
+          else
+          {
+            p->transinfo[i].cur_options = 0;
+          }
+        }
+        else
+        {
+          scsirate = (sc->device_flags[i] & CFXFER) |
+                     ((p->ultraenb & mask) ? 0x18 : 0x10);
+          p->transinfo[i].user_options = 0;
+          p->transinfo[i].cur_options = 0;
+        }
+        p->transinfo[i].user_period = aic7xxx_find_period(p, scsirate,
+                                       AHC_SYNCRATE_ULTRA3);
+        p->transinfo[i].cur_period = aic7xxx_find_period(p,
+                                       aic_inb(p, TARG_SCSIRATE + i),
+                                       AHC_SYNCRATE_ULTRA3);
+      }
+      else if (p->features & AHC_ULTRA2)
       {
         p->transinfo[i].user_offset = MAX_OFFSET_ULTRA2;
         p->transinfo[i].cur_offset = aic_inb(p, TARG_OFFSET + i);
         scsirate = (sc->device_flags[i] & CFXFER) |
                    ((p->ultraenb & mask) ? 0x18 : 0x10);
+        p->transinfo[i].user_options = 0;
+        p->transinfo[i].cur_options = 0;
         p->transinfo[i].user_period = aic7xxx_find_period(p, scsirate,
                                        AHC_SYNCRATE_ULTRA2);
         p->transinfo[i].cur_period = aic7xxx_find_period(p,
@@ -8385,10 +9283,9 @@ aic7xxx_load_seeprom(struct aic7xxx_host *p, unsigned char *sxfrctl1)
       else
       {
         scsirate = (sc->device_flags[i] & CFXFER) << 4;
-        if (sc->device_flags[i] & CFWIDEB)
-          p->transinfo[i].user_offset = MAX_OFFSET_16BIT;
-        else
-          p->transinfo[i].user_offset = MAX_OFFSET_8BIT;
+        p->transinfo[i].user_options = 0;
+        p->transinfo[i].cur_options = 0;
+        p->transinfo[i].user_offset = MAX_OFFSET_8BIT;
         if (p->features & AHC_ULTRA)
         {
           short ultraenb;
@@ -8427,9 +9324,10 @@ aic7xxx_load_seeprom(struct aic7xxx_host *p, unsigned char *sxfrctl1)
   }
   aic_outb(p, ~(p->discenable & 0xFF), DISC_DSB);
   aic_outb(p, ~((p->discenable >> 8) & 0xFF), DISC_DSB + 1);
+  p->needppr = p->needppr_copy = p->needdv = 0;
   p->needwdtr = p->needwdtr_copy;
   p->needsdtr = p->needsdtr_copy;
-  p->wdtr_pending = p->sdtr_pending = 0;
+  p->dtr_pending = 0;
 
   /*
    * We set the p->ultraenb from the SEEPROM to begin with, but now we make
@@ -8453,6 +9351,7 @@ aic7xxx_load_seeprom(struct aic7xxx_host *p, unsigned char *sxfrctl1)
     {
       case AHC_AIC7895:
       case AHC_AIC7896:
+      case AHC_AIC7899:
         if (p->adapter_control & CFBPRIMARY)
           p->flags |= AHC_CHANNEL_B_PRIMARY;
       default:
@@ -8518,7 +9417,7 @@ aic7xxx_detect(Scsi_Host_Template *template)
    * aic7xxx_setup
    */
   if(aic7xxx)
-    aic7xxx_setup(aic7xxx, NULL);
+    aic7xxx_setup(aic7xxx);
   if(dummy_buffer[0] != 'P')
     printk(KERN_WARNING "aic7xxx: Please read the file /usr/src/linux/drivers"
       "/scsi/README.aic7xxx\n"
@@ -8528,16 +9427,687 @@ aic7xxx_detect(Scsi_Host_Template *template)
       "aic7xxx: insmod or else it might trash certain memory areas.\n");
 #endif
 
-  template->proc_dir = &proc_scsi_aic7xxx;
+  template->proc_name = "aic7xxx";
   template->sg_tablesize = AIC7XXX_MAX_SG;
 
+
+#ifdef CONFIG_PCI
+  /*
+   * PCI-bus probe.
+   */
+  if (pci_present())
+  {
+    struct
+    {
+      unsigned short      vendor_id;
+      unsigned short      device_id;
+      ahc_chip            chip;
+      ahc_flag_type       flags;
+      ahc_feature         features;
+      int                 board_name_index;
+      unsigned short      seeprom_size;
+      unsigned short      seeprom_type;
+    } const aic_pdevs[] = {
+      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7810, AHC_NONE,
+       AHC_FNONE, AHC_FENONE,                                1,
+       32, C46 },
+      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7850, AHC_AIC7850,
+       AHC_PAGESCBS, AHC_AIC7850_FE,                         5,
+       32, C46 },
+      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7855, AHC_AIC7850,
+       AHC_PAGESCBS, AHC_AIC7850_FE,                         6,
+       32, C46 },
+      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7821, AHC_AIC7860,
+       AHC_PAGESCBS | AHC_NEWEEPROM_FMT | AHC_BIOS_ENABLED,
+       AHC_AIC7860_FE,                                       7,
+       32, C46 },
+      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_3860, AHC_AIC7860,
+       AHC_PAGESCBS | AHC_NEWEEPROM_FMT | AHC_BIOS_ENABLED,
+       AHC_AIC7860_FE,                                       7,
+       32, C46 },
+      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_38602, AHC_AIC7860,
+       AHC_PAGESCBS | AHC_NEWEEPROM_FMT | AHC_BIOS_ENABLED,
+       AHC_AIC7860_FE,                                       7,
+       32, C46 },
+      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_38602, AHC_AIC7860,
+       AHC_PAGESCBS | AHC_NEWEEPROM_FMT | AHC_BIOS_ENABLED,
+       AHC_AIC7860_FE,                                       7,
+       32, C46 },
+      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7860, AHC_AIC7860,
+       AHC_PAGESCBS | AHC_NEWEEPROM_FMT | AHC_BIOS_ENABLED | AHC_MOTHERBOARD,
+       AHC_AIC7860_FE,                                       7,
+       32, C46 },
+      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7861, AHC_AIC7860,
+       AHC_PAGESCBS | AHC_NEWEEPROM_FMT | AHC_BIOS_ENABLED,
+       AHC_AIC7860_FE,                                       8,
+       32, C46 },
+      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7870, AHC_AIC7870,
+       AHC_PAGESCBS | AHC_BIOS_ENABLED | AHC_MOTHERBOARD,
+       AHC_AIC7870_FE,                                       9,
+       32, C46 },
+      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7871, AHC_AIC7870,
+       AHC_PAGESCBS | AHC_BIOS_ENABLED, AHC_AIC7870_FE,     10,
+       32, C46 },
+      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7872, AHC_AIC7870,
+       AHC_PAGESCBS | AHC_BIOS_ENABLED | AHC_MULTI_CHANNEL,
+       AHC_AIC7870_FE,                                      11,
+       32, C56_66 },
+      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7873, AHC_AIC7870,
+       AHC_PAGESCBS | AHC_BIOS_ENABLED | AHC_MULTI_CHANNEL,
+       AHC_AIC7870_FE,                                      12,
+       32, C56_66 },
+      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7874, AHC_AIC7870,
+       AHC_PAGESCBS | AHC_BIOS_ENABLED, AHC_AIC7870_FE,     13,
+       32, C46 },
+      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7880, AHC_AIC7880,
+       AHC_PAGESCBS | AHC_BIOS_ENABLED | AHC_MOTHERBOARD,
+       AHC_AIC7880_FE,                                      14,
+       32, C46 },
+      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7881, AHC_AIC7880,
+       AHC_PAGESCBS | AHC_BIOS_ENABLED, AHC_AIC7880_FE,     15,
+       32, C46 },
+      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7882, AHC_AIC7880,
+       AHC_PAGESCBS | AHC_BIOS_ENABLED | AHC_MULTI_CHANNEL,
+       AHC_AIC7880_FE,                                      16,
+       32, C56_66 },
+      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7883, AHC_AIC7880,
+       AHC_PAGESCBS | AHC_BIOS_ENABLED | AHC_MULTI_CHANNEL,
+       AHC_AIC7880_FE,                                      17,
+       32, C56_66 },
+      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7884, AHC_AIC7880,
+       AHC_PAGESCBS | AHC_BIOS_ENABLED, AHC_AIC7880_FE,     18,
+       32, C46 },
+      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7885, AHC_AIC7880,
+       AHC_PAGESCBS | AHC_BIOS_ENABLED, AHC_AIC7880_FE,     18,
+       32, C46 },
+      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7886, AHC_AIC7880,
+       AHC_PAGESCBS | AHC_BIOS_ENABLED, AHC_AIC7880_FE,     18,
+       32, C46 },
+      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7887, AHC_AIC7880,
+       AHC_PAGESCBS | AHC_BIOS_ENABLED, AHC_AIC7880_FE | AHC_NEW_AUTOTERM, 19,
+       32, C46 },
+      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7888, AHC_AIC7880,
+       AHC_PAGESCBS | AHC_BIOS_ENABLED, AHC_AIC7880_FE,     18,
+       32, C46 },
+      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7895, AHC_AIC7895,
+       AHC_PAGESCBS | AHC_NEWEEPROM_FMT | AHC_BIOS_ENABLED | AHC_MULTI_CHANNEL,
+       AHC_AIC7895_FE,                                      20,
+       32, C56_66 },
+      {PCI_VENDOR_ID_ADAPTEC2, PCI_DEVICE_ID_ADAPTEC2_7890, AHC_AIC7890,
+       AHC_PAGESCBS | AHC_NEWEEPROM_FMT | AHC_BIOS_ENABLED,
+       AHC_AIC7890_FE,                                      21,
+       32, C46 },
+      {PCI_VENDOR_ID_ADAPTEC2, PCI_DEVICE_ID_ADAPTEC2_7890B, AHC_AIC7890,
+       AHC_PAGESCBS | AHC_NEWEEPROM_FMT | AHC_BIOS_ENABLED,
+       AHC_AIC7890_FE,                                      21,
+       32, C46 },
+      {PCI_VENDOR_ID_ADAPTEC2, PCI_DEVICE_ID_ADAPTEC2_2930U2, AHC_AIC7890,
+       AHC_PAGESCBS | AHC_NEWEEPROM_FMT | AHC_BIOS_ENABLED,
+       AHC_AIC7890_FE,                                      22,
+       32, C46 },
+      {PCI_VENDOR_ID_ADAPTEC2, PCI_DEVICE_ID_ADAPTEC2_2940U2, AHC_AIC7890,
+       AHC_PAGESCBS | AHC_NEWEEPROM_FMT | AHC_BIOS_ENABLED,
+       AHC_AIC7890_FE,                                      23,
+       32, C46 },
+      {PCI_VENDOR_ID_ADAPTEC2, PCI_DEVICE_ID_ADAPTEC2_7896, AHC_AIC7896,
+       AHC_PAGESCBS | AHC_NEWEEPROM_FMT | AHC_BIOS_ENABLED | AHC_MULTI_CHANNEL,
+       AHC_AIC7896_FE,                                      24,
+       32, C56_66 },
+      {PCI_VENDOR_ID_ADAPTEC2, PCI_DEVICE_ID_ADAPTEC2_3940U2, AHC_AIC7896,
+       AHC_PAGESCBS | AHC_NEWEEPROM_FMT | AHC_BIOS_ENABLED | AHC_MULTI_CHANNEL,
+       AHC_AIC7896_FE,                                      25,
+       32, C56_66 },
+      {PCI_VENDOR_ID_ADAPTEC2, PCI_DEVICE_ID_ADAPTEC2_3950U2D, AHC_AIC7896,
+       AHC_PAGESCBS | AHC_NEWEEPROM_FMT | AHC_BIOS_ENABLED | AHC_MULTI_CHANNEL,
+       AHC_AIC7896_FE,                                      26,
+       32, C56_66 },
+      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_1480A, AHC_AIC7860,
+       AHC_PAGESCBS | AHC_NEWEEPROM_FMT | AHC_BIOS_ENABLED | AHC_NO_STPWEN,
+       AHC_AIC7860_FE,                                      27,
+       32, C46 },
+      {PCI_VENDOR_ID_ADAPTEC2, PCI_DEVICE_ID_ADAPTEC2_7892A, AHC_AIC7892,
+       AHC_PAGESCBS | AHC_NEWEEPROM_FMT | AHC_BIOS_ENABLED,
+       AHC_AIC7892_FE,                                      28,
+       32, C46 },
+      {PCI_VENDOR_ID_ADAPTEC2, PCI_DEVICE_ID_ADAPTEC2_7892B, AHC_AIC7892,
+       AHC_PAGESCBS | AHC_NEWEEPROM_FMT | AHC_BIOS_ENABLED,
+       AHC_AIC7892_FE,                                      28,
+       32, C46 },
+      {PCI_VENDOR_ID_ADAPTEC2, PCI_DEVICE_ID_ADAPTEC2_7892D, AHC_AIC7892,
+       AHC_PAGESCBS | AHC_NEWEEPROM_FMT | AHC_BIOS_ENABLED,
+       AHC_AIC7892_FE,                                      28,
+       32, C46 },
+      {PCI_VENDOR_ID_ADAPTEC2, PCI_DEVICE_ID_ADAPTEC2_7892P, AHC_AIC7892,
+       AHC_PAGESCBS | AHC_NEWEEPROM_FMT | AHC_BIOS_ENABLED,
+       AHC_AIC7892_FE,                                      28,
+       32, C46 },
+      {PCI_VENDOR_ID_ADAPTEC2, PCI_DEVICE_ID_ADAPTEC2_7899A, AHC_AIC7899,
+       AHC_PAGESCBS | AHC_NEWEEPROM_FMT | AHC_BIOS_ENABLED | AHC_MULTI_CHANNEL,
+       AHC_AIC7899_FE,                                      29,
+       32, C56_66 },
+      {PCI_VENDOR_ID_ADAPTEC2, PCI_DEVICE_ID_ADAPTEC2_7899B, AHC_AIC7899,
+       AHC_PAGESCBS | AHC_NEWEEPROM_FMT | AHC_BIOS_ENABLED | AHC_MULTI_CHANNEL,
+       AHC_AIC7899_FE,                                      29,
+       32, C56_66 },
+      {PCI_VENDOR_ID_ADAPTEC2, PCI_DEVICE_ID_ADAPTEC2_7899D, AHC_AIC7899,
+       AHC_PAGESCBS | AHC_NEWEEPROM_FMT | AHC_BIOS_ENABLED | AHC_MULTI_CHANNEL,
+       AHC_AIC7899_FE,                                      29,
+       32, C56_66 },
+      {PCI_VENDOR_ID_ADAPTEC2, PCI_DEVICE_ID_ADAPTEC2_7899P, AHC_AIC7899,
+       AHC_PAGESCBS | AHC_NEWEEPROM_FMT | AHC_BIOS_ENABLED | AHC_MULTI_CHANNEL,
+       AHC_AIC7899_FE,                                      29,
+       32, C56_66 },
+    };
+
+    unsigned short command;
+    unsigned int  devconfig, i, oldverbose;
+    struct pci_dev *pdev = NULL;
+
+    for (i = 0; i < NUMBER(aic_pdevs); i++)
+    {
+      pdev = NULL;
+      while ((pdev = pci_find_device(aic_pdevs[i].vendor_id,
+                                     aic_pdevs[i].device_id,
+                                     pdev))) {
+	if (pci_enable_device(pdev))
+		continue;
+        if ( i == 0 ) /* We found one, but it's the 7810 RAID cont. */
+        {
+          if (aic7xxx_verbose & (VERBOSE_PROBE|VERBOSE_PROBE2))
+          {
+            printk(KERN_INFO "aic7xxx: The 7810 RAID controller is not "
+              "supported by\n");
+            printk(KERN_INFO "         this driver, we are ignoring it.\n");
+          }
+        }
+        else if ( (temp_p = kmalloc(sizeof(struct aic7xxx_host),
+                                    GFP_ATOMIC)) != NULL )
+        {
+          memset(temp_p, 0, sizeof(struct aic7xxx_host));
+          temp_p->chip = aic_pdevs[i].chip | AHC_PCI;
+          temp_p->flags = aic_pdevs[i].flags;
+          temp_p->features = aic_pdevs[i].features;
+          temp_p->board_name_index = aic_pdevs[i].board_name_index;
+          temp_p->sc_size = aic_pdevs[i].seeprom_size;
+          temp_p->sc_type = aic_pdevs[i].seeprom_type;
+
+          /*
+           * Read sundry information from PCI BIOS.
+           */
+          temp_p->irq = pdev->irq;
+          temp_p->pdev = pdev;
+          temp_p->pci_bus = pdev->bus->number;
+          temp_p->pci_device_fn = pdev->devfn;
+          temp_p->base = pci_resource_start(pdev, 0);
+          temp_p->mbase = pci_resource_start(pdev, 1);
+          current_p = list_p;
+	  while(current_p && temp_p)
+	  {
+	    if ( ((current_p->pci_bus == temp_p->pci_bus) &&
+	          (current_p->pci_device_fn == temp_p->pci_device_fn)) ||
+                 (temp_p->base && (current_p->base == temp_p->base)) ||
+                 (temp_p->mbase && (current_p->mbase == temp_p->mbase)) )
+	    {
+              /* duplicate PCI entry, skip it */
+	      kfree(temp_p);
+	      temp_p = NULL;
+	    }
+	    current_p = current_p->next;
+	  }
+	  if ( temp_p == NULL )
+            continue;
+          if (aic7xxx_verbose & VERBOSE_PROBE2)
+            printk("aic7xxx: <%s> at PCI %d/%d\n", 
+              board_names[aic_pdevs[i].board_name_index],
+              PCI_SLOT(pdev->devfn),
+              PCI_FUNC(pdev->devfn));
+          pci_read_config_word(pdev, PCI_COMMAND, &command);
+          if (aic7xxx_verbose & VERBOSE_PROBE2)
+          {
+            printk("aic7xxx: Initial PCI_COMMAND value was 0x%x\n",
+              (int)command);
+          }
+#ifdef AIC7XXX_STRICT_PCI_SETUP
+          command |= PCI_COMMAND_SERR | PCI_COMMAND_PARITY |
+            PCI_COMMAND_MASTER | PCI_COMMAND_MEMORY | PCI_COMMAND_IO;
+#else
+          command |= PCI_COMMAND_MASTER | PCI_COMMAND_MEMORY | PCI_COMMAND_IO;
+#endif
+          command &= ~PCI_COMMAND_INVALIDATE;
+          if (aic7xxx_pci_parity == 0)
+            command &= ~(PCI_COMMAND_SERR | PCI_COMMAND_PARITY);
+          pci_write_config_word(pdev, PCI_COMMAND, command);
+#ifdef AIC7XXX_STRICT_PCI_SETUP
+          pci_read_config_dword(pdev, DEVCONFIG, &devconfig);
+          if (aic7xxx_verbose & VERBOSE_PROBE2)
+          {
+            printk("aic7xxx: Initial DEVCONFIG value was 0x%x\n", devconfig);
+          }
+          devconfig |= 0x80000040;
+          pci_write_config_dword(pdev, DEVCONFIG, devconfig);
+#endif /* AIC7XXX_STRICT_PCI_SETUP */
+
+          if(temp_p->base && check_region(temp_p->base, MAXREG - MINREG))
+          {
+            printk("aic7xxx: <%s> at PCI %d/%d/%d\n", 
+              board_names[aic_pdevs[i].board_name_index],
+              temp_p->pci_bus,
+              PCI_SLOT(temp_p->pci_device_fn),
+              PCI_FUNC(temp_p->pci_device_fn));
+            printk("aic7xxx: I/O ports already in use, ignoring.\n");
+            kfree(temp_p);
+            temp_p = NULL;
+            continue;
+          }
+
+          temp_p->unpause = INTEN;
+          temp_p->pause = temp_p->unpause | PAUSE;
+          if ( ((temp_p->base == 0) &&
+                (temp_p->mbase == 0)) ||
+               (temp_p->irq == 0) )
+          {
+            printk("aic7xxx: <%s> at PCI %d/%d/%d\n", 
+              board_names[aic_pdevs[i].board_name_index],
+              temp_p->pci_bus,
+              PCI_SLOT(temp_p->pci_device_fn),
+              PCI_FUNC(temp_p->pci_device_fn));
+            printk("aic7xxx: Controller disabled by BIOS, ignoring.\n");
+            kfree(temp_p);
+            temp_p = NULL;
+            continue;
+          }
+
+#ifdef MMAPIO
+          if ( !(temp_p->base) || !(temp_p->flags & AHC_MULTI_CHANNEL) ||
+               ((temp_p->chip != (AHC_AIC7870 | AHC_PCI)) &&
+                (temp_p->chip != (AHC_AIC7880 | AHC_PCI))) )
+          {
+            unsigned long page_offset, base;
+
+            base = temp_p->mbase & PAGE_MASK;
+            page_offset = temp_p->mbase - base;
+            temp_p->maddr = ioremap_nocache(base, page_offset + 256);
+            if(temp_p->maddr)
+            {
+              temp_p->maddr += page_offset;
+              /*
+               * We need to check the I/O with the MMAPed address.  Some machines
+               * simply fail to work with MMAPed I/O and certain controllers.
+               */
+              if(aic_inb(temp_p, HCNTRL) == 0xff)
+              {
+                /*
+                 * OK.....we failed our test....go back to programmed I/O
+                 */
+                printk(KERN_INFO "aic7xxx: <%s> at PCI %d/%d/%d\n", 
+                  board_names[aic_pdevs[i].board_name_index],
+                  temp_p->pci_bus,
+                  PCI_SLOT(temp_p->pci_device_fn),
+                  PCI_FUNC(temp_p->pci_device_fn));
+                printk(KERN_INFO "aic7xxx: MMAPed I/O failed, reverting to "
+                                 "Programmed I/O.\n");
+                iounmap((void *) (((unsigned long) temp_p->maddr) & PAGE_MASK));
+                temp_p->maddr = 0;
+                if(temp_p->base == 0)
+                {
+                  printk("aic7xxx: <%s> at PCI %d/%d/%d\n", 
+                    board_names[aic_pdevs[i].board_name_index],
+                    temp_p->pci_bus,
+                    PCI_SLOT(temp_p->pci_device_fn),
+                    PCI_FUNC(temp_p->pci_device_fn));
+                  printk("aic7xxx: Controller disabled by BIOS, ignoring.\n");
+                  kfree(temp_p);
+                  temp_p = NULL;
+                  continue;
+                }
+              }
+            }
+          }
+#endif
+
+          /*
+           * Lock out other contenders for our i/o space.
+           */
+          if(temp_p->base)
+            request_region(temp_p->base, MAXREG - MINREG, "aic7xxx");
+
+          /*
+           * We HAVE to make sure the first pause_sequencer() and all other
+           * subsequent I/O that isn't PCI config space I/O takes place
+           * after the MMAPed I/O region is configured and tested.  The
+           * problem is the PowerPC architecture that doesn't support
+           * programmed I/O at all, so we have to have the MMAP I/O set up
+           * for this pause to even work on those machines.
+           */
+          pause_sequencer(temp_p);
+
+          /*
+           * Clear out any pending PCI error status messages.  Also set
+           * verbose to 0 so that we don't emit strange PCI error messages
+           * while cleaning out the current status bits.
+           */
+          oldverbose = aic7xxx_verbose;
+          aic7xxx_verbose = 0;
+          aic7xxx_pci_intr(temp_p);
+          aic7xxx_verbose = oldverbose;
+
+          temp_p->bios_address = 0;
+
+          /*
+           * Remember how the card was setup in case there is no seeprom.
+           */
+          if (temp_p->features & AHC_ULTRA2)
+            temp_p->scsi_id = aic_inb(temp_p, SCSIID_ULTRA2) & OID;
+          else
+            temp_p->scsi_id = aic_inb(temp_p, SCSIID) & OID;
+          /*
+           * Get current termination setting
+           */
+          sxfrctl1 = aic_inb(temp_p, SXFRCTL1);
+
+          if (aic7xxx_chip_reset(temp_p) == -1)
+          {
+            release_region(temp_p->base, MAXREG - MINREG);
+            kfree(temp_p);
+            temp_p = NULL;
+            continue;
+          }
+          /*
+           * Very quickly put the term setting back into the register since
+           * the chip reset may cause odd things to happen.  This is to keep
+           * LVD busses with lots of drives from draining the power out of
+           * the diffsense line before we get around to running the
+           * configure_termination() function.  Also restore the STPWLEVEL
+           * bit of DEVCONFIG
+           */
+          aic_outb(temp_p, sxfrctl1, SXFRCTL1);
+          pci_write_config_dword(temp_p->pdev, DEVCONFIG, devconfig);
+          sxfrctl1 &= STPWEN;
+
+          /*
+           * We need to set the CHNL? assignments before loading the SEEPROM
+           * The 3940 and 3985 cards (original stuff, not any of the later
+           * stuff) are 7870 and 7880 class chips.  The Ultra2 stuff falls
+           * under 7896 and 7897.  The 7895 is in a class by itself :)
+           */
+          switch (temp_p->chip & AHC_CHIPID_MASK)
+          {
+            case AHC_AIC7870: /* 3840 / 3985 */
+            case AHC_AIC7880: /* 3840 UW / 3985 UW */
+              if(temp_p->flags & AHC_MULTI_CHANNEL)
+              {
+                switch(PCI_SLOT(temp_p->pci_device_fn))
+                {
+                  case 5:
+                    temp_p->flags |= AHC_CHNLB;
+                    break;
+                  case 8:
+                    temp_p->flags |= AHC_CHNLB;
+                    break;
+                  case 12:
+                    temp_p->flags |= AHC_CHNLC;
+                    break;
+                  default:
+                    break;
+                }
+              }
+              break;
+
+            case AHC_AIC7895: /* 7895 */
+            case AHC_AIC7896: /* 7896/7 */
+            case AHC_AIC7899: /* 7899 */
+              if (PCI_FUNC(pdev->devfn) != 0)
+              {
+                temp_p->flags |= AHC_CHNLB;
+              }
+              /*
+               * The 7895 is the only chipset that sets the SCBSIZE32 param
+               * in the DEVCONFIG register.  The Ultra2 chipsets use
+               * the DSCOMMAND0 register instead.
+               */
+              if ((temp_p->chip & AHC_CHIPID_MASK) == AHC_AIC7895)
+              {
+                pci_read_config_dword(pdev, DEVCONFIG, &devconfig);
+                devconfig |= SCBSIZE32;
+                pci_write_config_dword(pdev, DEVCONFIG, devconfig);
+              }
+              break;
+            default:
+              break;
+          }
+
+          /*
+           * Loading of the SEEPROM needs to come after we've set the flags
+           * to indicate possible CHNLB and CHNLC assigments.  Otherwise,
+           * on 394x and 398x cards we'll end up reading the wrong settings
+           * for channels B and C
+           */
+          switch (temp_p->chip & AHC_CHIPID_MASK)
+          {
+            case AHC_AIC7892:
+            case AHC_AIC7899:
+              aic_outb(temp_p, 0, SCAMCTL);
+              /*
+               * Switch to the alt mode of the chip...
+               */
+              aic_outb(temp_p, aic_inb(temp_p, SFUNCT) | ALT_MODE, SFUNCT);
+              /*
+               * Set our options...the last two items set our CRC after x byte
+	       * count in target mode...
+               */
+              aic_outb(temp_p, AUTO_MSGOUT_DE | DIS_MSGIN_DUALEDGE, OPTIONMODE);
+	      aic_outb(temp_p, 0x00, 0x0b);
+	      aic_outb(temp_p, 0x10, 0x0a);
+              /*
+               * switch back to normal mode...
+               */
+              aic_outb(temp_p, aic_inb(temp_p, SFUNCT) & ~ALT_MODE, SFUNCT);
+              aic_outb(temp_p, CRCVALCHKEN | CRCENDCHKEN | CRCREQCHKEN |
+			       TARGCRCENDEN | TARGCRCCNTEN,
+                       CRCCONTROL1);
+              aic_outb(temp_p, ((aic_inb(temp_p, DSCOMMAND0) | USCBSIZE32 |
+                                 MPARCKEN | CIOPARCKEN | CACHETHEN) & 
+                               ~DPARCKEN), DSCOMMAND0);
+              aic7xxx_load_seeprom(temp_p, &sxfrctl1);
+              break;
+            case AHC_AIC7890:
+            case AHC_AIC7896:
+              aic_outb(temp_p, 0, SCAMCTL);
+              aic_outb(temp_p, (aic_inb(temp_p, DSCOMMAND0) |
+                                CACHETHEN | MPARCKEN | USCBSIZE32 |
+                                CIOPARCKEN) & ~DPARCKEN, DSCOMMAND0);
+              aic7xxx_load_seeprom(temp_p, &sxfrctl1);
+              break;
+            case AHC_AIC7850:
+            case AHC_AIC7860:
+              /*
+               * Set the DSCOMMAND0 register on these cards different from
+               * on the 789x cards.  Also, read the SEEPROM as well.
+               */
+              aic_outb(temp_p, (aic_inb(temp_p, DSCOMMAND0) |
+                                CACHETHEN | MPARCKEN) & ~DPARCKEN,
+                       DSCOMMAND0);
+              /* FALLTHROUGH */
+            default:
+              aic7xxx_load_seeprom(temp_p, &sxfrctl1);
+              break;
+            case AHC_AIC7880:
+              /*
+               * Check the rev of the chipset before we change DSCOMMAND0
+               */
+              pci_read_config_dword(pdev, DEVCONFIG, &devconfig);
+              if ((devconfig & 0xff) >= 1)
+              {
+                aic_outb(temp_p, (aic_inb(temp_p, DSCOMMAND0) |
+                                  CACHETHEN | MPARCKEN) & ~DPARCKEN,
+                         DSCOMMAND0);
+              }
+              aic7xxx_load_seeprom(temp_p, &sxfrctl1);
+              break;
+          }
+          
+
+          /*
+           * and then we need another switch based on the type in order to
+           * make sure the channel B primary flag is set properly on 7895
+           * controllers....Arrrgggghhh!!!  We also have to catch the fact
+           * that when you disable the BIOS on the 7895 on the Intel DK440LX
+           * motherboard, and possibly others, it only sets the BIOS disabled
+           * bit on the A channel...I think I'm starting to lean towards
+           * going postal....
+           */
+          switch(temp_p->chip & AHC_CHIPID_MASK)
+          {
+            case AHC_AIC7895:
+            case AHC_AIC7896:
+            case AHC_AIC7899:
+              current_p = list_p;
+              while(current_p != NULL)
+              {
+                if ( (current_p->pci_bus == temp_p->pci_bus) &&
+                     (PCI_SLOT(current_p->pci_device_fn) ==
+                      PCI_SLOT(temp_p->pci_device_fn)) )
+                {
+                  if ( PCI_FUNC(current_p->pci_device_fn) == 0 )
+                  {
+                    temp_p->flags |= 
+                      (current_p->flags & AHC_CHANNEL_B_PRIMARY);
+                    temp_p->flags &= ~(AHC_BIOS_ENABLED|AHC_USEDEFAULTS);
+                    temp_p->flags |=
+                      (current_p->flags & (AHC_BIOS_ENABLED|AHC_USEDEFAULTS));
+                  }
+                  else
+                  {
+                    current_p->flags |=
+                      (temp_p->flags & AHC_CHANNEL_B_PRIMARY);
+                    current_p->flags &= ~(AHC_BIOS_ENABLED|AHC_USEDEFAULTS);
+                    current_p->flags |=
+                      (temp_p->flags & (AHC_BIOS_ENABLED|AHC_USEDEFAULTS));
+                  }
+                }
+                current_p = current_p->next;
+              }
+              break;
+            default:
+              break;
+          }
+
+          /*
+           * We only support external SCB RAM on the 7895/6/7 chipsets.
+           * We could support it on the 7890/1 easy enough, but I don't
+           * know of any 7890/1 based cards that have it.  I do know
+           * of 7895/6/7 cards that have it and they work properly.
+           */
+          switch(temp_p->chip & AHC_CHIPID_MASK)
+          {
+            default:
+              break;
+            case AHC_AIC7895:
+            case AHC_AIC7896:
+            case AHC_AIC7899:
+              pci_read_config_dword(pdev, DEVCONFIG, &devconfig);
+              if (temp_p->features & AHC_ULTRA2)
+              {
+                if ( (aic_inb(temp_p, DSCOMMAND0) & RAMPSM_ULTRA2) &&
+                     (aic7xxx_scbram) )
+                {
+                  aic_outb(temp_p,
+                           aic_inb(temp_p, DSCOMMAND0) & ~SCBRAMSEL_ULTRA2,
+                           DSCOMMAND0);
+                  temp_p->flags |= AHC_EXTERNAL_SRAM;
+                  devconfig |= EXTSCBPEN;
+                }
+                else if (aic_inb(temp_p, DSCOMMAND0) & RAMPSM_ULTRA2)
+                {
+                  printk(KERN_INFO "aic7xxx: <%s> at PCI %d/%d/%d\n", 
+                    board_names[aic_pdevs[i].board_name_index],
+                    temp_p->pci_bus,
+                    PCI_SLOT(temp_p->pci_device_fn),
+                    PCI_FUNC(temp_p->pci_device_fn));
+                  printk("aic7xxx: external SCB RAM detected, "
+                         "but not enabled\n");
+                }
+              }
+              else
+              {
+                if ((devconfig & RAMPSM) && (aic7xxx_scbram))
+                {
+                  devconfig &= ~SCBRAMSEL;
+                  devconfig |= EXTSCBPEN;
+                  temp_p->flags |= AHC_EXTERNAL_SRAM;
+                }
+                else if (devconfig & RAMPSM)
+                {
+                  printk(KERN_INFO "aic7xxx: <%s> at PCI %d/%d/%d\n", 
+                    board_names[aic_pdevs[i].board_name_index],
+                    temp_p->pci_bus,
+                    PCI_SLOT(temp_p->pci_device_fn),
+                    PCI_FUNC(temp_p->pci_device_fn));
+                  printk("aic7xxx: external SCB RAM detected, "
+                         "but not enabled\n");
+                }
+              }
+              pci_write_config_dword(pdev, DEVCONFIG, devconfig);
+              if ( (temp_p->flags & AHC_EXTERNAL_SRAM) &&
+                   (temp_p->flags & AHC_CHNLB) )
+                aic_outb(temp_p, 1, CCSCBBADDR);
+              break;
+          }
+
+          /*
+           * Take the LED out of diagnostic mode
+           */
+          aic_outb(temp_p, 
+            (aic_inb(temp_p, SBLKCTL) & ~(DIAGLEDEN | DIAGLEDON)),
+            SBLKCTL);
+
+          /*
+           * We don't know where this is set in the SEEPROM or by the
+           * BIOS, so we default to 100%.  On Ultra2 controllers, use 75%
+           * instead.
+           */
+          if (temp_p->features & AHC_ULTRA2)
+          {
+            aic_outb(temp_p, RD_DFTHRSH_MAX | WR_DFTHRSH_MAX, DFF_THRSH);
+          }
+          else
+          {
+            aic_outb(temp_p, DFTHRSH_100, DSPCISTATUS);
+          }
+
+          if ( list_p == NULL )
+          {
+            list_p = current_p = temp_p;
+          }
+          else
+          {
+            current_p = list_p;
+            while(current_p->next != NULL)
+              current_p = current_p->next;
+            current_p->next = temp_p;
+          }
+          temp_p->next = NULL;
+          found++;
+        }  /* Found an Adaptec PCI device. */
+        else /* Well, we found one, but we couldn't get any memory */
+        {
+          printk("aic7xxx: Found <%s>\n", 
+            board_names[aic_pdevs[i].board_name_index]);
+          printk(KERN_INFO "aic7xxx: Unable to allocate device memory, "
+            "skipping.\n");
+        }
+      } /* while(pdev=....) */
+    } /* for PCI_DEVICES */
+  } /* PCI BIOS present */
+#endif CONFIG_PCI
 
 #if defined(__i386__) || defined(__alpha__)
   /*
    * EISA/VL-bus card signature probe.
    */
   slot = MINSLOT;
-  while ( (slot <= MAXSLOT) && !(aic7xxx_no_probe) )
+  while ( (slot <= MAXSLOT) && 
+         !(aic7xxx_no_probe) )
   {
     base = SLOTBASE(slot) + MINREG;
 
@@ -8564,6 +10134,11 @@ aic7xxx_detect(Scsi_Host_Template *template)
       slot++;
       continue; /* back to the beginning of the while loop */
     }
+    /*
+     * Lock out other contenders for our i/o space.
+     */
+    request_region(base, MAXREG - MINREG, "aic7xxx");
+
     /*
      * Pause the card preserving the IRQ type.  Allow the operator
      * to override the IRQ trigger.
@@ -8604,6 +10179,7 @@ aic7xxx_detect(Scsi_Host_Template *template)
         printk(KERN_WARNING "aic7xxx: Host adapter uses unsupported IRQ "
           "level %d, ignoring.\n", temp_p->irq);
         kfree(temp_p);
+        release_region(base, MAXREG - MINREG);
         slot++;
         continue; /* back to the beginning of the while loop */
     }
@@ -8753,649 +10329,6 @@ aic7xxx_detect(Scsi_Host_Template *template)
 
 #endif /* defined(__i386__) || defined(__alpha__) */
 
-#ifdef CONFIG_PCI
-  /*
-   * PCI-bus probe.
-   */
-#if LINUX_VERSION_CODE > KERNEL_VERSION(2,1,92)
-  if (pci_present())
-#else
-  if (pcibios_present())
-#endif
-  {
-    struct
-    {
-      unsigned short      vendor_id;
-      unsigned short      device_id;
-      ahc_chip            chip;
-      ahc_flag_type       flags;
-      ahc_feature         features;
-      int                 board_name_index;
-      unsigned short      seeprom_size;
-      unsigned short      seeprom_type;
-    } const aic_pdevs[] = {
-      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7810, AHC_NONE,
-       AHC_FNONE, AHC_FENONE,                                1,
-       32, C46 },
-      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7850, AHC_AIC7850,
-       AHC_PAGESCBS, AHC_AIC7850_FE,                         5,
-       32, C46 },
-      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7855, AHC_AIC7850,
-       AHC_PAGESCBS, AHC_AIC7850_FE,                         6,
-       32, C46 },
-      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7860, AHC_AIC7860,
-       AHC_PAGESCBS | AHC_NEWEEPROM_FMT | AHC_BIOS_ENABLED,
-       AHC_AIC7860_FE,                                       7,
-       32, C46 },
-      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7861, AHC_AIC7860,
-       AHC_PAGESCBS | AHC_NEWEEPROM_FMT | AHC_BIOS_ENABLED,
-       AHC_AIC7860_FE,                                       8,
-       32, C46 },
-      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7870, AHC_AIC7870,
-       AHC_PAGESCBS | AHC_BIOS_ENABLED, AHC_AIC7870_FE,      9,
-       32, C46 },
-      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7871, AHC_AIC7870,
-       AHC_PAGESCBS | AHC_BIOS_ENABLED, AHC_AIC7870_FE,     10,
-       32, C46 },
-      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7872, AHC_AIC7870,
-       AHC_PAGESCBS | AHC_BIOS_ENABLED | AHC_MULTI_CHANNEL,
-       AHC_AIC7870_FE,                                      11,
-       32, C56_66 },
-      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7873, AHC_AIC7870,
-       AHC_PAGESCBS | AHC_BIOS_ENABLED | AHC_MULTI_CHANNEL,
-       AHC_AIC7870_FE,                                      12,
-       32, C56_66 },
-      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7874, AHC_AIC7870,
-       AHC_PAGESCBS | AHC_BIOS_ENABLED, AHC_AIC7870_FE,     13,
-       32, C46 },
-      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7880, AHC_AIC7880,
-       AHC_PAGESCBS | AHC_BIOS_ENABLED, AHC_AIC7880_FE,     14,
-       32, C46 },
-      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7881, AHC_AIC7880,
-       AHC_PAGESCBS | AHC_BIOS_ENABLED, AHC_AIC7880_FE,     15,
-       32, C46 },
-      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7882, AHC_AIC7880,
-       AHC_PAGESCBS | AHC_BIOS_ENABLED | AHC_MULTI_CHANNEL,
-       AHC_AIC7880_FE,                                      16,
-       32, C56_66 },
-      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7883, AHC_AIC7880,
-       AHC_PAGESCBS | AHC_BIOS_ENABLED | AHC_MULTI_CHANNEL,
-       AHC_AIC7880_FE,                                      17,
-       32, C56_66 },
-      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7884, AHC_AIC7880,
-       AHC_PAGESCBS | AHC_BIOS_ENABLED, AHC_AIC7880_FE,     18,
-       32, C46 },
-      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_7895, AHC_AIC7895,
-       AHC_PAGESCBS | AHC_NEWEEPROM_FMT | AHC_BIOS_ENABLED | AHC_MULTI_CHANNEL,
-       AHC_AIC7895_FE,                                      19,
-       32, C56_66 },
-      {PCI_VENDOR_ID_ADAPTEC2, PCI_DEVICE_ID_ADAPTEC2_7890, AHC_AIC7890,
-       AHC_PAGESCBS | AHC_NEWEEPROM_FMT | AHC_BIOS_ENABLED,
-       AHC_AIC7890_FE,                                      20,
-       32, C46 },
-      {PCI_VENDOR_ID_ADAPTEC2, PCI_DEVICE_ID_ADAPTEC2_78902, AHC_AIC7890,
-       AHC_PAGESCBS | AHC_NEWEEPROM_FMT | AHC_BIOS_ENABLED,
-       AHC_AIC7890_FE,                                      20,
-       32, C46 },
-      {PCI_VENDOR_ID_ADAPTEC2, PCI_DEVICE_ID_ADAPTEC2_2940U2, AHC_AIC7890,
-       AHC_PAGESCBS | AHC_NEWEEPROM_FMT | AHC_BIOS_ENABLED,
-       AHC_AIC7890_FE,                                      21,
-       32, C46 },
-      {PCI_VENDOR_ID_ADAPTEC2, PCI_DEVICE_ID_ADAPTEC2_7896, AHC_AIC7896,
-       AHC_PAGESCBS | AHC_NEWEEPROM_FMT | AHC_BIOS_ENABLED | AHC_MULTI_CHANNEL,
-       AHC_AIC7896_FE,                                      22,
-       32, C56_66 },
-      {PCI_VENDOR_ID_ADAPTEC2, PCI_DEVICE_ID_ADAPTEC2_3940U2, AHC_AIC7896,
-       AHC_PAGESCBS | AHC_NEWEEPROM_FMT | AHC_BIOS_ENABLED | AHC_MULTI_CHANNEL,
-       AHC_AIC7896_FE,                                      23,
-       32, C56_66 },
-      {PCI_VENDOR_ID_ADAPTEC2, PCI_DEVICE_ID_ADAPTEC2_3950U2D, AHC_AIC7896,
-       AHC_PAGESCBS | AHC_NEWEEPROM_FMT | AHC_BIOS_ENABLED | AHC_MULTI_CHANNEL,
-       AHC_AIC7896_FE,                                      24,
-       32, C56_66 },
-      {PCI_VENDOR_ID_ADAPTEC, PCI_DEVICE_ID_ADAPTEC_1480A, AHC_AIC7860,
-       AHC_PAGESCBS | AHC_NEWEEPROM_FMT | AHC_BIOS_ENABLED,
-       AHC_AIC7860_FE,                                      25,
-       32, C46 },
-    };
-
-    unsigned short command;
-    unsigned int  devconfig, i, oldverbose;
-#if LINUX_VERSION_CODE > KERNEL_VERSION(2,1,92)
-    struct pci_dev *pdev = NULL;
-#else
-    int index;
-    unsigned int piobase, mmapbase;
-    unsigned char pci_bus, pci_devfn, pci_irq;
-#endif
-
-    for (i = 0; i < NUMBER(aic_pdevs); i++)
-    {
-#if LINUX_VERSION_CODE > KERNEL_VERSION(2,1,92)
-      pdev = NULL;
-      while ((pdev = pci_find_device(aic_pdevs[i].vendor_id,
-                                     aic_pdevs[i].device_id,
-                                     pdev)))
-#else
-      index = 0;
-      while (!(pcibios_find_device(aic_pdevs[i].vendor_id,
-                                   aic_pdevs[i].device_id,
-                                   index++, &pci_bus, &pci_devfn)) )
-#endif
-      {
-        if ( i == 0 ) /* We found one, but it's the 7810 RAID cont. */
-        {
-          if (aic7xxx_verbose & (VERBOSE_PROBE|VERBOSE_PROBE2))
-          {
-            printk(KERN_INFO "aic7xxx: The 7810 RAID controller is not "
-              "supported by\n");
-            printk(KERN_INFO "         this driver, we are ignoring it.\n");
-          }
-        }
-        else if ( (temp_p = kmalloc(sizeof(struct aic7xxx_host),
-                                    GFP_ATOMIC)) != NULL )
-        {
-          memset(temp_p, 0, sizeof(struct aic7xxx_host));
-          temp_p->chip = aic_pdevs[i].chip | AHC_PCI;
-          temp_p->flags = aic_pdevs[i].flags;
-          temp_p->features = aic_pdevs[i].features;
-          temp_p->board_name_index = aic_pdevs[i].board_name_index;
-          temp_p->sc_size = aic_pdevs[i].seeprom_size;
-          temp_p->sc_type = aic_pdevs[i].seeprom_type;
-
-          /*
-           * Read sundry information from PCI BIOS.
-           */
-#if LINUX_VERSION_CODE > KERNEL_VERSION(2,1,92)
-          temp_p->irq = pdev->irq;
-          temp_p->pdev = pdev;
-          temp_p->pci_bus = pdev->bus->number;
-          temp_p->pci_device_fn = pdev->devfn;
-          temp_p->base = pdev->base_address[0];
-          temp_p->mbase = pdev->base_address[1];
-          if (aic7xxx_verbose & VERBOSE_PROBE2)
-            printk("aic7xxx: <%s> at PCI %d/%d\n", 
-              board_names[aic_pdevs[i].board_name_index],
-              PCI_SLOT(temp_p->pdev->devfn),
-              PCI_FUNC(temp_p->pdev->devfn));
-          pci_read_config_word(pdev, PCI_COMMAND, &command);
-          if (aic7xxx_verbose & VERBOSE_PROBE2)
-          {
-            printk("aic7xxx: Initial PCI_COMMAND value was 0x%x\n",
-              (int)command);
-          }
-#ifdef AIC7XXX_STRICT_PCI_SETUP
-          command |= PCI_COMMAND_SERR | PCI_COMMAND_PARITY |
-            PCI_COMMAND_INVALIDATE | PCI_COMMAND_MASTER |
-            PCI_COMMAND_MEMORY | PCI_COMMAND_IO;
-#else
-          command |= PCI_COMMAND_MASTER | PCI_COMMAND_MEMORY | PCI_COMMAND_IO;
-#endif
-          if (aic7xxx_pci_parity == 0)
-            command &= ~(PCI_COMMAND_SERR | PCI_COMMAND_PARITY);
-          pci_write_config_word(pdev, PCI_COMMAND, command);
-#ifdef AIC7XXX_STRICT_PCI_SETUP
-          pci_read_config_dword(pdev, DEVCONFIG, &devconfig);
-          if (aic7xxx_verbose & VERBOSE_PROBE2)
-          {
-            printk("aic7xxx: Initial DEVCONFIG value was 0x%x\n", devconfig);
-          }
-          devconfig |= 0x80000000;
-          if ((aic7xxx_pci_parity == 0) || (aic7xxx_pci_parity == -1))
-          {
-            devconfig &= ~(0x00000008);
-          }
-          else
-          {
-            devconfig |= 0x00000008;
-          }
-          pci_write_config_dword(pdev, DEVCONFIG, devconfig);
-#endif /* AIC7XXX_STRICT_PCI_SETUP */
-#else  /* LINUX_VERSION_CODE > KERNEL_VERSION(2,1,92) */
-          temp_p->pci_bus = pci_bus;
-          temp_p->pci_device_fn = pci_devfn;
-          if (aic7xxx_verbose & VERBOSE_PROBE2)
-            printk("aic7xxx: <%s> at PCI %d/%d\n", 
-              board_names[aic_pdevs[i].board_name_index],
-              PCI_SLOT(temp_p->pci_device_fn),
-              PCI_FUNC(temp_p->pci_device_fn));
-          pcibios_read_config_byte(pci_bus, pci_devfn, PCI_INTERRUPT_LINE,
-            &pci_irq);
-          temp_p->irq = pci_irq;
-          pcibios_read_config_dword(pci_bus, pci_devfn, PCI_BASE_ADDRESS_0,
-            &piobase);
-          temp_p->base = piobase;
-          pcibios_read_config_dword(pci_bus, pci_devfn, PCI_BASE_ADDRESS_1,
-            &mmapbase);
-          temp_p->mbase = mmapbase;
-          pcibios_read_config_word(pci_bus, pci_devfn, PCI_COMMAND, &command);
-          if (aic7xxx_verbose & VERBOSE_PROBE2)
-          {
-            printk("aic7xxx: Initial PCI_COMMAND value was 0x%x\n",
-              (int)command);
-          }
-#ifdef AIC7XXX_STRICT_PCI_SETUP
-          command |= PCI_COMMAND_SERR | PCI_COMMAND_PARITY |
-            PCI_COMMAND_INVALIDATE | PCI_COMMAND_MASTER |
-            PCI_COMMAND_MEMORY | PCI_COMMAND_IO;
-#else
-          command |= PCI_COMMAND_MASTER | PCI_COMMAND_MEMORY | PCI_COMMAND_IO;
-#endif
-          if (aic7xxx_pci_parity == 0)
-            command &= ~(PCI_COMMAND_SERR | PCI_COMMAND_PARITY);
-          pcibios_write_config_word(pci_bus, pci_devfn, PCI_COMMAND, command);
-#ifdef AIC7XXX_STRICT_PCI_SETUP
-          pcibios_read_config_dword(pci_bus, pci_devfn, DEVCONFIG, &devconfig);
-          if (aic7xxx_verbose & VERBOSE_PROBE2)
-          {
-            printk("aic7xxx: Initial DEVCONFIG value was 0x%x\n", devconfig);
-          }
-          devconfig |= 0x80000000;
-          if ((aic7xxx_pci_parity == 0) || (aic7xxx_pci_parity == -1))
-          {
-            devconfig &= ~(0x00000008);
-          }
-          else
-          {
-            devconfig |= 0x00000008;
-          }
-          pcibios_write_config_dword(pci_bus, pci_devfn, DEVCONFIG, devconfig);
-#endif /* AIC7XXX_STRICT_PCI_SETUP */
-#endif /* LINUIX_VERSION_CODE > KERNEL_VERSION(2,1,92) */
-
-          /*
-           * The first bit (LSB) of PCI_BASE_ADDRESS_0 is always set, so
-           * we mask it off.
-           */
-          temp_p->base &= PCI_BASE_ADDRESS_IO_MASK;
-          temp_p->mbase &= PCI_BASE_ADDRESS_MEM_MASK;
-          temp_p->unpause = INTEN;
-          temp_p->pause = temp_p->unpause | PAUSE;
-          if ( ((temp_p->base == 0) &&
-                (temp_p->mbase == 0)) ||
-               (temp_p->irq == 0) )
-          {
-            printk("aic7xxx: <%s> at PCI %d/%d\n", 
-              board_names[aic_pdevs[i].board_name_index],
-              PCI_SLOT(temp_p->pci_device_fn),
-              PCI_FUNC(temp_p->pci_device_fn));
-            printk("aic7xxx: Controller disabled by BIOS, ignoring.\n");
-            kfree(temp_p);
-            temp_p = NULL;
-            continue;
-          }
-
-#ifdef MMAPIO
-          {
-            unsigned long page_offset, base;
-
-            base = temp_p->mbase & PAGE_MASK;
-            page_offset = temp_p->mbase - base;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,1,0)
-            temp_p->maddr = ioremap_nocache(base, page_offset + 256);
-#else
-            temp_p->maddr = vremap(base, page_offset + 256);
-#endif
-            if(temp_p->maddr)
-            {
-              temp_p->maddr += page_offset;
-              /*
-               * We need to check the I/O with the MMAPed address.  Some machines
-               * simply fail to work with MMAPed I/O and certain controllers.
-               */
-              if(aic_inb(temp_p, HCNTRL) == 0xff)
-              {
-                /*
-                 * OK.....we failed our test....go back to programmed I/O
-                 */
-                printk(KERN_INFO "aic7xxx: <%s> at PCI %d/%d\n", 
-                  board_names[aic_pdevs[i].board_name_index],
-                  PCI_SLOT(temp_p->pci_device_fn),
-                  PCI_FUNC(temp_p->pci_device_fn));
-                printk(KERN_INFO "aic7xxx: MMAPed I/O failed, reverting to "
-                                 "Programmed I/O.\n");
-#if LINUX_VERSION_CODE > KERNEL_VERSION(2,1,0)
-                iounmap((void *) (((unsigned long) temp_p->maddr) & PAGE_MASK));
-#else
-                vfree((void *) (((unsigned long) temp_p->maddr) & PAGE_MASK));
-#endif
-                temp_p->maddr = 0;
-              }
-            }
-          }
-#endif
-
-          /*
-           * We HAVE to make sure the first pause_sequencer() and all other
-           * subsequent I/O that isn't PCI config space I/O takes place
-           * after the MMAPed I/O region is configured and tested.  The
-           * problem is the PowerPC architecture that doesn't support
-           * programmed I/O at all, so we have to have the MMAP I/O set up
-           * for this pause to even work on those machines.
-           */
-          pause_sequencer(temp_p);
-
-          /*
-           * Clear out any pending PCI error status messages.  Also set
-           * verbose to 0 so that we don't emit strange PCI error messages
-           * while cleaning out the current status bits.
-           */
-          oldverbose = aic7xxx_verbose;
-          aic7xxx_verbose = 0;
-          aic7xxx_pci_intr(temp_p);
-          aic7xxx_verbose = oldverbose;
-
-          temp_p->bios_address = 0;
-
-          /*
-           * Remember how the card was setup in case there is no seeprom.
-           */
-          if (temp_p->features & AHC_ULTRA2)
-            temp_p->scsi_id = aic_inb(temp_p, SCSIID_ULTRA2) & OID;
-          else
-            temp_p->scsi_id = aic_inb(temp_p, SCSIID) & OID;
-          /*
-           * Get current termination setting
-           */
-          sxfrctl1 = aic_inb(temp_p, SXFRCTL1) & STPWEN;
-
-          if (aic7xxx_chip_reset(temp_p) == -1)
-          {
-            kfree(temp_p);
-            temp_p = NULL;
-            continue;
-          }
-
-          /*
-           * We need to set the CHNL? assignments before loading the SEEPROM
-           * The 3940 and 3985 cards (original stuff, not any of the later
-           * stuff) are 7870 and 7880 class chips.  The Ultra2 stuff falls
-           * under 7896 and 7897.  The 7895 is in a class by itself :)
-           */
-          switch (temp_p->chip & AHC_CHIPID_MASK)
-          {
-            case AHC_AIC7870: /* 3840 / 3985 */
-            case AHC_AIC7880: /* 3840 UW / 3985 UW */
-              if(temp_p->flags & AHC_MULTI_CHANNEL)
-              {
-                switch(PCI_SLOT(temp_p->pci_device_fn))
-                {
-                  case 5:
-                    temp_p->flags |= AHC_CHNLB;
-                    break;
-                  case 8:
-                    temp_p->flags |= AHC_CHNLB;
-                    break;
-                  case 12:
-                    temp_p->flags |= AHC_CHNLC;
-                    break;
-                  default:
-                    break;
-                }
-              }
-              break;
-
-            case AHC_AIC7895: /* 7895 */
-            case AHC_AIC7896: /* 7896/7 */
-#if LINUX_VERSION_CODE > KERNEL_VERSION(2,1,92)
-              if (PCI_FUNC(temp_p->pdev->devfn) != 0)
-              {
-                temp_p->flags |= AHC_CHNLB;
-              }
-              /*
-               * The 7895 is the only chipset that sets the SCBSIZE32 param
-               * in the DEVCONFIG register.  The Ultra2 chipsets use
-               * the DSCOMMAND0 register instead.
-               */
-              if ((temp_p->chip & AHC_CHIPID_MASK) == AHC_AIC7895)
-              {
-                pci_read_config_dword(pdev, DEVCONFIG, &devconfig);
-                devconfig |= SCBSIZE32;
-                pci_write_config_dword(pdev, DEVCONFIG, devconfig);
-              }
-#else
-              if (PCI_FUNC(temp_p->pci_device_fn) != 0)
-              {
-                temp_p->flags |= AHC_CHNLB;
-              }
-              /*
-               * The 7895 is the only chipset that sets the SCBSIZE32 param
-               * in the DEVCONFIG register.  The Ultra2 chipsets use
-               * the DSCOMMAND0 register instead.
-               */
-              if ((temp_p->chip & AHC_CHIPID_MASK) == AHC_AIC7895)
-              {
-                pcibios_read_config_dword(pci_bus, pci_devfn, DEVCONFIG,
-                  &devconfig);
-                devconfig |= SCBSIZE32;
-                pcibios_write_config_dword(pci_bus, pci_devfn, DEVCONFIG,
-                  devconfig);
-              }
-#endif
-              break;
-            default:
-              break;
-          }
-
-          /*
-           * Loading of the SEEPROM needs to come after we've set the flags
-           * to indicate possible CHNLB and CHNLC assigments.  Otherwise,
-           * on 394x and 398x cards we'll end up reading the wrong settings
-           * for channels B and C
-           */
-          switch (temp_p->chip & AHC_CHIPID_MASK)
-          {
-            case AHC_AIC7890:
-            case AHC_AIC7896:
-              aic_outb(temp_p, 0, SCAMCTL);
-              /*
-               * We used to set DPARCKEN in this register, but after talking
-               * to a tech from Adaptec, I found out they don't use that
-               * particular bit in their own register settings, and when you
-               * combine that with the fact that I determined that we were
-               * seeing Data-Path Parity Errors on things we shouldn't see
-               * them on, I think there is a bug in the silicon and the way
-               * to work around it is to disable this particular check.  Also
-               * This bug only showed up on certain commands, so it seems to
-               * be pattern related or some such.  The commands we would
-               * typically send as a linux TEST_UNIT_READY or INQUIRY command
-               * could cause it to be triggered, while regular commands that
-               * actually made reasonable use of the SG array capabilities
-               * seemed not to cause the problem.
-               */
-              /*
-              aic_outb(temp_p, aic_inb(temp_p, DSCOMMAND0) |
-                               CACHETHEN | DPARCKEN | MPARCKEN |
-                               USCBSIZE32 | CIOPARCKEN,
-                               DSCOMMAND0);
-               */
-              aic_outb(temp_p, (aic_inb(temp_p, DSCOMMAND0) |
-                                CACHETHEN | MPARCKEN | USCBSIZE32 |
-                                CIOPARCKEN) & ~DPARCKEN, DSCOMMAND0);
-              /* FALLTHROUGH */
-            default:
-              /*
-               * We attempt to read a SEEPROM on *everything*.  If we fail,
-               * then we fail, but this covers things like 2910c cards that
-               * now have SEEPROMs with their 7856 chipset that we would
-               * otherwise ignore.  They still don't have a BIOS, but they
-               * have a SEEPROM that the SCSISelect utility on the Adaptec
-               * diskettes can configure.
-               */
-              aic7xxx_load_seeprom(temp_p, &sxfrctl1);
-              break;
-            case AHC_AIC7850:
-            case AHC_AIC7860:
-              /*
-               * Set the DSCOMMAND0 register on these cards different from
-               * on the 789x cards.  Also, read the SEEPROM as well.
-               */
-              aic_outb(temp_p, (aic_inb(temp_p, DSCOMMAND0) |
-                                CACHETHEN | MPARCKEN) & ~DPARCKEN,
-                       DSCOMMAND0);
-              aic7xxx_load_seeprom(temp_p, &sxfrctl1);
-              break;
-            case AHC_AIC7880:
-              /*
-               * Only set the DSCOMMAND0 register if this is a Rev B.
-               * chipset.  For those, we also enable Ultra mode by
-               * force due to brain-damage on the part of some BIOSes
-               * We overload the devconfig variable here since we can.
-               */
-#if LINUX_VERSION_CODE > KERNEL_VERSION(2,1,92)
-              pci_read_config_dword(pdev, DEVCONFIG, &devconfig);
-#else
-              pcibios_read_config_dword(pci_bus, pci_devfn, DEVCONFIG,
-                                        &devconfig);
-#endif
-              if ((devconfig & 0xff) >= 1)
-              {
-                aic_outb(temp_p, (aic_inb(temp_p, DSCOMMAND0) |
-                                  CACHETHEN | MPARCKEN) & ~DPARCKEN,
-                         DSCOMMAND0);
-              }
-              aic7xxx_load_seeprom(temp_p, &sxfrctl1);
-              break;
-          }
-          
-
-          /*
-           * and then we need another switch based on the type in order to
-           * make sure the channel B primary flag is set properly on 7895
-           * controllers....Arrrgggghhh!!!  We also have to catch the fact
-           * that when you disable the BIOS on the 7895 on the Intel DK440LX
-           * motherboard, and possibly others, it only sets the BIOS disabled
-           * bit on the A channel...I think I'm starting to lean towards
-           * going postal....
-           */
-          switch(temp_p->chip & AHC_CHIPID_MASK)
-          {
-            case AHC_AIC7895:
-            case AHC_AIC7896:
-              current_p = list_p;
-              while(current_p != NULL)
-              {
-                if ( (current_p->pci_bus == temp_p->pci_bus) &&
-                     (PCI_SLOT(current_p->pci_device_fn) ==
-                      PCI_SLOT(temp_p->pci_device_fn)) )
-                {
-                  if ( PCI_FUNC(current_p->pci_device_fn) == 0 )
-                  {
-                    temp_p->flags |= 
-                      (current_p->flags & AHC_CHANNEL_B_PRIMARY);
-                    temp_p->flags &= ~(AHC_BIOS_ENABLED|AHC_USEDEFAULTS);
-                    temp_p->flags |=
-                      (current_p->flags & (AHC_BIOS_ENABLED|AHC_USEDEFAULTS));
-                  }
-                  else
-                  {
-                    current_p->flags |=
-                      (temp_p->flags & AHC_CHANNEL_B_PRIMARY);
-                    current_p->flags &= ~(AHC_BIOS_ENABLED|AHC_USEDEFAULTS);
-                    current_p->flags |=
-                      (temp_p->flags & (AHC_BIOS_ENABLED|AHC_USEDEFAULTS));
-                  }
-                }
-                current_p = current_p->next;
-              }
-              break;
-            default:
-              break;
-          }
-
-          /*
-           * We only support external SCB RAM on the 7895/6/7 chipsets.
-           * We could support it on the 7890/1 easy enough, but I don't
-           * know of any 7890/1 based cards that have it.  I do know
-           * of 7895/6/7 cards that have it and they work properly.
-           */
-          switch(temp_p->chip & AHC_CHIPID_MASK)
-          {
-            default:
-              break;
-            case AHC_AIC7895:
-            case AHC_AIC7896:
-#if LINUX_VERSION_CODE > KERNEL_VERSION(2,1,92)
-              pci_read_config_dword(pdev, DEVCONFIG, &devconfig);
-#else
-              pcibios_read_config_dword(pci_bus, pci_devfn, DEVCONFIG,
-                                        &devconfig);
-#endif
-              if (temp_p->features & AHC_ULTRA2)
-              {
-                if (aic_inb(temp_p, DSCOMMAND0) & RAMPSM_ULTRA2)
-                {
-                  aic_outb(temp_p,
-                           aic_inb(temp_p, DSCOMMAND0) & ~SCBRAMSEL_ULTRA2,
-                           DSCOMMAND0);
-                  temp_p->flags |= AHC_EXTERNAL_SRAM;
-                  devconfig |= EXTSCBPEN;
-                }
-              }
-              else if (devconfig & RAMPSM)
-              {
-                devconfig &= ~SCBRAMSEL;
-                devconfig |= EXTSCBPEN;
-                temp_p->flags |= AHC_EXTERNAL_SRAM;
-              }
-#if LINUX_VERSION_CODE > KERNEL_VERSION(2,1,92)
-              pci_write_config_dword(pdev, DEVCONFIG, devconfig);
-#else
-              pcibios_write_config_dword(pci_bus, pci_devfn, DEVCONFIG,
-                                         devconfig);
-#endif
-              if ( (temp_p->flags & AHC_EXTERNAL_SRAM) &&
-                   (temp_p->flags & AHC_CHNLB) )
-                aic_outb(temp_p, 1, CCSCBBADDR);
-              break;
-          }
-
-          /*
-           * Take the LED out of diagnostic mode
-           */
-          aic_outb(temp_p, 
-            (aic_inb(temp_p, SBLKCTL) & ~(DIAGLEDEN | DIAGLEDON)),
-            SBLKCTL);
-
-          /*
-           * We don't know where this is set in the SEEPROM or by the
-           * BIOS, so we default to 100%.  On Ultra2 controllers, use 75%
-           * instead.
-           */
-          if (temp_p->features & AHC_ULTRA2)
-          {
-            aic_outb(temp_p, RD_DFTHRSH_75 | WR_DFTHRSH_75, DFF_THRSH);
-          }
-          else
-          {
-            aic_outb(temp_p, DFTHRSH_100, DSPCISTATUS);
-          }
-
-          if ( list_p == NULL )
-          {
-            list_p = current_p = temp_p;
-          }
-          else
-          {
-            current_p = list_p;
-            while(current_p->next != NULL)
-              current_p = current_p->next;
-            current_p->next = temp_p;
-          }
-          temp_p->next = NULL;
-          found++;
-        }  /* Found an Adaptec PCI device. */
-        else /* Well, we found one, but we couldn't get any memory */
-        {
-          printk("aic7xxx: Found <%s>\n", 
-            board_names[aic_pdevs[i].board_name_index]);
-          printk(KERN_INFO "aic7xxx: Unable to allocate device memory, "
-            "skipping.\n");
-        }
-      } /* while(pdev=....) */
-    } /* for PCI_DEVICES */
-  } /* PCI BIOS present */
-#endif CONFIG_PCI
   /*
    * Now, we re-order the probed devices by BIOS address and BUS class.
    * In general, we follow this algorithm to make the adapters show up
@@ -9512,7 +10445,7 @@ aic7xxx_detect(Scsi_Host_Template *template)
               }
             }
             /*
-             * Are we dealing with a 7985 where we need to sort the
+             * Are we dealing with a 7895/6/7/9 where we need to sort the
              * channels as well, if so, the bios_address values should
              * be the same
              */
@@ -9603,7 +10536,55 @@ aic7xxx_detect(Scsi_Host_Template *template)
   return (found);
 }
 
-#ifdef AIC7XXX_FAKE_NEGOTIATION_CMDS
+static void aic7xxx_build_negotiation_cmnd(struct aic7xxx_host *p,
+                                           Scsi_Cmnd *old_cmd, int tindex);
+
+/*+F*************************************************************************
+ * Function:
+ *   aic7xxx_allocate_negotiation_command
+ *
+ * Description:
+ *   allocate the actual command struct and fill in the gaps...
+ *-F*************************************************************************/
+static Scsi_Cmnd *
+aic7xxx_allocate_negotiation_command(struct aic7xxx_host *p,
+                                     Scsi_Cmnd *old_cmd, int tindex)
+{
+  Scsi_Cmnd *cmd;
+  char *buffer;
+
+  if (!(p->dev_dtr_cmnd[tindex] = kmalloc(sizeof(Scsi_Cmnd), GFP_ATOMIC)) )
+  {
+    return(NULL);
+  }
+  if (!(buffer = kmalloc(256, GFP_ATOMIC)))
+  {
+    kfree(p->dev_dtr_cmnd[tindex]);
+    p->dev_dtr_cmnd[tindex] = NULL;
+    return(NULL);
+  }
+  cmd = p->dev_dtr_cmnd[tindex];
+  memset(cmd, 0, sizeof(Scsi_Cmnd));
+  memcpy(cmd, old_cmd, sizeof(Scsi_Cmnd));
+  memset(&cmd->cmnd[0], 0, sizeof(cmd->cmnd));
+  memset(&cmd->data_cmnd[0], 0, sizeof(cmd->data_cmnd));
+  cmd->lun = 0;
+  cmd->request_bufflen = 255;
+  cmd->request_buffer = buffer;
+  cmd->sc_data_direction = SCSI_DATA_READ;
+  cmd->use_sg = cmd->old_use_sg = cmd->sglist_len = 0;
+  cmd->bufflen = 0;
+  cmd->buffer = NULL;
+  cmd->underflow = 0;
+  cmd->cmd_len = 6;
+  cmd->cmnd[0] = cmd->data_cmnd[0] = INQUIRY;
+  cmd->cmnd[1] = cmd->data_cmnd[1] = 0;
+  cmd->cmnd[2] = cmd->data_cmnd[2] = 0;
+  cmd->cmnd[3] = cmd->data_cmnd[3] = 0;
+  cmd->cmnd[4] = cmd->data_cmnd[4] = 255; /* match what scsi.c does here */
+  cmd->cmnd[5] = cmd->data_cmnd[5] = 0;
+  return(cmd);
+}
 
 /*+F*************************************************************************
  * Function:
@@ -9616,6 +10597,164 @@ aic7xxx_detect(Scsi_Host_Template *template)
 static void
 aic7xxx_negotiation_complete(Scsi_Cmnd *cmd)
 {
+  unsigned int checksum;
+  int i;
+  int *ibuffer;
+  struct aic7xxx_host *p = (struct aic7xxx_host *)cmd->host->hostdata;
+  int tindex = TARGET_INDEX(cmd);
+  struct aic7xxx_syncrate *syncrate;
+
+  /*
+   * perform our minimalistic domain validation
+   */
+  if(p->dev_flags[tindex] & DEVICE_SCANNED)
+  {
+    ibuffer = (int *)cmd->request_buffer;
+    checksum = 0;
+    for(i = 0; i < (cmd->request_bufflen >> 2); i++)
+    {
+      checksum += ibuffer[i];
+    }
+    if( (checksum != p->dev_checksum[tindex]) &&
+        (p->transinfo[tindex].cur_offset != 0) )
+    {
+      unsigned int period = p->transinfo[tindex].cur_period;
+      unsigned char options = p->transinfo[tindex].cur_options;
+
+      if (p->needdv & (1<<tindex))
+      {
+        /*
+         * oops, we had a failure, lower the transfer rate and try again.  It's
+         * worth noting here that it might be wise to also check for typical
+         * wide setting on narrow cable type problems and try disabling wide
+         * instead of slowing down if those exist.  That's hard to do with simple
+         * checksums though.
+         */
+        if(aic7xxx_verbose & VERBOSE_NEGOTIATION2) 
+        {
+          printk(INFO_LEAD "reducing SCSI transfer speed due to Domain "
+                 "validation failure.\n", p->host_no, CTL_OF_CMD(cmd));
+        }
+        if((syncrate = aic7xxx_find_syncrate(p, &period, 0, &options)) != NULL)
+        {
+          syncrate++;
+          if( (syncrate->rate[0] != NULL) &&
+              (!(p->features & AHC_ULTRA2) || (syncrate->sxfr_ultra2 == 0)) )
+          {
+            p->transinfo[tindex].goal_period = syncrate->period;
+            if( p->transinfo[tindex].goal_period > 9 )
+            {
+              p->transinfo[tindex].goal_options = 0;
+              p->needppr &= ~(1<<tindex);
+              p->needsdtr |= (1<<tindex);
+              p->needppr_copy &= ~(1<<tindex);
+              p->needsdtr_copy |= (1<<tindex);
+              if (p->transinfo[tindex].goal_width)
+              {
+                p->needwdtr |= (1<<tindex);
+                p->needwdtr_copy |= (1<<tindex);
+              }
+            }
+          }
+          else if (p->transinfo[tindex].goal_width)
+          {
+            p->transinfo[tindex].goal_width = 0;
+            p->needwdtr &= ~(1<<tindex);
+            p->needwdtr_copy &= ~(1<<tindex);
+            p->transinfo[tindex].goal_offset =
+              p->transinfo[tindex].user_offset;
+            p->transinfo[tindex].goal_period =
+              p->transinfo[tindex].user_period;
+            p->transinfo[tindex].goal_options =
+              p->transinfo[tindex].user_options;
+            if( p->transinfo[tindex].goal_period <= 9 )
+            {
+              p->needppr |= (1<<tindex);
+              p->needsdtr &= ~(1<<tindex);
+              p->needppr_copy |= (1<<tindex);
+              p->needsdtr_copy &= ~(1<<tindex);
+            }
+            else
+            {
+              p->needppr &= ~(1<<tindex);
+              p->needsdtr |= (1<<tindex);
+              p->needppr_copy &= ~(1<<tindex);
+              p->needsdtr_copy |= (1<<tindex);
+            }
+          }
+          else
+          {
+            p->transinfo[tindex].goal_offset = 0;
+            p->transinfo[tindex].goal_period = 255;
+            p->transinfo[tindex].goal_options = 0;
+            p->transinfo[tindex].goal_width = 0;
+            p->needppr &= ~(1<<tindex);
+            p->needsdtr &= ~(1<<tindex);
+            p->needwdtr &= ~(1<<tindex);
+            p->needppr_copy &= ~(1<<tindex);
+            p->needsdtr_copy &= ~(1<<tindex);
+            p->needwdtr_copy &= ~(1<<tindex);
+          }
+        }
+        p->needdv &= ~(1<<tindex);
+      }
+      else
+      {
+        if(aic7xxx_verbose & VERBOSE_NEGOTIATION2) 
+        {
+          printk(INFO_LEAD "Performing Domain validation.\n",
+                 p->host_no, CTL_OF_CMD(cmd));
+        }
+        /*
+         * Update the checksum in case the INQUIRY data has changed, maybe
+         * in relation to a change in the mode pages, or whatever.
+         */
+        p->dev_checksum[tindex] = checksum;
+        /*
+         * Signal that we are trying out the domain validation
+         */
+        p->needdv |= (1<<tindex);
+        /*
+         * Signal that we need to re-negotiate things, this also gets us our
+         * INQUIRY command to re-checksum off of.
+         */
+        p->needppr |= (p->needppr_copy & (1<<tindex));
+        p->needsdtr |= (p->needsdtr_copy & (1<<tindex));
+        p->needwdtr |= (p->needwdtr_copy & (1<<tindex));
+      }
+    } 
+    else
+    {
+      if( (aic7xxx_verbose & VERBOSE_NEGOTIATION2) &&
+          (p->needdv & (1<<tindex)) )
+      {
+        printk(INFO_LEAD "Successfully completed Domain validation.\n",
+               p->host_no, CTL_OF_CMD(cmd));
+      }
+      /*
+       * We successfully did our checksum, so don't leave the needdv flag set
+       * in case we might have set it last time through.
+       */
+      p->needdv &= ~(1<<tindex);
+    }
+  }
+
+  p->dtr_pending &= ~(0x01 << tindex);
+  /*
+   * This looks recursive in the extreme, but if this was a WDTR negotiation
+   * and we didn't follow up with SDTR yet, then this will get it started.
+   * For all other cases, this should work out to be a no-op, unless we are
+   * doing domain validation and happen to need a new negotiation command.
+   *
+   * In case we don't want this to go any further, the cmdcmplt interrupt
+   * handler will NULL out the cmd->next entry so that the real SCSI command
+   * can be sent back to the mid layer code with SENSE data intact.  We'll
+   * finish things up when the cmd gets sent back down to us, so no worries.
+   */
+  if(cmd->next)
+  {
+    aic7xxx_build_negotiation_cmnd(p, cmd->next, tindex);
+  }
   return;
 }
 
@@ -9632,80 +10771,62 @@ aic7xxx_build_negotiation_cmnd(struct aic7xxx_host *p, Scsi_Cmnd *old_cmd,
   int tindex)
 {
 
-  if ( (p->needwdtr & (1<<tindex)) && !(p->wdtr_pending & (1<<tindex)) )
+  if ( !(p->dtr_pending & (1<<tindex)) &&
+       ( (p->needppr & (1<<tindex)) ||
+         (p->needwdtr & (1<<tindex)) ||
+         (p->needsdtr & (1<<tindex)) ) )
   {
-    if(p->dev_wdtr_cmnd[tindex] == NULL)
+    if ( (p->dev_dtr_cmnd[tindex] == NULL) &&
+         (aic7xxx_allocate_negotiation_command(p, old_cmd, tindex) == NULL) )
     {
-      Scsi_Cmnd *cmd;
-
-      if (!(p->dev_wdtr_cmnd[tindex] = kmalloc(sizeof(Scsi_Cmnd), GFP_ATOMIC)) )
-      {
-        return;
-      }
-      cmd = p->dev_wdtr_cmnd[tindex];
-      memset(cmd, 0, sizeof(Scsi_Cmnd));
-      memcpy(cmd, old_cmd, sizeof(Scsi_Cmnd));
-      memset(&cmd->cmnd[0], 0, sizeof(cmd->cmnd));
-      memset(&cmd->data_cmnd[0], 0, sizeof(cmd->data_cmnd));
-      cmd->lun = 0;
-      cmd->request_bufflen = 0;
-      cmd->request_buffer = NULL;
-      cmd->use_sg = cmd->old_use_sg = cmd->sglist_len = 0;
-      cmd->bufflen = 0;
-      cmd->buffer = NULL;
-      cmd->underflow = 0;
-      cmd->cmd_len = 6;
+      return;
     }
     /*
-     * Before sending this thing out, we also amke the cmd->next pointer
+     * Before sending this thing out, we also make the cmd->next pointer
      * point to the real command so we can stuff any possible SENSE data
-     * intp the real command instead of this fake command.  This has to be
+     * into the real command instead of this fake command.  This has to be
      * done each time the command is built, not just the first time, hence
      * it's outside of the above if()...
      */
-    p->dev_wdtr_cmnd[tindex]->next = old_cmd;
-    aic7xxx_queue(p->dev_wdtr_cmnd[tindex], 
-                  aic7xxx_negotiation_complete);
-  }
-  else if ( (p->needsdtr & (1<<tindex)) && !(p->sdtr_pending & (1<<tindex)) &&
-            !(p->wdtr_pending & (1<<tindex)) )
-  {
-    if(p->dev_sdtr_cmnd[tindex] == NULL)
-    {
-      Scsi_Cmnd *cmd;
-
-      if (!(p->dev_sdtr_cmnd[tindex] = kmalloc(sizeof(Scsi_Cmnd), GFP_ATOMIC)) )
-      {
-        return;
-      }
-      cmd = p->dev_sdtr_cmnd[tindex];
-      memset(cmd, 0, sizeof(Scsi_Cmnd));
-      memcpy(cmd, old_cmd, sizeof(Scsi_Cmnd));
-      memset(&cmd->cmnd[0], 0, sizeof(cmd->cmnd));
-      memset(&cmd->data_cmnd[0], 0, sizeof(cmd->data_cmnd));
-      cmd->lun = 0;
-      cmd->request_bufflen = 0;
-      cmd->request_buffer = NULL;
-      cmd->use_sg = cmd->old_use_sg = cmd->sglist_len = 0;
-      cmd->bufflen = 0;
-      cmd->buffer = NULL;
-      cmd->underflow = 0;
-      cmd->cmd_len = 6;
-    }
+    p->dev_dtr_cmnd[tindex]->next = old_cmd;
     /*
-     * Before sending this thing out, we also amke the cmd->next pointer
-     * point to the real command so we can stuff any possible SENSE data
-     * intp the real command instead of this fake command.  This has to be
-     * done each time the command is built, not just the first time, hence
-     * it's outside of the above if()...
+     * Clear the buffer so checksums come out right....
      */
-    p->dev_sdtr_cmnd[tindex]->next = old_cmd;
-    aic7xxx_queue(p->dev_sdtr_cmnd[tindex], 
+    memset(p->dev_dtr_cmnd[tindex]->request_buffer, 0,
+           p->dev_dtr_cmnd[tindex]->request_bufflen);
+    /*
+     * Remove any commands for this particular device that might be on the
+     * waiting_scbs queue or qinfifo so that this command goes out first.
+     * This is vital for our implementation of domain validation.
+     */
+    pause_sequencer(p);
+    aic7xxx_search_qinfifo(p, old_cmd->target, old_cmd->channel, ALL_LUNS,
+                SCB_LIST_NULL, 0, TRUE, &p->delayed_scbs[tindex]);
+    unpause_sequencer(p, FALSE);
+    {
+      struct aic7xxx_scb *scb, *next;
+
+      scb = p->waiting_scbs.head;
+      while(scb != NULL)
+      {
+        if( aic7xxx_match_scb(p, scb, old_cmd->target, old_cmd->channel,
+                              ALL_LUNS, SCB_LIST_NULL) )
+        {
+          next = scb->q_next;
+          scbq_remove(&p->waiting_scbs, scb);
+          scbq_insert_tail(&p->delayed_scbs[tindex], scb);
+          scb = next;
+        }
+        else
+        {
+          scb = scb->q_next;
+        }
+      }
+    }
+    aic7xxx_queue(p->dev_dtr_cmnd[tindex], 
                   aic7xxx_negotiation_complete);
   }
 }
-
-#endif
 
 #ifdef AIC7XXX_VERBOSE_DEBUGGING
 /*+F*************************************************************************
@@ -9744,8 +10865,9 @@ aic7xxx_buildscb(struct aic7xxx_host *p, Scsi_Cmnd *cmd,
 {
   unsigned short mask;
   struct aic7xxx_hwscb *hscb;
+  unsigned char tindex = TARGET_INDEX(cmd);
 
-  mask = (0x01 << TARGET_INDEX(cmd));
+  mask = (0x01 << tindex);
   hscb = scb->hscb;
 
   /*
@@ -9754,14 +10876,15 @@ aic7xxx_buildscb(struct aic7xxx_host *p, Scsi_Cmnd *cmd,
    */
   hscb->control = 0;
   scb->tag_action = 0;
+  cmd->tag = hscb->tag;
   if (p->discenable & mask)
   {
     hscb->control |= DISCENB;
-    if (p->tagenable & mask)
+    if ( (p->tagenable & mask) &&
+         (cmd->cmnd[0] != TEST_UNIT_READY) )
     {
-      cmd->tag = hscb->tag;
-      p->dev_commands_sent[TARGET_INDEX(cmd)]++;
-      if (p->dev_commands_sent[TARGET_INDEX(cmd)] < 200)
+      p->dev_commands_sent[tindex]++;
+      if (p->dev_commands_sent[tindex] < 200)
       {
         hscb->control |= MSG_SIMPLE_Q_TAG;
         scb->tag_action = MSG_SIMPLE_Q_TAG;
@@ -9778,74 +10901,38 @@ aic7xxx_buildscb(struct aic7xxx_host *p, Scsi_Cmnd *cmd,
           hscb->control |= MSG_SIMPLE_Q_TAG;
           scb->tag_action = MSG_SIMPLE_Q_TAG;
         }
-        p->dev_commands_sent[TARGET_INDEX(cmd)] = 0;
+        p->dev_commands_sent[tindex] = 0;
       }
     }
   }
-  if (p->dev_flags[TARGET_INDEX(cmd)] & DEVICE_SCANNED)
+  if ( cmd == p->dev_dtr_cmnd[tindex] )
   {
-#ifdef AIC7XXX_FAKE_NEGOTIATION_CMDS
-    if ( (p->needwdtr & mask) && !(p->wdtr_pending & mask) )
+    p->dtr_pending |= mask;
+    scb->tag_action = 0;
+    if (p->dev_flags[tindex] & DEVICE_SCANNED)
     {
-      if (cmd == p->dev_wdtr_cmnd[TARGET_INDEX(cmd)])
+      hscb->control &= DISCENB;
+      hscb->control |= MK_MESSAGE;
+      if(p->needppr & mask)
       {
-        p->wdtr_pending |= mask;
+        scb->flags |= SCB_MSGOUT_PPR;
+      }
+      else if(p->needwdtr & mask)
+      {
         scb->flags |= SCB_MSGOUT_WDTR;
-        hscb->control &= DISCENB;
-        hscb->control |= MK_MESSAGE;
-        scb->tag_action = 0;
       }
-      else
+      else if(p->needsdtr & mask)
       {
-        aic7xxx_build_negotiation_cmnd(p, cmd, TARGET_INDEX(cmd));
-      }
-    }
-    else if ( (p->needsdtr & mask) && !(p->sdtr_pending & mask) &&
-              !(p->wdtr_pending & mask) )
-    {
-      if (cmd == p->dev_sdtr_cmnd[TARGET_INDEX(cmd)])
-      {
-        p->sdtr_pending |= mask;
         scb->flags |= SCB_MSGOUT_SDTR;
-        hscb->control &= DISCENB;
-        hscb->control |= MK_MESSAGE;
-        scb->tag_action = 0;
-      }
-      else if (cmd != p->dev_wdtr_cmnd[TARGET_INDEX(cmd)])
-      {
-        aic7xxx_build_negotiation_cmnd(p, cmd, TARGET_INDEX(cmd));
       }
     }
-#else
-    if ( (p->needwdtr & mask) && !(p->wdtr_pending & mask) &&
-         !(p->sdtr_pending & mask) && (cmd->lun == 0) )
-    {
-      p->wdtr_pending |= mask;
-      scb->flags |= SCB_MSGOUT_WDTR;
-      hscb->control &= DISCENB;
-      hscb->control |= MK_MESSAGE;
-      scb->tag_action = 0;
-#ifdef AIC7XXX_VERBOSE_DEBUGGING
-      if (aic7xxx_verbose > 0xffff)
-        printk(INFO_LEAD "Building WDTR command.\n", p->host_no,
-               CTL_OF_CMD(cmd));
-#endif
-    }
-    else if ( (p->needsdtr & mask) && !(p->wdtr_pending & mask) &&
-              !(p->sdtr_pending & mask) && (cmd->lun == 0) )
-    {
-      p->sdtr_pending |= mask;
-      scb->flags |= SCB_MSGOUT_SDTR;
-      hscb->control &= DISCENB;
-      hscb->control |= MK_MESSAGE;
-      scb->tag_action = 0;
-#ifdef AIC7XXX_VERBOSE_DEBUGGING
-      if (aic7xxx_verbose > 0xffff)
-        printk(INFO_LEAD "Building SDTR command.\n", p->host_no,
-               CTL_OF_CMD(cmd));
-#endif
-    }
-#endif
+  }
+  if ( !(p->dtr_pending & mask) &&
+        ( (p->needppr & mask) ||
+          (p->needwdtr & mask) ||
+          (p->needsdtr & mask) ) )
+  {
+    aic7xxx_build_negotiation_cmnd(p, cmd, tindex);
   }
   hscb->target_channel_lun = ((cmd->target << 4) & 0xF0) |
         ((cmd->channel & 0x01) << 3) | (cmd->lun & 0x07);
@@ -9862,7 +10949,8 @@ aic7xxx_buildscb(struct aic7xxx_host *p, Scsi_Cmnd *cmd,
    *       little-endian format.
    */
   hscb->SCSI_cmd_length = cmd->cmd_len;
-  hscb->SCSI_cmd_pointer = cpu_to_le32(VIRT_TO_BUS(cmd->cmnd));
+  memcpy(scb->cmnd, cmd->cmnd, cmd->cmd_len);
+  hscb->SCSI_cmd_pointer = cpu_to_le32(SCB_DMA_ADDR(scb, scb->cmnd));
 
   if (cmd->use_sg)
   {
@@ -9874,10 +10962,11 @@ aic7xxx_buildscb(struct aic7xxx_host *p, Scsi_Cmnd *cmd,
      * differences and the kernel SG list uses virtual addresses where
      * we need physical addresses.
      */
-    int i;
+    int i, use_sg;
 
     sg = (struct scatterlist *)cmd->request_buffer;
     scb->sg_length = 0;
+    use_sg = pci_map_sg(p->pdev, sg, cmd->use_sg, scsi_to_pci_dma_dir(cmd->sc_data_direction));
     /*
      * Copy the segments into the SG array.  NOTE!!! - We used to
      * have the first entry both in the data_pointer area and the first
@@ -9885,30 +10974,34 @@ aic7xxx_buildscb(struct aic7xxx_host *p, Scsi_Cmnd *cmd,
      * entry in both places, but now we download the address of
      * scb->sg_list[1] instead of 0 to the sg pointer in the hscb.
      */
-    for (i = 0; i < cmd->use_sg; i++)
+    for (i = 0; i < use_sg; i++)
     {
-      scb->sg_list[i].address = cpu_to_le32(VIRT_TO_BUS(sg[i].address));
-      scb->sg_list[i].length = cpu_to_le32(sg[i].length);
-      scb->sg_length += sg[i].length;
+      unsigned int len = sg_dma_len(sg+i);
+      scb->sg_list[i].address = cpu_to_le32(sg_dma_address(sg+i));
+      scb->sg_list[i].length = cpu_to_le32(len);
+      scb->sg_length += len;
     }
     /* Copy the first SG into the data pointer area. */
     hscb->data_pointer = scb->sg_list[0].address;
     hscb->data_count = scb->sg_list[0].length;
-    scb->sg_count = cmd->use_sg;
-    hscb->SG_segment_count = cmd->use_sg;
-    hscb->SG_list_pointer = cpu_to_le32(VIRT_TO_BUS(&scb->sg_list[1]));
-
+    scb->sg_count = i;
+    hscb->SG_segment_count = i;
+    hscb->SG_list_pointer = cpu_to_le32(SCB_DMA_ADDR(scb, &scb->sg_list[1]));
   }
   else
   {
     if (cmd->request_bufflen)
     {
-      scb->sg_count = 1;
-      scb->sg_list[0].address = cpu_to_le32(VIRT_TO_BUS(cmd->request_buffer));
+      unsigned int address = pci_map_single(p->pdev, cmd->request_buffer,
+					    cmd->request_bufflen,
+                                            scsi_to_pci_dma_dir(cmd->sc_data_direction));
+      aic7xxx_mapping(cmd) = address;
+      scb->sg_list[0].address = cpu_to_le32(address);
       scb->sg_list[0].length = cpu_to_le32(cmd->request_bufflen);
+      scb->sg_count = 1;
       scb->sg_length = cmd->request_bufflen;
       hscb->SG_segment_count = 1;
-      hscb->SG_list_pointer = cpu_to_le32(VIRT_TO_BUS(&scb->sg_list[0]));
+      hscb->SG_list_pointer = cpu_to_le32(SCB_DMA_ADDR(scb, &scb->sg_list[0]));
       hscb->data_count = scb->sg_list[0].length;
       hscb->data_pointer = scb->sg_list[0].address;
     }
@@ -9922,12 +11015,6 @@ aic7xxx_buildscb(struct aic7xxx_host *p, Scsi_Cmnd *cmd,
       hscb->data_pointer = 0;
     }
   }
-#ifdef AIC7XXX_VERBOSE_DEBUGGING
-  if((cmd->cmnd[0] == TEST_UNIT_READY) && (aic7xxx_verbose & VERBOSE_PROBE2))
-  {
-    aic7xxx_print_scb(p, scb);
-  }
-#endif
 }
 
 /*+F*************************************************************************
@@ -10237,13 +11324,6 @@ aic7xxx_bus_device_reset(struct aic7xxx_host *p, Scsi_Cmnd *cmd)
 void
 aic7xxx_panic_abort(struct aic7xxx_host *p, Scsi_Cmnd *cmd)
 {
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,1,0)
-  int i, mask, found, need_tag;
-  struct aic7xxx_scb *scb;
-  unsigned char qinpos, hscbp;
-
-  found = FALSE;
-#endif
 
   printk("aic7xxx driver version %s/%s\n", AIC7XXX_C_VERSION,
          UTS_RELEASE);
@@ -10256,120 +11336,7 @@ aic7xxx_panic_abort(struct aic7xxx_host *p, Scsi_Cmnd *cmd)
   disable_irq(p->irq);
   aic7xxx_print_card(p);
   aic7xxx_print_scratch_ram(p);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,1,0)
-  for(i=0; i<MAX_TARGETS; i++)
-  {
-    if(p->dev_flags[i] & DEVICE_PRESENT)
-    {
-      mask = (0x01 << i);
-      printk(INFO_LEAD "dev_flags=0x%x, WDTR:%c/%c/%c, SDTR:%c/%c/%c,"
-             " q_depth=%d:%d\n",
-        p->host_no, 0, i, 0, p->dev_flags[i],
-        (p->wdtr_pending & mask) ? 'Y' : 'N',
-        (p->needwdtr & mask) ? 'Y' : 'N',
-        (p->needwdtr_copy & mask) ? 'Y' : 'N',
-        (p->sdtr_pending & mask) ? 'Y' : 'N',
-        (p->needsdtr & mask) ? 'Y' : 'N',
-        (p->needsdtr_copy & mask) ? 'Y' : 'N',
-        p->dev_active_cmds[i],
-        p->dev_max_queue_depth[i] );
-      printk(INFO_LEAD "targ_scsirate=0x%x", p->host_no, 0, i, 0,
-             aic_inb(p, TARG_SCSIRATE + i));
-      if (p->features & AHC_ULTRA2)
-        printk(", targ_offset=%d", aic_inb(p, TARG_OFFSET + i));
-      printk("\n");
-    }
-  }
-  /*
-   * Search for this command and see if we can't track it down, it's the
-   * one causing the timeout.  Print out this command first, then all other
-   * active commands afterwords.
-   */
-  need_tag = -1;
-  if ( cmd )
-  {
-    scb = p->scb_data->scb_array[aic7xxx_position(cmd)];
-    if ( (scb->flags & SCB_ACTIVE) && (scb->cmd == cmd) )
-    {
-      printk("Timed out command is scb #%d:\n", scb->hscb->tag);
-      printk("Tag%d: flags=0x%x, control=0x%x, TCL=0x%x, %s\n", scb->hscb->tag,
-             scb->flags, scb->hscb->control, scb->hscb->target_channel_lun,
-             (scb->flags & SCB_WAITINGQ) ? "WAITINGQ" : "Sent" );
-      need_tag = scb->hscb->tag;
-      if (scb->flags & SCB_WAITINGQ) found=TRUE;
-    }
-  }
-  printk("QINFIFO: (TAG) ");
-  qinpos = aic_inb(p, QINPOS);
-  while ( qinpos != p->qinfifonext )
-  {
-    if (p->qinfifo[qinpos] == need_tag)
-      found=TRUE;
-    printk("%d ", p->qinfifo[qinpos++]);
-  }  
-  printk("\n");
-  printk("Current SCB: (SCBPTR/TAG/CONTROL) %d/%d/0x%x\n", aic_inb(p, SCBPTR),
-         aic_inb(p, SCB_TAG), aic_inb(p, SCB_CONTROL) );
-  if (aic_inb(p, SCB_TAG) == need_tag)  found=TRUE;
-  printk("WAITING_SCBS: (SCBPTR/TAG/CONTROL) %d->",
-         hscbp = aic_inb(p, WAITING_SCBH));
-  while (hscbp != SCB_LIST_NULL)
-  {
-    aic_outb(p, hscbp, SCBPTR);
-    printk("%d/%d/0x%x ", hscbp, aic_inb(p, SCB_TAG), aic_inb(p, SCB_CONTROL));
-    hscbp = aic_inb(p, SCB_NEXT);
-    if (aic_inb(p, SCB_TAG) == need_tag)  found=TRUE;
-  }
-  printk("\n");
-  printk("DISCONNECTED_SCBS: (SCBPTR/TAG/CONTROL) %d->",
-         hscbp = aic_inb(p, DISCONNECTED_SCBH));
-  while (hscbp != SCB_LIST_NULL)
-  {
-    aic_outb(p, hscbp, SCBPTR);
-    printk("%d/%d/0x%x ", hscbp, aic_inb(p, SCB_TAG), aic_inb(p, SCB_CONTROL));
-    hscbp = aic_inb(p, SCB_NEXT);
-    if (aic_inb(p, SCB_TAG) == need_tag)  found=TRUE;
-  }
-  printk("\n");
-  printk("FREE_SCBS: (SCBPTR/TAG/CONTROL) %d->",
-         hscbp = aic_inb(p, FREE_SCBH));
-  while (hscbp != SCB_LIST_NULL)
-  {
-    aic_outb(p, hscbp, SCBPTR);
-    printk("%d/%d/0x%x ", hscbp, aic_inb(p, SCB_TAG), aic_inb(p, SCB_CONTROL));
-    hscbp = aic_inb(p, SCB_NEXT);
-  }
-  printk("\n");
-
-  if (found == FALSE)
-  {
-    /*
-     * We haven't found the offending SCB yet, and it should be around
-     * somewhere, so go look for it in the cards SCBs.
-     */
-    printk("SCBPTR CONTROL TAG PREV NEXT\n");
-    for(i=0; i<p->scb_data->maxhscbs; i++)
-    {
-      aic_outb(p, i, SCBPTR);
-      printk("   %3d      %02x  %02x   %02x   %02x\n", i,
-             aic_inb(p, SCB_CONTROL), aic_inb(p, SCB_TAG),
-             aic_inb(p, SCB_PREV), aic_inb(p, SCB_NEXT));
-    }
-  }
-  
-
-  for (i=0; i < p->scb_data->numscbs; i++)
-  {
-    scb = p->scb_data->scb_array[i];
-    if ( (scb->flags & SCB_ACTIVE) && (scb->cmd != cmd) )
-    {
-      printk("Tag%d: flags=0x%x, control=0x%x, TCL=0x%x, %s\n", scb->hscb->tag,
-             scb->flags, scb->hscb->control, scb->hscb->target_channel_lun,
-             (scb->flags & SCB_WAITINGQ) ? "WAITINGQ" : "Sent" );
-    }
-  }
-#endif
-  sti();
+  spin_unlock_irq(&io_request_lock);
   for(;;) barrier();
 }
 
@@ -10415,7 +11382,6 @@ aic7xxx_abort(Scsi_Cmnd *cmd)
  *  we are following a straight code path without entering the scheduler
  *  code.
  */
-
   pause_sequencer(p);
   while ( (aic_inb(p, INTSTAT) & INT_PEND) && !(p->flags & AHC_IN_ISR))
   {
@@ -10569,21 +11535,13 @@ aic7xxx_abort(Scsi_Cmnd *cmd)
   if ((found == 0) && (scb->flags & SCB_WAITINGQ))
   {
     int tindex = TARGET_INDEX(cmd);
-#ifdef AIC7XXX_FAKE_NEGOTIATION_CMDS
     unsigned short mask;
 
     mask = (1 << tindex);
 
-    if (p->wdtr_pending & mask)
+    if (p->dtr_pending & mask)
     {
-      if (p->dev_wdtr_cmnd[tindex]->next != cmd)
-        found = 1;
-      else
-        found = 0;
-    }
-    else if (p->sdtr_pending & mask)
-    {
-      if (p->dev_sdtr_cmnd[tindex]->next != cmd)
+      if (p->dev_dtr_cmnd[tindex]->next != cmd)
         found = 1;
       else
         found = 0;
@@ -10606,7 +11564,6 @@ aic7xxx_abort(Scsi_Cmnd *cmd)
       DRIVER_UNLOCK
       return(SCSI_ABORT_PENDING);
     }
-#endif
     if (aic7xxx_verbose & VERBOSE_ABORT_PROCESS) 
       printk(INFO_LEAD "SCB found on waiting list and "
           "aborted.\n", p->host_no, CTL_OF_SCB(scb));
@@ -10862,11 +11819,17 @@ aic7xxx_reset(Scsi_Cmnd *cmd, unsigned int flags)
     if ( aic7xxx_scb_on_qoutfifo(p, scb) )
     {
       if(aic7xxx_verbose & VERBOSE_RESET_RETURN)
-        printk(INFO_LEAD "SCB on qoutfifo, returning.\n", p->host_no,
+        printk(INFO_LEAD "SCB on qoutfifo, completing.\n", p->host_no,
           CTL_OF_SCB(scb));
+      if ((aic_inb(p,INTSTAT) & CMDCMPLT) == 0)
+        printk(INFO_LEAD "missed CMDCMPLT interrupt!\n", p->host_no,
+          CTL_OF_SCB(scb));
+      aic7xxx_handle_command_completion_intr(p);
+      aic7xxx_done_cmds_complete(p);
+      aic7xxx_run_waiting_queues(p);
       unpause_sequencer(p, FALSE);
       DRIVER_UNLOCK
-      return(SCSI_RESET_NOT_RUNNING);
+      return(SCSI_RESET_SUCCESS);
     }
     if ( flags & SCSI_RESET_SUGGEST_HOST_RESET )
     {
@@ -10970,9 +11933,7 @@ aic7xxx_reset(Scsi_Cmnd *cmd, unsigned int flags)
       if ( !(p->dev_timer_active & (0x01 << MAX_TARGETS)) ||
             time_after_eq(p->dev_timer.expires, p->dev_expires[p->scsi_id]) )
       {
-        del_timer(&p->dev_timer);
-        p->dev_timer.expires = p->dev_expires[p->scsi_id];
-        add_timer(&p->dev_timer);
+        mod_timer(&p->dev_timer, p->dev_expires[p->scsi_id]);
         p->dev_timer_active |= (0x01 << MAX_TARGETS);
       }
       aic7xxx_reset_channel(p, cmd->channel, TRUE);
@@ -11034,16 +11995,21 @@ aic7xxx_reset(Scsi_Cmnd *cmd, unsigned int flags)
 int
 aic7xxx_biosparam(Disk *disk, kdev_t dev, int geom[])
 {
-  int heads, sectors, cylinders;
+  int heads, sectors, cylinders, ret;
   struct aic7xxx_host *p;
+  struct buffer_head *bh;
 
   p = (struct aic7xxx_host *) disk->device->host->hostdata;
+  bh = bread(MKDEV(MAJOR(dev), MINOR(dev)&~0xf), 0, 1024);
 
-  /*
-   * XXX - if I could portably find the card's configuration
-   *       information, then this could be autodetected instead
-   *       of left to a boot-time switch.
-   */
+  if ( bh )
+  {
+    ret = scsi_partsize(bh, disk->capacity, &geom[2], &geom[0], &geom[1]);
+    brelse(bh);
+    if ( ret != -1 )
+      return(ret);
+  }
+  
   heads = 64;
   sectors = 32;
   cylinders = disk->capacity / (heads * sectors);
@@ -11078,15 +12044,12 @@ aic7xxx_release(struct Scsi_Host *host)
 
   if(p->irq)
     free_irq(p->irq, p);
-  release_region(p->base, MAXREG - MINREG);
+  if(p->base)
+    release_region(p->base, MAXREG - MINREG);
 #ifdef MMAPIO
   if(p->maddr)
   {
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,1,0)
-    vfree((void *) (((unsigned long) p->maddr) & PAGE_MASK));
-#else
     iounmap((void *) (((unsigned long) p->maddr) & PAGE_MASK));
-#endif
   }
 #endif /* MMAPIO */
   prev = NULL;
@@ -11150,28 +12113,14 @@ aic7xxx_print_card(struct aic7xxx_host *p)
           0x84, 0x8e, 0x90, 0x95, 0x97, 0x97, 0x9a, 0x9a, 0x9f, 0x9f,
           0xe0, 0xf1, 0xf4, 0xf4, 0xf6, 0xf6, 0xf8, 0xf8, 0xfa, 0xfc,
           0xfe, 0xff} },
+    {12, {0x00, 0x05, 0x08, 0x11, 0x18, 0x1f, 0x60, 0x60, 0x62, 0x66, /*7892*/
+          0x84, 0x8e, 0x90, 0x95, 0x97, 0x97, 0x9a, 0x9a, 0x9c, 0x9f,
+          0xe0, 0xf1, 0xf4, 0xfc} },
+    {12, {0x00, 0x05, 0x08, 0x11, 0x18, 0x1f, 0x60, 0x60, 0x62, 0x66, /*7899*/
+          0x84, 0x8e, 0x90, 0x95, 0x97, 0x97, 0x9a, 0x9a, 0x9c, 0x9f,
+          0xe0, 0xf1, 0xf4, 0xfc} },
   };
-#ifdef CONFIG_PCI
-  static struct register_ranges cards_ns[] = {
-    { 0, {0,} }, /* none */
-    { 0, {0,} }, /* 7771 */
-    { 7, {0x04, 0x08, 0x0c, 0x0e, 0x10, 0x17, 0x28, 0x2b, 0x30, 0x33,
-          0x3c, 0x41, 0x43, 0x47} },
-    { 7, {0x04, 0x08, 0x0c, 0x0e, 0x10, 0x17, 0x28, 0x2b, 0x30, 0x33,
-          0x3c, 0x41, 0x43, 0x47} },
-    { 5, {0x04, 0x08, 0x0c, 0x0e, 0x10, 0x17, 0x30, 0x33, 0x3c, 0x41} },
-    { 5, {0x04, 0x08, 0x0c, 0x0e, 0x10, 0x17, 0x30, 0x34, 0x3c, 0x47} },
-    { 5, {0x04, 0x08, 0x0c, 0x1b, 0x30, 0x34, 0x3c, 0x43, 0xdc, 0xe3} },
-    { 6, {0x04, 0x08, 0x0c, 0x0e, 0x10, 0x17, 0x30, 0x34, 0x3c, 0x47,
-          0xdc, 0xe3} },
-    { 6, {0x04, 0x08, 0x0c, 0x1b, 0x30, 0x34, 0x3c, 0x43, 0xdc, 0xe3,
-          0xff, 0xff} }
-  };
-#endif
   chip = p->chip & AHC_CHIPID_MASK;
-  /*
-   * Let's run through the PCI space first....
-   */
   printk("%s at ",
          board_names[p->board_name_index]);
   switch(p->chip & ~AHC_CHIPID_MASK)
@@ -11184,43 +12133,13 @@ aic7xxx_print_card(struct aic7xxx_host *p)
       break;
     case AHC_PCI:
     default:
-      printk("PCI %d/%d.\n", PCI_SLOT(p->pci_device_fn),
+      printk("PCI %d/%d/%d.\n", p->pci_bus, PCI_SLOT(p->pci_device_fn),
              PCI_FUNC(p->pci_device_fn));
       break;
   }
 
-#ifdef CONFIG_PCI
-  {
-    unsigned char temp;
-    
-    printk("PCI Dump:\n");
-    k=0;
-    for(i=0; i<cards_ns[chip].num_ranges; i++)
-    {
-      for(j  = cards_ns[chip].range_val[ i * 2 ];
-          j <= cards_ns[chip].range_val[ i * 2 + 1 ] ;
-          j++)
-      {
-#if LINUX_VERSION_CODE > KERNEL_VERSION(2,1,92)
-        pci_read_config_byte(p->pdev, j, &temp);
-#else
-        pcibios_read_config_byte(p->pci_bus, p->pci_device_fn, j, &temp);
-#endif
-        printk("%02x:%02x ", j, temp);
-        if(++k == 13)
-        {
-          printk("\n");
-          k = 0;
-        }
-      }
-    }
-  }
-  if(k != 0)
-    printk("\n");
-#endif /* CONFIG_PCI */
-
   /*
-   * Now the registers on the card....
+   * the registers on the card....
    */
   printk("Card Dump:\n");
   k = 0;
@@ -11240,21 +12159,6 @@ aic7xxx_print_card(struct aic7xxx_host *p)
   }
   if(k != 0)
     printk("\n");
-  if (p->flags & AHC_SEEPROM_FOUND)
-  {
-    unsigned short *sc1;
-    sc1 = (unsigned short *)&p->sc;
-    
-    printk("SEEPROM dump.\n");
-    for(i=1; i<=32; i++)
-    {
-      printk("0x%04x", sc1[i-1]);
-      if ( (i % 8) == 0 )
-        printk("\n");
-      else
-        printk("  ");
-    }
-  }
 
   /*
    * If this was an Ultra2 controller, then we just hosed the card in terms
@@ -11313,12 +12217,10 @@ aic7xxx_print_scratch_ram(struct aic7xxx_host *p)
 
 #include "aic7xxx_proc.c"
 
-#ifdef MODULE
 /* Eventually this will go into an include file, but this will be later */
-Scsi_Host_Template driver_template = AIC7XXX;
+static Scsi_Host_Template driver_template = AIC7XXX;
 
 #include "scsi_module.c"
-#endif
 
 /*
  * Overrides for Emacs so that we almost follow Linus's tabbing style.

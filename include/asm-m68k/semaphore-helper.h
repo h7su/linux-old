@@ -9,6 +9,8 @@
  * m68k version by Andreas Schwab
  */
 
+#include <linux/config.h>
+
 /*
  * These two _must_ execute atomically wrt each other.
  */
@@ -16,6 +18,10 @@ static inline void wake_one_more(struct semaphore * sem)
 {
 	atomic_inc(&sem->waking);
 }
+
+#ifndef CONFIG_RMW_INSNS
+extern spinlock_t semaphore_wake_lock;
+#endif
 
 static inline int waking_non_zero(struct semaphore *sem)
 {

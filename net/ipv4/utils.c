@@ -6,7 +6,7 @@
  *		Various kernel-resident INET utility functions; mainly
  *		for format conversion and debugging output.
  *
- * Version:	$Id: utils.c,v 1.6 1997/12/13 21:53:03 kuznet Exp $
+ * Version:	$Id: utils.c,v 1.8 2000/10/03 07:29:01 anton Exp $
  *
  * Author:	Fred N. van Kempen, <waltje@uWalt.NL.Mugnet.ORG>
  *
@@ -56,7 +56,6 @@ char *in_ntoa(__u32 in)
 		(p[0] & 255), (p[1] & 255), (p[2] & 255), (p[3] & 255));
 	return(buff);
 }
-
 
 /*
  *	Convert an ASCII string to binary IP. 

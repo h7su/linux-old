@@ -53,7 +53,7 @@ static int autofs_write(struct file *file, const void *addr, int bytes)
 
 	/** WARNING: this is not safe for writing more than PIPE_BUF bytes! **/
 
-	sigpipe = sigismember(&current->signal, SIGPIPE);
+	sigpipe = sigismember(&current->pending.signal, SIGPIPE);
 
 	/* Save pointer to user space and point back to kernel space */
 	fs = get_fs();
@@ -71,7 +71,7 @@ static int autofs_write(struct file *file, const void *addr, int bytes)
 	   SIGPIPE unless it was already supposed to get one */
 	if (wr == -EPIPE && !sigpipe) {
 		spin_lock_irqsave(&current->sigmask_lock, flags);
-		sigdelset(&current->signal, SIGPIPE);
+		sigdelset(&current->pending.signal, SIGPIPE);
 		recalc_sigpending(current);
 		spin_unlock_irqrestore(&current->sigmask_lock, flags);
 	}
@@ -131,7 +131,7 @@ int autofs_wait(struct autofs_sb_info *sbi, struct qstr *name)
 			return -ENOMEM;
 		}
 		wq->wait_queue_token = autofs_next_wait_queue++;
-		init_waitqueue(&wq->queue);
+		init_waitqueue_head(&wq->queue);
 		wq->hash = name->hash;
 		wq->len = name->len;
 		wq->status = -EINTR; /* Status return if interrupted */

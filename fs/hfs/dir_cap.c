@@ -57,84 +57,31 @@ const struct hfs_name hfs_cap_reserved2[] = {
 #define DOT_FINDERINFO	(&hfs_cap_reserved1[3])
 #define DOT_ROOTINFO	(&hfs_cap_reserved2[0])
 
-static struct file_operations hfs_cap_dir_operations = {
-	NULL,			/* lseek - default */
-	hfs_dir_read,		/* read - invalid */
-	NULL,			/* write - bad */
-	cap_readdir,		/* readdir */
-	NULL,			/* select - default */
-	NULL,			/* ioctl - default */
-	NULL,			/* mmap - none */
-	NULL,			/* no special open code */
-	NULL,			/* flush */
-	NULL,			/* no special release code */
-	file_fsync,		/* fsync - default */
-	NULL,			/* fasync - default */
-	NULL,			/* check_media_change - none */
-	NULL			/* revalidate - none */
+struct file_operations hfs_cap_dir_operations = {
+	read:		generic_read_dir,
+	readdir:	cap_readdir,
+	fsync:		file_fsync,
 };
 
 struct inode_operations hfs_cap_ndir_inode_operations = {
-	&hfs_cap_dir_operations,/* default directory file-ops */
-	hfs_create,		/* create */
-	cap_lookup,		/* lookup */
-	NULL,			/* link */
-	hfs_unlink,		/* unlink */
-	NULL,			/* symlink */
-	hfs_mkdir,		/* mkdir */
-	hfs_rmdir,		/* rmdir */
-	hfs_mknod,		/* mknod */
-	hfs_rename,		/* rename */
-	NULL,			/* readlink */
-	NULL,			/* follow_link */
-	NULL,			/* readpage */
-	NULL,			/* writepage */
-	NULL,			/* bmap */
-	NULL,			/* truncate */
-	NULL,			/* permission */
-	NULL			/* smap */
+	create:		hfs_create,
+	lookup:		cap_lookup,
+	unlink:		hfs_unlink,
+	mkdir:		hfs_mkdir,
+	rmdir:		hfs_rmdir,
+	rename:		hfs_rename,
+	setattr:	hfs_notify_change,
 };
 
 struct inode_operations hfs_cap_fdir_inode_operations = {
-	&hfs_cap_dir_operations,/* default directory file-ops */
-	NULL,			/* create */
-	cap_lookup,		/* lookup */
-	NULL,			/* link */
-	NULL,			/* unlink */
-	NULL,			/* symlink */
-	NULL,			/* mkdir */
-	NULL,			/* rmdir */
-	NULL,			/* mknod */
-	NULL,			/* rename */
-	NULL,			/* readlink */
-	NULL,			/* follow_link */
-	NULL,			/* readpage */
-	NULL,			/* writepage */
-	NULL,			/* bmap */
-	NULL,			/* truncate */
-	NULL,			/* permission */
-	NULL			/* smap */
+	lookup:		cap_lookup,
+	setattr:	hfs_notify_change,
 };
 
 struct inode_operations hfs_cap_rdir_inode_operations = {
-	&hfs_cap_dir_operations,/* default directory file-ops */
-	hfs_create,		/* create */
-	cap_lookup,		/* lookup */
-	NULL,			/* link */
-	NULL,			/* unlink */
-	NULL,			/* symlink */
-	NULL,			/* mkdir */
-	NULL,			/* rmdir */
-	NULL,			/* mknod */
-	NULL,			/* rename */
-	NULL,			/* readlink */
-	NULL,			/* follow_link */
-	NULL,			/* readpage */
-	NULL,			/* writepage */
-	NULL,			/* bmap */
-	NULL,			/* truncate */
-	NULL,			/* permission */
-	NULL			/* smap */
+	create:		hfs_create,
+	lookup:		cap_lookup,
+	setattr:	hfs_notify_change,
 };
 
 /*================ File-local functions ================*/
@@ -237,17 +184,13 @@ static int cap_readdir(struct file * filp,
         struct hfs_cat_entry *entry;
 	struct inode *dir = filp->f_dentry->d_inode;
 
-	if (!dir || !dir->i_sb || !S_ISDIR(dir->i_mode)) {
-		return -EBADF;
-	}
-
 	entry = HFS_I(dir)->entry;
 	type = HFS_ITYPE(dir->i_ino);
 	skip_dirs = (type == HFS_CAP_RDIR);
 
 	if (filp->f_pos == 0) {
 		/* Entry 0 is for "." */
-		if (filldir(dirent, DOT->Name, DOT_LEN, 0, dir->i_ino)) {
+		if (filldir(dirent, DOT->Name, DOT_LEN, 0, dir->i_ino, DT_DIR)) {
 			return 0;
 		}
 		filp->f_pos = 1;
@@ -264,7 +207,7 @@ static int cap_readdir(struct file * filp,
 		}
 
 		if (filldir(dirent, DOT_DOT->Name,
-			    DOT_DOT_LEN, 1, ntohl(cnid))) {
+			    DOT_DOT_LEN, 1, ntohl(cnid), DT_DIR)) {
 			return 0;
 		}
 		filp->f_pos = 2;
@@ -291,7 +234,7 @@ static int cap_readdir(struct file * filp,
 				len = hfs_namein(dir, tmp_name,
 				    &((struct hfs_cat_key *)brec.key)->CName);
 				if (filldir(dirent, tmp_name, len,
-					    filp->f_pos, ino)) {
+					    filp->f_pos, ino, DT_UNKNOWN)) {
 					hfs_cat_close(entry, &brec);
 					return 0;
 				}
@@ -307,7 +250,8 @@ static int cap_readdir(struct file * filp,
 			/* In root dir last-2 entry is for ".rootinfo" */
 			if (filldir(dirent, DOT_ROOTINFO->Name,
 				    DOT_ROOTINFO_LEN, filp->f_pos,
-				    ntohl(entry->cnid) | HFS_CAP_FNDR)) {
+				    ntohl(entry->cnid) | HFS_CAP_FNDR,
+				    DT_UNKNOWN)) {
 				return 0;
 			}
 		}
@@ -319,7 +263,8 @@ static int cap_readdir(struct file * filp,
 			/* In normal dirs last-1 entry is for ".finderinfo" */
 			if (filldir(dirent, DOT_FINDERINFO->Name,
 				    DOT_FINDERINFO_LEN, filp->f_pos,
-				    ntohl(entry->cnid) | HFS_CAP_FDIR)) {
+				    ntohl(entry->cnid) | HFS_CAP_FDIR,
+				    DT_UNKNOWN)) {
 				return 0;
 			}
 		}
@@ -331,7 +276,8 @@ static int cap_readdir(struct file * filp,
 			/* In normal dirs last entry is for ".resource" */
 			if (filldir(dirent, DOT_RESOURCE->Name,
 				    DOT_RESOURCE_LEN, filp->f_pos,
-				    ntohl(entry->cnid) | HFS_CAP_RDIR)) {
+				    ntohl(entry->cnid) | HFS_CAP_RDIR,
+				    DT_UNKNOWN)) {
 				return 0;
 			}
 		}
