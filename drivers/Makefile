@@ -10,7 +10,7 @@
 SUB_DIRS     := block char net misc sound
 MOD_SUB_DIRS := $(SUB_DIRS)
 ALL_SUB_DIRS := $(SUB_DIRS) pci scsi sbus cdrom isdn pnp \
-				 macintosh video dio zorro fc4
+				 macintosh video dio zorro fc4 usb
 
 ifdef CONFIG_DIO
 SUB_DIRS += dio
@@ -43,6 +43,15 @@ ifdef CONFIG_PPC
 SUB_DIRS += macintosh
 MOD_SUB_DIRS += macintosh
 endif
+
+ifeq ($(CONFIG_USB),y)
+SUB_DIRS += usb
+MOD_SUB_DIRS += usb
+else
+  ifeq ($(CONFIG_USB),m)
+  MOD_SUB_DIRS += usb
+  endif
+endif 
 
 # If CONFIG_SCSI is set, the core of SCSI support will be added to the kernel,
 # but some of the low-level things may also be modules.

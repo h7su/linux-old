@@ -42,14 +42,20 @@ endif
 
 ifndef CONFIG_SUN_KEYBOARD
 ifdef CONFIG_VT
-L_OBJS += keyboard.o
+LX_OBJS += keyboard.o
 endif
-ifneq ($(ARCH),m68k)
-L_OBJS += pc_keyb.o defkeymap.o
+ ifneq ($(ARCH),m68k)
+   L_OBJS += pc_keyb.o defkeymap.o
+ endif
+else
+ifdef CONFIG_PCI
+L_OBJS += defkeymap.o
+LX_OBJS += keyboard.o
 endif
+endif
+
 ifdef CONFIG_MAGIC_SYSRQ
-L_OBJS += sysrq.o
-endif
+LX_OBJS += sysrq.o
 endif
 
 ifeq ($(CONFIG_ATARI_DSP56K),y)
@@ -134,6 +140,14 @@ else
   endif
 endif
 
+ifeq ($(CONFIG_SYNCLINK),m)
+  M_OBJS += synclink.o
+endif
+
+ifeq ($(CONFIG_N_HDLC),m)
+  M_OBJS += n_hdlc.o
+endif
+
 ifeq ($(CONFIG_SPECIALIX),y)
 L_OBJS += specialix.o
 else
@@ -173,6 +187,14 @@ MOD_SUB_DIRS += joystick
 else
   ifeq ($(CONFIG_JOYSTICK),m)
   MOD_SUB_DIRS += joystick
+  endif
+endif
+
+ifeq ($(CONFIG_DTLK),y)
+L_OBJS += dtlk.o
+else
+  ifeq ($(CONFIG_DTLK),m)
+  M_OBJS += dtlk.o
   endif
 endif
 
@@ -261,12 +283,12 @@ L_OBJS += rtc.o
 endif
 
 ifeq ($(CONFIG_NVRAM),y)
-  ifeq ($(CONFIG_PMAC)$(CONFIG_CHRP),)
+  ifeq ($(CONFIG_PPC),)
   L_OBJS += nvram.o
   endif
 else
   ifeq ($(CONFIG_NVRAM),m)
-    ifeq ($(CONFIG_PMAC)$(CONFIG_CHRP),)
+    ifeq ($(CONFIG_PPC),)
     M_OBJS += nvram.o
     endif
   endif
@@ -332,6 +354,14 @@ else
   endif
 endif
 
+ifeq ($(CONFIG_VIDEO_PLANB),y)
+L_OBJS += planb.o
+else
+  ifeq ($(CONFIG_VIDEO_PLANB),m)
+  M_OBJS += planb.o
+  endif
+endif
+
 ifeq ($(CONFIG_RADIO_AZTECH),y)
 L_OBJS += radio-aztech.o
 else
@@ -364,11 +394,27 @@ else
   endif
 endif                                             
 
+ifeq ($(CONFIG_RADIO_TYPHOON),y)
+L_OBJS += radio-typhoon.o
+else
+  ifeq ($(CONFIG_RADIO_TYPHOON),m)
+  M_OBJS += radio-typhoon.o
+  endif
+endif                                             
+
 ifeq ($(CONFIG_RADIO_ZOLTRIX),y)
 L_OBJS += radio-zoltrix.o
 else
   ifeq ($(CONFIG_RADIO_ZOLTRIX),m)
   M_OBJS += radio-zoltrix.o
+  endif
+endif                                             
+
+ifeq ($(CONFIG_RADIO_CADET),y)
+L_OBJS += radio-cadet.o
+else
+  ifeq ($(CONFIG_RADIO_CADET),m)
+  M_OBJS += radio-cadet.o
   endif
 endif                                             
 
@@ -430,6 +476,7 @@ else
   ALL_SUB_DIRS += hfmodem
   MOD_SUB_DIRS += hfmodem
   endif
+
 endif
 
 include $(TOPDIR)/Rules.make

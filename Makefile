@@ -1,5 +1,5 @@
 VERSION = 2
-PATCHLEVEL = 2
+PATCHLEVEL = 3
 SUBLEVEL = 0
 EXTRAVERSION =
 
@@ -175,7 +175,7 @@ DRIVERS := $(DRIVERS) drivers/net/hamradio/hamradio.a
 endif
 
 ifeq ($(CONFIG_USB),y)
-DRIVERS := $(DRIVERS) drivers/uusbd/usb.a
+DRIVERS := $(DRIVERS) drivers/usb/usb.a
 endif
 
 ifeq ($(CONFIG_I2O),y)
@@ -221,35 +221,27 @@ symlinks:
 		mkdir include/linux/modules; \
 	fi
 
-oldconfig: symlinks scripts/split-include
+oldconfig: symlinks
 	$(CONFIG_SHELL) scripts/Configure -d arch/$(ARCH)/config.in
-	if [ -r include/linux/autoconf.h ]; then \
-	    scripts/split-include include/linux/autoconf.h include/config; \
-	fi
 
-xconfig: symlinks scripts/split-include
+xconfig: symlinks
 	$(MAKE) -C scripts kconfig.tk
 	wish -f scripts/kconfig.tk
-	if [ -r include/linux/autoconf.h ]; then \
-	    scripts/split-include include/linux/autoconf.h include/config; \
-	fi
 
-menuconfig: include/linux/version.h symlinks scripts/split-include
+menuconfig: include/linux/version.h symlinks
 	$(MAKE) -C scripts/lxdialog all
 	$(CONFIG_SHELL) scripts/Menuconfig arch/$(ARCH)/config.in
-	if [ -r include/linux/autoconf.h ]; then \
-	    scripts/split-include include/linux/autoconf.h include/config; \
-	fi
 
-config: symlinks scripts/split-include
+config: symlinks
 	$(CONFIG_SHELL) scripts/Configure arch/$(ARCH)/config.in
-	if [ -r include/linux/autoconf.h ]; then \
-	    scripts/split-include include/linux/autoconf.h include/config; \
-	fi
+
+include/config/MARKER: scripts/split-include include/linux/autoconf.h
+	scripts/split-include include/linux/autoconf.h include/config
+	@ touch include/config/MARKER
 
 linuxsubdirs: $(patsubst %, _dir_%, $(SUBDIRS))
 
-$(patsubst %, _dir_%, $(SUBDIRS)) : dummy
+$(patsubst %, _dir_%, $(SUBDIRS)) : dummy include/config/MARKER
 	$(MAKE) -C $(patsubst _dir_%, %, $@)
 
 $(TOPDIR)/include/linux/version.h: include/linux/version.h
@@ -286,10 +278,10 @@ include/linux/version.h: ./Makefile
 	@echo '#define KERNEL_VERSION(a,b,c) (((a) << 16) + ((b) << 8) + (c))' >>.ver
 	@mv -f .ver $@
 
-init/version.o: init/version.c include/linux/compile.h
+init/version.o: init/version.c include/linux/compile.h include/config/MARKER
 	$(CC) $(CFLAGS) -DUTS_MACHINE='"$(ARCH)"' -c -o init/version.o init/version.c
 
-init/main.o: init/main.c
+init/main.o: init/main.c include/config/MARKER
 	$(CC) $(CFLAGS) $(PROFILING) -c -o $*.o $<
 
 fs lib mm ipc kernel drivers net: dummy
@@ -351,7 +343,8 @@ endif
 
 clean:	archclean
 	rm -f kernel/ksyms.lst include/linux/compile.h
-	rm -f core `find . -name '*.[oas]' ! -regex '.*lxdialog/.*' -print`
+	rm -f core `find . -name '*.[oas]' ! -regex '.*lxdialog/.*' \
+		! -regex '.*ksymoops/.*' -print`
 	rm -f core `find . -type f -name 'core' -print`
 	rm -f core `find . -name '.*.flags' -print`
 	rm -f vmlinux System.map
@@ -375,6 +368,7 @@ mrproper: clean archmrproper
 	rm -f .version .config* config.in config.old
 	rm -f scripts/tkparse scripts/kconfig.tk scripts/kconfig.tmp
 	rm -f scripts/lxdialog/*.o scripts/lxdialog/lxdialog
+	rm -f scripts/ksymoops/*.o scripts/ksymoops/ksymoops
 	rm -f .menuconfig.log
 	rm -f include/asm
 	rm -rf include/config
@@ -387,8 +381,8 @@ mrproper: clean archmrproper
 
 distclean: mrproper
 	rm -f core `find . \( -name '*.orig' -o -name '*.rej' -o -name '*~' \
-                -o -name '*.bak' -o -name '#*#' -o -name '.*.orig' \
-                -o -name '.*.rej' -o -name '.SUMS' -o -size 0 \) -print` TAGS
+		-o -name '*.bak' -o -name '#*#' -o -name '.*.orig' \
+		-o -name '.*.rej' -o -name '.SUMS' -o -size 0 \) -print` TAGS
 
 backup: mrproper
 	cd .. && tar cf - linux/ | gzip -9 > backup.gz

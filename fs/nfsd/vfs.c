@@ -11,7 +11,7 @@
  * So if you notice code paths that apparently fail to dput() the
  * dentry, don't worry--they have been taken care of.
  *
- * Copyright (C) 1995, 1996, 1997 Olaf Kirch <okir@monad.swb.de>
+ * Copyright (C) 1995-1999 Olaf Kirch <okir@monad.swb.de>
  */
 
 #include <linux/config.h>
@@ -734,7 +734,7 @@ nfsd_create(struct svc_rqst *rqstp, struct svc_fh *fhp,
 	 * directories via NFS.
 	 */
 	err = 0;
-	if ((iap->ia_valid &= (ATTR_UID|ATTR_GID|ATTR_MODE)) != 0)
+	if ((iap->ia_valid &= ~(ATTR_UID|ATTR_GID|ATTR_MODE)) != 0)
 		err = nfsd_setattr(rqstp, resfhp, iap);
 out:
 	return err;
@@ -959,7 +959,7 @@ nfsd_link(struct svc_rqst *rqstp, struct svc_fh *ffhp,
 		goto out_unlock;
 
 	err = nfserr_perm;
-	if (IS_IMMUTABLE(dest) /* || IS_APPEND(dest) */ )
+	if (IS_IMMUTABLE(dest) || IS_APPEND(dest))
 		goto out_unlock;
 	if (!dirp->i_op || !dirp->i_op->link)
 		goto out_unlock;
@@ -986,6 +986,20 @@ out_nfserr:
 	err = nfserrno(-err);
 	goto out;
 }
+
+/*
+ * We need to do a check-parent every time
+ * after we have locked the parent - to verify
+ * that the parent is still our parent and
+ * that we are still hashed onto it..
+ *
+ * This is requied in case two processes race
+ * on removing (or moving) the same entry: the
+ * parent lock will serialize them, but the
+ * other process will be too late..
+ */
+#define check_parent(dir, dentry) \
+	((dir) == (dentry)->d_parent->d_inode && !list_empty(&dentry->d_hash))
 
 /*
  * This follows the model of double_lock() in the VFS.
@@ -1048,6 +1062,10 @@ nfsd_rename(struct svc_rqst *rqstp, struct svc_fh *ffhp, char *fname, int flen,
 	if (IS_ERR(odentry))
 		goto out_nfserr;
 
+	err = -ENOENT;
+	if (!odentry->d_inode)
+		goto out_dput_old;
+
 	ndentry = lookup_dentry(tname, dget(tdentry), 0);
 	err = PTR_ERR(ndentry);
 	if (IS_ERR(ndentry))
@@ -1057,13 +1075,18 @@ nfsd_rename(struct svc_rqst *rqstp, struct svc_fh *ffhp, char *fname, int flen,
 	 * Lock the parent directories.
 	 */
 	nfsd_double_down(&tdir->i_sem, &fdir->i_sem);
-	/* N.B. check for parent changes after locking?? */
+	err = -ENOENT;
+	/* GAM3 check for parent changes after locking. */
+	if (check_parent(fdir, odentry) &&
+	    check_parent(tdir, ndentry)) {
 
-	err = vfs_rename(fdir, odentry, tdir, ndentry);
-	if (!err && EX_ISSYNC(tfhp->fh_export)) {
-		write_inode_now(fdir);
-		write_inode_now(tdir);
-	}
+		err = vfs_rename(fdir, odentry, tdir, ndentry);
+		if (!err && EX_ISSYNC(tfhp->fh_export)) {
+			write_inode_now(fdir);
+			write_inode_now(tdir);
+		}
+	} else
+		dprintk("nfsd: Caught race in nfsd_rename");
 	DQUOT_DROP(fdir);
 	DQUOT_DROP(tdir);
 
@@ -1116,8 +1139,11 @@ nfsd_unlink(struct svc_rqst *rqstp, struct svc_fh *fhp, int type,
 		goto out;
 	}
 
+	expire_by_dentry(rdentry);
+
 	if (type != S_IFDIR) {
 		/* It's UNLINK */
+
 		err = fh_lock_parent(fhp, rdentry);
 		if (err)
 			goto out;
@@ -1132,15 +1158,15 @@ nfsd_unlink(struct svc_rqst *rqstp, struct svc_fh *fhp, int type,
 	} else {
 		/* It's RMDIR */
 		/* See comments in fs/namei.c:do_rmdir */
+
 		rdentry->d_count++;
 		nfsd_double_down(&dirp->i_sem, &rdentry->d_inode->i_sem);
 		if (!fhp->fh_pre_mtime)
 			fhp->fh_pre_mtime = dirp->i_mtime;
 		fhp->fh_locked = 1;
-		/* CHECKME: Should we do something with the child? */
 
 		err = -ENOENT;
-		if (rdentry->d_parent->d_inode == dirp)
+		if (check_parent(dirp, rdentry))
 			err = vfs_rmdir(dirp, rdentry);
 
 		rdentry->d_count--;
