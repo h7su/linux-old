@@ -360,28 +360,33 @@ extern void locks_remove_locks(struct task_struct *task, struct file *filp);
 #define FLOCK_VERIFY_WRITE 2
 
 extern int locks_mandatory_locked(struct inode *inode);
+extern int locks_mandatory_area(int read_write, struct inode *inode,
+				struct file *filp, unsigned int offset,
+				unsigned int count);
+
 extern inline int locks_verify_locked(struct inode *inode)
 {
+#ifdef CONFIG_LOCK_MANDATORY	 
 	/* Candidates for mandatory locking have the setgid bit set
 	 * but no group execute bit -  an otherwise meaningless combination.
 	 */
 	if ((inode->i_mode & (S_ISGID | S_IXGRP)) == S_ISGID)
 		return (locks_mandatory_locked(inode));
+#endif
 	return (0);
 }
-extern int locks_mandatory_area(int read_write, struct inode *inode,
-				struct file *filp, unsigned int offset,
-				unsigned int count);
 extern inline int locks_verify_area(int read_write, struct inode *inode,
 				    struct file *filp, unsigned int offset,
 				    unsigned int count)
 {
+#ifdef CONFIG_LOCK_MANDATORY	 
 	/* Candidates for mandatory locking have the setgid bit set
 	 * but no group execute bit -  an otherwise meaningless combination.
 	 */
 	if ((inode->i_mode & (S_ISGID | S_IXGRP)) == S_ISGID)
 		return (locks_mandatory_area(read_write, inode, filp, offset,
 					     count));
+#endif
 	return (0);
 }
 
@@ -473,7 +478,7 @@ struct inode_operations {
 	int (*mkdir) (struct inode *,const char *,int,int);
 	int (*rmdir) (struct inode *,const char *,int);
 	int (*mknod) (struct inode *,const char *,int,int,int);
-	int (*rename) (struct inode *,const char *,int,struct inode *,const char *,int);
+	int (*rename) (struct inode *,const char *,int,struct inode *,const char *,int, int);
 	int (*readlink) (struct inode *,char *,int);
 	int (*follow_link) (struct inode *,struct inode *,int,int,struct inode **);
 	int (*readpage) (struct inode *, struct page *);

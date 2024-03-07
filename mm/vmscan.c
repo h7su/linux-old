@@ -334,7 +334,12 @@ int try_to_free_page(int priority, int dma, int wait)
 {
 	static int state = 0;
 	int i=6;
+	int stop;
 
+	/* we don't try as hard if we're not waiting.. */
+	stop = 3;
+	if (wait)
+		stop = 0;
 	switch (state) {
 		do {
 		case 0:
@@ -349,7 +354,8 @@ int try_to_free_page(int priority, int dma, int wait)
 			if (swap_out(i, dma, wait))
 				return 1;
 			state = 0;
-		} while (i--);
+		i--;
+		} while ((i - stop) >= 0);
 	}
 	return 0;
 }
@@ -398,6 +404,7 @@ int kswapd(void *unused)
 	while (1) {
 		kswapd_awake = 0;
 		current->signal = 0;
+		run_task_queue(&tq_disk);
 		interruptible_sleep_on(&kswapd_wait);
 		kswapd_awake = 1;
 		swapstats.wakeups++;

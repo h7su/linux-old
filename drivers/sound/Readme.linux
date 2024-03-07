@@ -19,7 +19,7 @@ IMPORTANT!	Read this if you are installing a separately
   sources). Remove old version of linux/drivers/sound directory before
   installing new files.
 
-- To build the device files you need to run the enclosed shell script 
+- To build the device files you need to run the enclosed shell scrip 
   (see below). You need to do this only when installing sound driver
   first time or when upgrading to much recent version than the earlier
   one.
@@ -27,13 +27,13 @@ IMPORTANT!	Read this if you are installing a separately
 - Configure and compile Linux as normally (remember to include the
   sound support during "make config"). Please refer to kernel documentation
   for instructions about configuring and compiling kernel. File Readme.cards
-  contains card specific instructions for configuring this driver for
+  contains card spesific instructions for configuring this driver for
   use with various soundcards.
 
 Boot time configuration (using lilo and insmod) 
 -----------------------------------------------
 
-This information has been removed. Too many users didn't believe
+This information has been removed. Too many users did't believe
 that it's really not necessary to use this method. Please look at
 Readme of sound driver version 3.0.1 if you still want to use this method.
 
@@ -46,7 +46,7 @@ command:
 
 	cat /dev/sndstat 
 
-and look at the output. It should display some useful info about the
+and look at the output. It should display some usefull info about the
 driver configuration. If there is no /dev/sndstat 
 (/dev/sndstat: No such file or directory), ensure that you have executed the
 soundinstall script (at the end of this file).
@@ -67,15 +67,26 @@ Readme.cards for info about configuring the driver with your card. Also
 check for possible boot (insmod) time error messages in /var/adm/messages.
 
 - Other messages or problems
-Please check http://personal.eunet.fi/pp/voxware for more info.
+Please check http://www.4front-tech.com/usslite for more info.
 
 Hannu Savolainen
 hannu@voxware.pp.fi
 
 ----------------- cut here ------------------------------
 #!/bin/sh
+# *****************************************
+# * NOTICE!
+# *
+# * For security reasons read access to /dev/dsp* and /dev/audio* has been
+# * disabled from other than root. Otherwise any user may be able to spy
+# * what is being talked about near the microphone.
+# * This effectively disables audio recording by other than root. In case
+# * this capability is required, you should change AUDIOPERMS (below) to 666
+# * before executing this script.
+# *****************************************
+AUDIOPERMS=622
 #
-#	soundinstall		
+#
 #
 #
 # Create the devices
@@ -161,7 +172,7 @@ fi
 if [ -e /dev/dsp0 ]; then
 	rm -f /dev/dsp0
 fi
-mknod -m 666 /dev/dsp0 c 14 3
+mknod -m $AUDIOPERMS /dev/dsp0 c 14 3
 ln -s /dev/dsp0 /dev/dsp
 
 #
@@ -173,13 +184,13 @@ fi
 if [ -e /dev/dspW0 ]; then
 	rm -f /dev/dspW0
 fi
-mknod -m 666 /dev/dspW0 c 14 5
+mknod -m $AUDIOPERMS /dev/dspW0 c 14 5
 ln -s /dev/dspW0 /dev/dspW
 
 if [ -e /dev/dspW1 ]; then
 	rm -f /dev/dspW1
 fi
-mknod -m 666 /dev/dspW1 c 14 37
+mknod -m $AUDIOPERMS /dev/dspW1 c 14 37
 
 #
 #	SPARC compatible /dev/audio	(14, 4)	
@@ -190,7 +201,7 @@ fi
 if [ -e /dev/audio0 ]; then
 	rm -f /dev/audio0
 fi
-mknod -m 666 /dev/audio0 c 14 4
+mknod -m $AUDIOPERMS /dev/audio0 c 14 4
 ln -s /dev/audio0 /dev/audio
 
 #
@@ -201,7 +212,7 @@ ln -s /dev/audio0 /dev/audio
 if [ -e /dev/dsp1 ]; then
 	rm -f /dev/dsp1
 fi
-mknod -m 666 /dev/dsp1 c 14 19
+mknod -m $AUDIOPERMS /dev/dsp1 c 14 19
 #
 #	SPARC audio1	(14, 20) 
 #				/dev/audio for the second soundcard.
@@ -211,7 +222,7 @@ mknod -m 666 /dev/dsp1 c 14 19
 if [ -e /dev/audio1 ]; then
 	rm -f /dev/audio1
 fi
-mknod -m 666 /dev/audio1 c 14 20
+mknod -m $AUDIOPERMS /dev/audio1 c 14 20
 #
 #	/dev/sndstat	(14,6)	For debugging purposes
 #

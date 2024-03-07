@@ -22,6 +22,7 @@
 #ifndef _LINUX_IF_ARP_H
 #define _LINUX_IF_ARP_H
 
+#include <linux/netdevice.h>
 
 /* ARP protocol HARDWARE identifiers. */
 #define ARPHRD_NETROM	0		/* from KA9Q: NET/ROM pseudo	*/
@@ -34,6 +35,7 @@
 #define	ARPHRD_ARCNET	7		/* ARCnet			*/
 #define	ARPHRD_APPLETLK	8		/* APPLEtalk			*/
 #define ARPHRD_DLCI	15		/* Frame Relay DLCI		*/
+#define ARPHRD_METRICOM	23		/* Metricom STRIP (new IANA id)	*/
 
 /* Dummy types for non ARP hardware */
 #define ARPHRD_SLIP	256
@@ -50,7 +52,6 @@
 #define ARPHRD_SKIP	771		/* SKIP vif			*/
 #define ARPHRD_LOOPBACK	772		/* Loopback device		*/
 #define ARPHRD_LOCALTLK 773		/* Localtalk device		*/
-#define ARPHRD_METRICOM	774		/* Metricom STRIP		*/
 
 /* ARP protocol opcodes. */
 #define	ARPOP_REQUEST	1		/* ARP request			*/

@@ -18,8 +18,6 @@
 #include <linux/stat.h>
 #include <linux/mman.h>
 #include <linux/mm.h>
-#include <linux/pagemap.h>
-#include <linux/swap.h>
 #include <linux/fcntl.h>
 #include <linux/acct.h>
 #include <linux/tty.h>
@@ -304,7 +302,7 @@ int acct_process(long exitcode)
       ac.ac_uid   = current->uid;
       ac.ac_gid   = current->gid;
       ac.ac_tty   = (current)->tty == NULL ? -1 :
-	  MKDEV(4, current->tty->device);
+	  kdev_t_to_nr(current->tty->device);
       ac.ac_flag  = 0;
       if (current->flags & PF_FORKNOEXEC)
          ac.ac_flag |= AFORK;
@@ -550,70 +548,6 @@ asmlinkage long sys_times(struct tms * tbuf)
 	return jiffies;
 }
 
-asmlinkage unsigned long sys_brk(unsigned long brk)
-{
-	int freepages;
-	unsigned long rlim;
-	unsigned long newbrk, oldbrk;
-
-	if (brk < current->mm->end_code)
-		return current->mm->brk;
-	newbrk = PAGE_ALIGN(brk);
-	oldbrk = PAGE_ALIGN(current->mm->brk);
-	if (oldbrk == newbrk)
-		return current->mm->brk = brk;
-
-	/*
-	 * Always allow shrinking brk
-	 */
-	if (brk <= current->mm->brk) {
-		current->mm->brk = brk;
-		do_munmap(newbrk, oldbrk-newbrk);
-		return brk;
-	}
-	/*
-	 * Check against rlimit and stack..
-	 */
-	rlim = current->rlim[RLIMIT_DATA].rlim_cur;
-	if (rlim >= RLIM_INFINITY)
-		rlim = ~0;
-	if (brk - current->mm->end_code > rlim)
-		return current->mm->brk;
-	/*
-	 * Check against existing mmap mappings.
-	 */
-	if (find_vma_intersection(current, oldbrk, newbrk+PAGE_SIZE))
-		return current->mm->brk;
-	/*
-	 * stupid algorithm to decide if we have enough memory: while
-	 * simple, it hopefully works in most obvious cases.. Easy to
-	 * fool it, but this should catch most mistakes.
-	 */
-	freepages = buffermem >> PAGE_SHIFT;
-	freepages += page_cache_size;
-	freepages >>= 1;
-	freepages += nr_free_pages;
-	freepages += nr_swap_pages;
-	freepages -= MAP_NR(high_memory) >> 4;
-	freepages -= (newbrk-oldbrk) >> PAGE_SHIFT;
-	if (freepages < 0)
-		return current->mm->brk;
-#if 0
-	freepages += current->mm->rss;
-	freepages -= oldbrk >> 12;
-	if (freepages < 0)
-		return current->mm->brk;
-#endif
-	/*
-	 * Ok, we have probably got enough memory - let it rip.
-	 */
-	current->mm->brk = brk;
-	do_mmap(NULL, oldbrk, newbrk-oldbrk,
-		PROT_READ|PROT_WRITE|PROT_EXEC,
-		MAP_FIXED|MAP_PRIVATE, 0);
-	return brk;
-}
-
 /*
  * This needs some heavy checking ...
  * I just haven't the stomach for it. I also don't fully
@@ -700,8 +634,13 @@ asmlinkage int sys_getsid(pid_t pid)
 
 asmlinkage int sys_setsid(void)
 {
-	if (current->leader)
-		return -EPERM;
+	struct task_struct * p;
+
+	for_each_task(p) {
+		if (p->pgrp == current->pid)
+		        return -EPERM;
+	}
+
 	current->leader = 1;
 	current->session = current->pgrp = current->pid;
 	current->tty = NULL;
@@ -717,21 +656,29 @@ asmlinkage int sys_getgroups(int gidsetsize, gid_t *grouplist)
 	int i;
 	int * groups;
 
-	if (gidsetsize) {
-		i = verify_area(VERIFY_WRITE, grouplist, sizeof(gid_t) * gidsetsize);
-		if (i)
-			return i;
-	}
+	if (gidsetsize < 0)
+		return -EINVAL;
 	groups = current->groups;
-	for (i = 0 ; (i < NGROUPS) && (*groups != NOGROUP) ; i++, groups++) {
-		if (!gidsetsize)
-			continue;
-		if (i >= gidsetsize)
+	for (i = 0 ; i < NGROUPS ; i++) {
+		if (groups[i] == NOGROUP)
 			break;
-		put_user(*groups, grouplist);
-		grouplist++;
 	}
-	return(i);
+	if (gidsetsize) {
+		int error;
+		error = verify_area(VERIFY_WRITE, grouplist, sizeof(gid_t) * gidsetsize);
+		if (error)
+			return error;
+		if (i > gidsetsize)
+		        return -EINVAL;
+
+		for (i = 0 ; i < NGROUPS ; i++) {
+			if (groups[i] == NOGROUP)
+				break;
+			put_user(groups[i], grouplist);
+			grouplist++;
+		}
+	}
+	return i;
 }
 
 asmlinkage int sys_setgroups(int gidsetsize, gid_t *grouplist)

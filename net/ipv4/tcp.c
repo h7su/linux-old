@@ -200,7 +200,9 @@
  *					against machines running Solaris,
  *					and seems to result in general
  *					improvement.
- *
+ *	Stefan Magdalinski	:	adjusted tcp_readable() to fix FIONREAD
+ *	Willy Konynenberg	:	Transparent proxying support.
+ *					
  * To Fix:
  *		Fast path the code. Two things here - fix the window calculation
  *		so it doesn't iterate over the queue, also spot packets with no funny
@@ -510,7 +512,7 @@ void tcp_err(int type, int code, unsigned char *header, __u32 daddr,
 	struct iphdr *iph=(struct iphdr *)(header-sizeof(struct iphdr));
 #endif
 	th =(struct tcphdr *)header;
-	sk = get_sock(&tcp_prot, th->source, daddr, th->dest, saddr);
+	sk = get_sock(&tcp_prot, th->source, daddr, th->dest, saddr, 0, 0);
 
 	if (sk == NULL)
 		return;
@@ -519,11 +521,13 @@ void tcp_err(int type, int code, unsigned char *header, __u32 daddr,
 	{
 		/*
 		 * FIXME:
-		 * For now we will just trigger a linear backoff.
-		 * The slow start code should cause a real backoff here.
+		 * Follow BSD for now and just reduce cong_window to 1 again.
+		 * It is possible that we just want to reduce the
+		 * window by 1/2, or that we want to reduce ssthresh by 1/2
+		 * here as well.
 		 */
-		if (sk->cong_window > 4)
-			sk->cong_window--;
+		sk->cong_window = 1;
+		sk->high_seq = sk->sent_seq;
 		return;
 	}
 
@@ -547,8 +551,15 @@ void tcp_err(int type, int code, unsigned char *header, __u32 daddr,
 			if (rt->rt_mtu > new_mtu)
 				rt->rt_mtu = new_mtu;
 
+		/*
+		 *	FIXME::
+		 *	Not the nicest of fixes: Lose a MTU update if the socket is
+		 *	locked this instant. Not the right answer but will be best
+		 *	for the production fix. Make 2.1 work right!
+		 */
+		 
 		if (sk->mtu > new_mtu - sizeof(struct iphdr) - sizeof(struct tcphdr)
-			&& new_mtu > sizeof(struct iphdr)+sizeof(struct tcphdr))
+			&& new_mtu > sizeof(struct iphdr)+sizeof(struct tcphdr) && !sk->users)
 			sk->mtu = new_mtu - sizeof(struct iphdr) - sizeof(struct tcphdr);
 
 		return;
@@ -644,7 +655,7 @@ static int tcp_readable(struct sock *sk)
 		 */
 		if (skb->h.th->urg)
 			amount--;	/* don't count urg data */
-		if (amount && skb->h.th->psh) break;
+/*		if (amount && skb->h.th->psh) break;*/
 		skb = skb->next;
 	}
 	while(skb != (struct sk_buff *)&sk->receive_queue);
@@ -939,40 +950,44 @@ static int do_tcp_sendmsg(struct sock *sk,
 				return -EPIPE;
 			}
 
-		/*
-		 * The following code can result in copy <= if sk->mss is ever
-		 * decreased.  It shouldn't be.  sk->mss is min(sk->mtu, sk->max_window).
-		 * sk->mtu is constant once SYN processing is finished.  I.e. we
-		 * had better not get here until we've seen his SYN and at least one
-		 * valid ack.  (The SYN sets sk->mtu and the ack sets sk->max_window.)
-		 * But ESTABLISHED should guarantee that.  sk->max_window is by definition
-		 * non-decreasing.  Note that any ioctl to set user_mss must be done
-		 * before the exchange of SYN's.  If the initial ack from the other
-		 * end has a window of 0, max_window and thus mss will both be 0.
-		 */
+			/*
+			 * The following code can result in copy <= if sk->mss is ever
+			 * decreased.  It shouldn't be.  sk->mss is min(sk->mtu, sk->max_window).
+			 * sk->mtu is constant once SYN processing is finished.  I.e. we
+			 * had better not get here until we've seen his SYN and at least one
+			 * valid ack.  (The SYN sets sk->mtu and the ack sets sk->max_window.)
+			 * But ESTABLISHED should guarantee that.  sk->max_window is by definition
+			 * non-decreasing.  Note that any ioctl to set user_mss must be done
+			 * before the exchange of SYN's.  If the initial ack from the other
+			 * end has a window of 0, max_window and thus mss will both be 0.
+			 */
 
-		/*
-		 *	Now we need to check if we have a half built packet.
-		 */
+			/*
+			 *	Now we need to check if we have a half built packet.
+			 */
 #ifndef CONFIG_NO_PATH_MTU_DISCOVERY
-		/*
-		 *	FIXME:  I'm almost sure that this fragment is BUG,
-		 *		but it works... I do not know why 8) --ANK
-		 *
-		 *	Really, we should rebuild all the queues...
-		 *	It's difficult. Temporary hack is to send all
-		 *	queued segments with allowed fragmentation.
-		 */
-		{
-			int new_mss = min(sk->mtu, sk->max_window);
-			if (new_mss < sk->mss)
+			/*
+			 *	FIXME:  I'm almost sure that this fragment is BUG,
+			 *		but it works... I do not know why 8) --ANK
+			 *
+			 *	Really, we should rebuild all the queues...
+			 *	It's difficult. Temporary hack is to send all
+			 *	queued segments with allowed fragmentation.
+			 */
 			{
-				tcp_send_partial(sk);
-				sk->mss = new_mss;
+				int new_mss = min(sk->mtu, sk->max_window);
+				if (new_mss < sk->mss)
+				{
+					tcp_send_partial(sk);
+					sk->mss = new_mss;
+				}
 			}
-		}
 #endif
 
+			/*
+			 *	If there is a partly filled frame we can fill
+			 *	out.
+			 */
 			if ((skb = tcp_dequeue_partial(sk)) != NULL)
 			{
 				int tcp_size;
@@ -983,11 +998,33 @@ static int do_tcp_sendmsg(struct sock *sk,
 				if (!(flags & MSG_OOB))
 				{
 					copy = min(sk->mss - tcp_size, seglen);
+					
+					/*
+					 *	Now we may find the frame is as big, or too
+					 *	big for our MSS. Thats all fine. It means the
+					 *	MSS shrank (from an ICMP) after we allocated 
+					 *	this frame.
+					 */
+					 
 					if (copy <= 0)
 					{
-						printk("TCP: **bug**: \"copy\" <= 0\n");
-				  		return -EFAULT;
+						/*
+						 *	Send the now forced complete frame out. 
+						 *
+						 *	Note for 2.1: The MSS reduce code ought to
+						 *	flush any frames in partial that are now
+						 *	full sized. Not serious, potential tiny
+						 *	performance hit.
+						 */
+						tcp_send_skb(sk,skb);
+						/*
+						 *	Get a new buffer and try again.
+						 */
+						continue;
 					}
+					/*
+					 *	Otherwise continue to fill the buffer.
+					 */
 					tcp_size += copy;
 					memcpy_fromfs(skb_put(skb,copy), from, copy);
 					skb->csum = csum_partial(skb->tail - tcp_size, tcp_size, 0);
@@ -1023,7 +1060,7 @@ static int do_tcp_sendmsg(struct sock *sk,
 				copy = seglen;
 			if (copy <= 0)
 			{
-				printk("TCP: **bug**: copy=%d, sk->mss=%d\n", copy, sk->mss);
+				printk(KERN_CRIT "TCP: **bug**: copy=%d, sk->mss=%d\n", copy, sk->mss);
 		  		return -EFAULT;
 			}
 
@@ -1183,8 +1220,6 @@ out:
 
 /*
  *	Send an ack if one is backlogged at this point.
- *
- *	This is called for delayed acks also.
  */
 
 void tcp_read_wakeup(struct sock *sk)
@@ -1376,11 +1411,9 @@ static int tcp_recvmsg(struct sock *sk, struct msghdr *msg,
 
 		current->state = TASK_INTERRUPTIBLE;
 
-		skb = skb_peek(&sk->receive_queue);
-		do
+		skb = sk->receive_queue.next;
+		while (skb != (struct sk_buff *)&sk->receive_queue)
 		{
-			if (!skb)
-				break;
 			if (before(*seq, skb->seq))
 				break;
 			offset = *seq - skb->seq;
@@ -1394,7 +1427,6 @@ static int tcp_recvmsg(struct sock *sk, struct msghdr *msg,
 				skb->used = 1;
 			skb = skb->next;
 		}
-		while (skb != (struct sk_buff *)&sk->receive_queue);
 
 		if (copied)
 			break;
@@ -1762,6 +1794,19 @@ static void tcp_close(struct sock *sk, unsigned long timeout)
 	 * free'ing up the memory.
 	 */
 	tcp_cache_zap();	/* Kill the cache again. */
+
+	/* Now that the socket is dead, if we are in the FIN_WAIT2 state
+	 * we may need to set up a timer.
+         */
+	if (sk->state==TCP_FIN_WAIT2)
+	{
+		int timer_active=del_timer(&sk->timer);
+		if(timer_active)
+			add_timer(&sk->timer);
+		else
+			tcp_reset_msl_timer(sk, TIME_CLOSE, TCP_FIN_TIMEOUT);
+	}
+
 	release_sock(sk);
 	sk->dead = 1;
 }
@@ -1999,10 +2044,7 @@ static int tcp_connect(struct sock *sk, struct sockaddr_in *usin, int addr_len)
 	sk->delack_timer.data = (unsigned long) sk;
 	sk->retransmit_timer.function = tcp_retransmit_timer;
 	sk->retransmit_timer.data = (unsigned long)sk;
-	tcp_reset_xmit_timer(sk, TIME_WRITE, sk->rto);	/* Timer for repeating the SYN until an answer  */
-	sk->retransmits = 0;				/* Now works the right way instead of a hacked
-											initial setting */
-
+	sk->retransmits = 0;
 	sk->prot->queue_xmit(sk, dev, buff, 0);
 	tcp_reset_xmit_timer(sk, TIME_WRITE, sk->rto);
 	tcp_statistics.TcpActiveOpens++;

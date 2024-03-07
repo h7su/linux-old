@@ -11,6 +11,14 @@
  *        PCBIT-D interface with isdn4linux
  */
 
+/*
+ *	Fixes:
+ *
+ *	Nuno Grilo	<l38486@alfa.ist.utl.pt>
+ *      fixed msn_list NULL pointer dereference.
+ *		
+ */
+
 #define __NO_VERSION__
 
 #include <linux/module.h>
@@ -52,9 +60,9 @@ static char* pcbit_devname[MAX_PCBIT_CARDS] = {
  */
 
 int pcbit_command(isdn_ctrl* ctl);
-int pcbit_stat(u_char* buf, int len, int user);
+int pcbit_stat(u_char* buf, int len, int user, int, int);
 int pcbit_xmit(int driver, int chan, struct sk_buff *skb);
-int pcbit_writecmd(const u_char*, int, int);
+int pcbit_writecmd(const u_char*, int, int, int, int);
 
 static int set_protocol_running(struct pcbit_dev * dev);
 
@@ -109,7 +117,7 @@ int pcbit_init_dev(int board, int mem_base, int irq)
 	dev->b2->id = 1;
 
 
-	dev->qdelivery.next = 0;
+	dev->qdelivery.next = NULL;
 	dev->qdelivery.sync = 0;
 	dev->qdelivery.routine = pcbit_deliver;
 	dev->qdelivery.data = dev;
@@ -152,8 +160,8 @@ int pcbit_init_dev(int board, int mem_base, int irq)
 	dev_if->channels = 2;
 
 
-	dev_if->features = ISDN_FEATURE_P_EURO | ISDN_FEATURE_L3_TRANS | 
-		ISDN_FEATURE_L2_HDLC;
+	dev_if->features = (ISDN_FEATURE_P_EURO  | ISDN_FEATURE_L3_TRANS | 
+			    ISDN_FEATURE_L2_HDLC | ISDN_FEATURE_L2_TRANS );
 
 	dev_if->writebuf_skb = pcbit_xmit;
 	dev_if->writebuf  = NULL;
@@ -390,19 +398,16 @@ int pcbit_xmit(int driver, int chnum, struct sk_buff *skb)
 }
 
 
-int pcbit_writecmd(const u_char* buf, int len, int user)
+int pcbit_writecmd(const u_char* buf, int len, int user, int driver, int channel)
 {
 	struct pcbit_dev * dev;
-	int board, i, j;
+	int i, j;
 	const u_char * loadbuf;
 	u_char * ptr = NULL;
 
 	int errstat;
 
-	/* we should have the driver id as input here too - let's say it's 0 */
-	board = 0;
-
-	dev = dev_pcbit[board];
+	dev = finddev(driver);
 
 	if (!dev)
 	{
@@ -760,7 +765,7 @@ static int stat_end = 0;
 (flag ? memcpy_tofs(d, s, len) : memcpy(d, s, len))
 
 
-int pcbit_stat(u_char* buf, int len, int user)
+int pcbit_stat(u_char* buf, int len, int user, int driver, int channel)
 {
 	int stat_count;
 	stat_count = stat_end - stat_st;
@@ -1054,7 +1059,8 @@ static void pcbit_clear_msn(struct pcbit_dev *dev)
 
 static void pcbit_set_msn(struct pcbit_dev *dev, char *list)
 {
-	struct msn_entry *ptr, *back;
+	struct msn_entry *ptr;
+	struct msn_entry *back = NULL;
 	char *cp, *sp;
 	int len;
 
@@ -1073,7 +1079,8 @@ static void pcbit_set_msn(struct pcbit_dev *dev, char *list)
 		return;
 	}
 
-	for (back=dev->msn_list; back->next; back=back->next);
+	if (dev->msn_list)
+		for (back=dev->msn_list; back->next; back=back->next);
 	
 	sp = list;
 
@@ -1131,10 +1138,3 @@ static int pcbit_check_msn(struct pcbit_dev *dev, char *msn)
 
 	return 0;
 }
-
-
-
-
-
-
-

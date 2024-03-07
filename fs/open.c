@@ -53,6 +53,8 @@ asmlinkage int sys_fstatfs(unsigned int fd, struct statfs * buf)
 		return -EBADF;
 	if (!(inode = file->f_inode))
 		return -ENOENT;
+	if (!inode->i_sb)
+	        return -ENODEV;
 	if (!inode->i_sb->s_op->statfs)
 		return -ENOSYS;
 	inode->i_sb->s_op->statfs(inode->i_sb, buf, sizeof(struct statfs));
@@ -86,34 +88,37 @@ asmlinkage int sys_truncate(const char * path, unsigned long length)
 	error = namei(path,&inode);
 	if (error)
 		return error;
-	if (S_ISDIR(inode->i_mode)) {
-		iput(inode);
-		return -EACCES;
-	}
-	if ((error = permission(inode,MAY_WRITE)) != 0) {
-		iput(inode);
-		return error;
-	}
-	if (IS_RDONLY(inode)) {
-		iput(inode);
-		return -EROFS;
-	}
-	if (IS_IMMUTABLE(inode) || IS_APPEND(inode)) {
-		iput(inode);
-		return -EPERM;
-	}
+
+	error = -EACCES;
+	if (S_ISDIR(inode->i_mode))
+		goto out;
+
+	error = permission(inode,MAY_WRITE);
+	if (error)
+		goto out;
+
+	error = -EROFS;
+	if (IS_RDONLY(inode))
+		goto out;
+
+	error = -EPERM;
+	if (IS_IMMUTABLE(inode) || IS_APPEND(inode))
+		goto out;
+
 	error = get_write_access(inode);
-	if (error) {
-		iput(inode);
-		return error;
-	}
+	if (error)
+		goto out;
+
 	error = locks_verify_area(FLOCK_VERIFY_WRITE, inode, NULL,
 				  length < inode->i_size ? length : inode->i_size,
 				  abs(inode->i_size - length));
-	if (error)
-		return error;
-	error = do_truncate(inode, length);
+	if (!error) {
+		if (inode->i_sb && inode->i_sb->dq_op)
+			inode->i_sb->dq_op->initialize(inode, -1);
+		error = do_truncate(inode, length);
+	}
 	put_write_access(inode);
+out:
 	iput(inode);
 	return error;
 }
@@ -135,9 +140,9 @@ asmlinkage int sys_ftruncate(unsigned int fd, unsigned long length)
 	error = locks_verify_area(FLOCK_VERIFY_WRITE, inode, file,
 				  length < inode->i_size ? length : inode->i_size,
 				  abs(inode->i_size - length));
-	if (error)
-		return error;
-	return do_truncate(inode, length);
+	if (!error)
+		error = do_truncate(inode, length);
+	return error;
 }
 
 #ifndef __alpha__
@@ -394,7 +399,7 @@ asmlinkage int sys_fchown(unsigned int fd, uid_t user, gid_t group)
 	/*
 	 * If the owner has been changed, remove the setuid bit
 	 */
-	if (user != inode->i_uid && (inode->i_mode & S_ISUID)) {
+	if (inode->i_mode & S_ISUID) {
 		newattrs.ia_mode &= ~S_ISUID;
 		newattrs.ia_valid |= ATTR_MODE;
 	}
@@ -404,8 +409,7 @@ asmlinkage int sys_fchown(unsigned int fd, uid_t user, gid_t group)
 	 * Don't remove the setgid bit if no group execute bit.
 	 * This is a file marked for mandatory locking.
 	 */
-	if (group != inode->i_gid &&
-	    ((inode->i_mode & (S_ISGID | S_IXGRP)) == (S_ISGID | S_IXGRP))) {
+	if (((inode->i_mode & (S_ISGID | S_IXGRP)) == (S_ISGID | S_IXGRP))) {
 		newattrs.ia_mode &= ~S_ISGID;
 		newattrs.ia_valid |= ATTR_MODE;
 	}
@@ -450,7 +454,7 @@ asmlinkage int sys_chown(const char * filename, uid_t user, gid_t group)
 	/*
 	 * If the owner has been changed, remove the setuid bit
 	 */
-	if (user != inode->i_uid && (inode->i_mode & S_ISUID)) {
+	if (inode->i_mode & S_ISUID) {
 		newattrs.ia_mode &= ~S_ISUID;
 		newattrs.ia_valid |= ATTR_MODE;
 	}
@@ -460,8 +464,7 @@ asmlinkage int sys_chown(const char * filename, uid_t user, gid_t group)
 	 * Don't remove the setgid bit if no group execute bit.
 	 * This is a file marked for mandatory locking.
 	 */
-	if (group != inode->i_gid &&
-	    ((inode->i_mode & (S_ISGID | S_IXGRP)) == (S_ISGID | S_IXGRP))) {
+	if (((inode->i_mode & (S_ISGID | S_IXGRP)) == (S_ISGID | S_IXGRP))) {
 		newattrs.ia_mode &= ~S_ISGID;
 		newattrs.ia_valid |= ATTR_MODE;
 	}
@@ -506,7 +509,7 @@ int do_open(const char * filename,int flags,int mode)
 	f->f_mode = (flag+1) & O_ACCMODE;
 	if (f->f_mode)
 		flag++;
-	if (flag & (O_TRUNC | O_CREAT))
+	if (flag & O_TRUNC)
 		flag |= 2;
 	error = open_namei(filename,flag,mode,&inode,NULL);
 	if (error)

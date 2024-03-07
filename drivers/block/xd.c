@@ -22,7 +22,7 @@
  *
  */
 
-
+#include <linux/module.h>
 #include <linux/errno.h>
 #include <linux/sched.h>
 #include <linux/mm.h>
@@ -211,7 +211,7 @@ static int xd_open (struct inode *inode,struct file *file)
 		return (0);
 	}
 	else
-		return (-ENODEV);
+		return -ENXIO;
 }
 
 /* do_xd_request: handle an incoming request */

@@ -11,7 +11,7 @@
   Copyright 1992 - 1996 Kai Makisara
 		 email Kai.Makisara@metla.fi
 
-  Last modified: Thu May  2 19:41:34 1996 by makisara@kai.makisara.fi
+  Last modified: Sun Jun 30 15:26:23 1996 by root@kai.makisara.fi
   Some small formal changes - aeb, 950809
 */
 
@@ -143,6 +143,8 @@ st_chk_result(Scsi_Cmnd * SCpnt)
   }
 #endif
   scode = sense[2] & 0x0f;
+
+#if !DEBUG
   if (!(driver_byte(result) & DRIVER_SENSE) ||
       ((sense[0] & 0x70) == 0x70 &&
        scode != NO_SENSE &&
@@ -152,15 +154,14 @@ st_chk_result(Scsi_Cmnd * SCpnt)
        scode != VOLUME_OVERFLOW &&
        SCpnt->data_cmnd[0] != MODE_SENSE &&
        SCpnt->data_cmnd[0] != TEST_UNIT_READY)) { /* Abnormal conditions for tape */
-#if !DEBUG
     if (driver_byte(result) & DRIVER_SENSE) {
       printk(KERN_WARNING "st%d: Error with sense data: ", dev);
       print_sense("st", SCpnt);
     }
     else
       printk(KERN_WARNING "st%d: Error %x.\n", dev, result);
-#endif
   }
+#endif
 
   if ((sense[0] & 0x70) == 0x70 &&
       scode == RECOVERED_ERROR
@@ -172,7 +173,7 @@ st_chk_result(Scsi_Cmnd * SCpnt)
     scsi_tapes[dev].recover_count++;
     scsi_tapes[dev].mt_status->mt_erreg += (1 << MT_ST_SOFTERR_SHIFT);
 #if DEBUG
-    if (debugging) {  /* This is compiled always on purpose */
+    if (debugging) {
       if (SCpnt->data_cmnd[0] == READ_6)
 	stp = "read";
       else if (SCpnt->data_cmnd[0] == WRITE_6)
@@ -380,16 +381,17 @@ flush_write_buffer(Scsi_Tape *STp)
       return (-EBUSY);
 
     if ((STp->buffer)->last_result_fatal != 0) {
-      printk(KERN_ERR "st%d: Error on flush.\n", TAPE_NR(STp->devt));
       if ((SCpnt->sense_buffer[0] & 0x70) == 0x70 &&
 	  (SCpnt->sense_buffer[2] & 0x40) &&
-	  (SCpnt->sense_buffer[2] & 0x0f) != VOLUME_OVERFLOW) {
+	  (SCpnt->sense_buffer[2] & 0x0f) == NO_SENSE) {
 	STp->dirty = 0;
 	(STp->buffer)->buffer_bytes = 0;
 	result = (-ENOSPC);
       }
-      else
+      else {
+	printk(KERN_ERR "st%d: Error on flush.\n", TAPE_NR(STp->devt));
 	result = (-EIO);
+      }
       STp->drv_block = (-1);
     }
     else {
@@ -455,7 +457,8 @@ flush_buffer(struct inode * inode, struct file * filp, int seek_next)
       result = st_int_ioctl(inode, MTBSR, backspace);
   }
   else if ((STp->eof == ST_FM) && !STp->eof_hit) {
-    (STp->mt_status)->mt_fileno++;
+    if ((STp->mt_status)->mt_fileno >= 0)
+      (STp->mt_status)->mt_fileno++;
     STp->drv_block = 0;
   }
 
@@ -530,8 +533,6 @@ scsi_tape_open(struct inode * inode, struct file * filp)
 	printk(ST_DEB_MSG "st%d: Mode change from %d to %d.\n",
 	       dev, STp->current_mode, mode);
 #endif
-      /*      if (!STp->modes[mode].defined)
-	return (-ENXIO); */
       new_session = TRUE;
       STp->current_mode = mode;
     }
@@ -570,12 +571,20 @@ scsi_tape_open(struct inode * inode, struct file * filp)
     STp->nbr_waits = STp->nbr_finished = 0;
 #endif
 
+    if (scsi_tapes[dev].device->host->hostt->usage_count)
+	(*scsi_tapes[dev].device->host->hostt->usage_count)++;
+    if(st_template.usage_count) (*st_template.usage_count)++;
+
     memset ((void *) &cmd[0], 0, 10);
     cmd[0] = TEST_UNIT_READY;
 
     SCpnt = st_do_scsi(NULL, STp, cmd, 0, ST_LONG_TIMEOUT, MAX_READY_RETRIES);
-    if (!SCpnt)
+    if (!SCpnt) {
+      if (scsi_tapes[dev].device->host->hostt->usage_count)
+	  (*scsi_tapes[dev].device->host->hostt->usage_count)--;
+      if(st_template.usage_count) (*st_template.usage_count)--;
       return (-EBUSY);
+    }
 
     if ((SCpnt->sense_buffer[0] & 0x70) == 0x70 &&
 	(SCpnt->sense_buffer[2] & 0x0f) == UNIT_ATTENTION) { /* New media? */
@@ -619,9 +628,6 @@ scsi_tape_open(struct inode * inode, struct file * filp)
       STp->partition = STp->new_partition = 0;
       STp->door_locked = ST_UNLOCKED;
       STp->in_use = 1;
-      if (scsi_tapes[dev].device->host->hostt->usage_count)
-	(*scsi_tapes[dev].device->host->hostt->usage_count)++;
-      if(st_template.usage_count) (*st_template.usage_count)++;
       return 0;
     }
 
@@ -698,6 +704,9 @@ scsi_tape_open(struct inode * inode, struct file * filp)
 	       STp->block_size);
 	(STp->buffer)->in_use = 0;
 	STp->buffer = NULL;
+	if (scsi_tapes[dev].device->host->hostt->usage_count)
+	    (*scsi_tapes[dev].device->host->hostt->usage_count)--;
+	if(st_template.usage_count) (*st_template.usage_count)--;
 	return (-EIO);
       }
       STp->drv_write_prot = ((STp->buffer)->b_data[2] & 0x80) != 0;
@@ -726,6 +735,9 @@ scsi_tape_open(struct inode * inode, struct file * filp)
       if ((flags & O_ACCMODE) == O_WRONLY || (flags & O_ACCMODE) == O_RDWR) {
 	(STp->buffer)->in_use = 0;
 	STp->buffer = NULL;
+	if (scsi_tapes[dev].device->host->hostt->usage_count)
+	    (*scsi_tapes[dev].device->host->hostt->usage_count)--;
+	if(st_template.usage_count) (*st_template.usage_count)--;
 	return (-EROFS);
       }
     }
@@ -741,6 +753,9 @@ scsi_tape_open(struct inode * inode, struct file * filp)
       if ((STp->partition = find_partition(inode)) < 0) {
 	(STp->buffer)->in_use = 0;
 	STp->buffer = NULL;
+	if (scsi_tapes[dev].device->host->hostt->usage_count)
+	    (*scsi_tapes[dev].device->host->hostt->usage_count)--;
+	if(st_template.usage_count) (*st_template.usage_count)--;
 	return STp->partition;
       }
       STp->new_partition = STp->partition;
@@ -754,6 +769,9 @@ scsi_tape_open(struct inode * inode, struct file * filp)
 	  (i = set_mode_densblk(inode, STp, STm)) < 0) {
 	(STp->buffer)->in_use = 0;
 	STp->buffer = NULL;
+	if (scsi_tapes[dev].device->host->hostt->usage_count)
+	    (*scsi_tapes[dev].device->host->hostt->usage_count)--;
+	if(st_template.usage_count) (*st_template.usage_count)--;
 	return i;
       }
       if (STp->default_drvbuffer != 0xff) {
@@ -764,9 +782,6 @@ scsi_tape_open(struct inode * inode, struct file * filp)
     }
 
     STp->in_use = 1;
-    if (scsi_tapes[dev].device->host->hostt->usage_count)
-      (*scsi_tapes[dev].device->host->hostt->usage_count)++;
-    if(st_template.usage_count) (*st_template.usage_count)++;
 
     return 0;
 }
@@ -820,7 +835,13 @@ scsi_tape_close(struct inode * inode, struct file * filp)
 
 	SCpnt->request.rq_status = RQ_INACTIVE;  /* Mark as not busy */
 
-	if ((STp->buffer)->last_result_fatal != 0)
+	if ((STp->buffer)->last_result_fatal != 0 &&
+	    ((SCpnt->sense_buffer[0] & 0x70) != 0x70 ||
+	     (SCpnt->sense_buffer[2] & 0x4f) != 0x40 ||
+	     ((SCpnt->sense_buffer[0] & 0x80) != 0 &&
+	      (SCpnt->sense_buffer[3] | SCpnt->sense_buffer[4] |
+	       SCpnt->sense_buffer[5] |
+	       SCpnt->sense_buffer[6]) == 0)))  /* Filter out successful write at EOM */
 	  printk(KERN_ERR "st%d: Error on write filemark.\n", dev);
 	else {
 	  if ((STp->mt_status)->mt_fileno >= 0)
@@ -1254,6 +1275,9 @@ st_read(struct inode * inode, struct file * filp, char * buf, int count)
 #endif
 	  if ((SCpnt->sense_buffer[0] & 0x70) == 0x70) { /* extended sense */
 
+	    if ((SCpnt->sense_buffer[2] & 0x0f) == BLANK_CHECK)
+		SCpnt->sense_buffer[2] &= 0xcf; /* No need for EOM in this case */
+
 	    if ((SCpnt->sense_buffer[2] & 0xe0) != 0) { /* EOF, EOM, or ILI */
 
 	      if ((SCpnt->sense_buffer[0] & 0x80) != 0)
@@ -1297,20 +1321,7 @@ st_read(struct inode * inode, struct file * filp, char * buf, int count)
 		  SCpnt = NULL;
 		}
 	      }
-	      else if (SCpnt->sense_buffer[2] & 0x40) {
-		STp->eof = ST_EOM_OK;
-		if (STp->block_size == 0)
-		  (STp->buffer)->buffer_bytes = bytes - transfer;
-		else
-		  (STp->buffer)->buffer_bytes =
-		    bytes - transfer * STp->block_size;
-#if DEBUG
-		if (debugging)
-		  printk(ST_DEB_MSG "st%d: EOM detected (%d bytes read).\n", dev,
-			 (STp->buffer)->buffer_bytes);
-#endif
-	      }
-	      else if (SCpnt->sense_buffer[2] & 0x80) {
+	      else if (SCpnt->sense_buffer[2] & 0x80) { /* FM overrides EOM */
 		STp->eof = ST_FM;
 		if (STp->block_size == 0)
 		  (STp->buffer)->buffer_bytes = 0;
@@ -1322,6 +1333,19 @@ st_read(struct inode * inode, struct file * filp, char * buf, int count)
 		  printk(ST_DEB_MSG
 		    "st%d: EOF detected (%d bytes read, transferred %d bytes).\n",
 			 dev, (STp->buffer)->buffer_bytes, total);
+#endif
+	      }
+	      else if (SCpnt->sense_buffer[2] & 0x40) {
+		STp->eof = ST_EOM_OK;
+		if (STp->block_size == 0)
+		  (STp->buffer)->buffer_bytes = bytes - transfer;
+		else
+		  (STp->buffer)->buffer_bytes =
+		    bytes - transfer * STp->block_size;
+#if DEBUG
+		if (debugging)
+		  printk(ST_DEB_MSG "st%d: EOM detected (%d bytes read).\n", dev,
+			 (STp->buffer)->buffer_bytes);
 #endif
 	      }
 	    } /* end of EOF, EOM, ILI test */
@@ -1397,7 +1421,7 @@ st_read(struct inode * inode, struct file * filp, char * buf, int count)
 	    (STp->mt_status)->mt_fileno++;
 	}
 	if (total == 0 && STp->eof == ST_EOM_OK)
-	  return (-EIO);  /* ST_EOM_ERROR not used in read */
+	  return (-ENOSPC);  /* ST_EOM_ERROR not used in read */
 	return total;
       }
 
@@ -1665,7 +1689,7 @@ st_compression(Scsi_Tape * STp, int state)
 
   SCpnt->request.rq_status = RQ_INACTIVE;  /* Mark as not busy */
   STp->compression_changed = TRUE;
-  return 0;  /* Not implemented yet */
+  return 0;
 }
 
 
@@ -2073,7 +2097,16 @@ st_int_ioctl(struct inode * inode,
 	  (SCpnt->sense_buffer[4] << 16) +
 	  (SCpnt->sense_buffer[5] << 8) +
 	  SCpnt->sense_buffer[6] );
-     if ( (cmd_in == MTFSF) || (cmd_in == MTFSFM) ) {
+     if (cmd_in == MTWEOF &&
+       (SCpnt->sense_buffer[0] & 0x70) == 0x70 &&
+       (SCpnt->sense_buffer[2] & 0x4f) == 0x40 &&
+       ((SCpnt->sense_buffer[0] & 0x80) == 0 || undone == 0)) {
+       ioctl_result = 0;  /* EOF written succesfully at EOM */
+       if (fileno >= 0)
+	 fileno++;
+       (STp->mt_status)->mt_fileno = fileno;
+     }
+     else if ( (cmd_in == MTFSF) || (cmd_in == MTFSFM) ) {
        if (fileno >= 0)
 	 (STp->mt_status)->mt_fileno = fileno - undone ;
        else
@@ -2506,11 +2539,13 @@ st_ioctl(struct inode * inode,struct file * file,
        if (STp->eof_hit) {
 	 if (mtc.mt_op == MTFSF || mtc.mt_op == MTEOM) {
 	   mtc.mt_count -= 1;
-	   (STp->mt_status)->mt_fileno += 1;
+	   if ((STp->mt_status)->mt_fileno >= 0)
+	     (STp->mt_status)->mt_fileno += 1;
 	 }
 	 else if (mtc.mt_op == MTBSF) {
 	   mtc.mt_count += 1;
-	   (STp->mt_status)->mt_fileno += 1;
+	   if ((STp->mt_status)->mt_fileno >= 0)
+	     (STp->mt_status)->mt_fileno += 1;
 	 }
        }
 
@@ -2658,6 +2693,9 @@ st_ioctl(struct inode * inode,struct file * file,
        (STp->mt_status)->mt_gstat |= GMT_DR_OPEN(0xffffffff);
      if (STps->at_sm)
        (STp->mt_status)->mt_gstat |= GMT_SM(0xffffffff);
+     if (STm->do_async_writes || (STm->do_buffer_writes && STp->block_size != 0) ||
+	 STp->drv_buffer != 0)
+       (STp->mt_status)->mt_gstat |= GMT_IM_REP_EN(0xffffffff);
 
      memcpy_tofs((char *)arg, (char *)(STp->mt_status),
 		 sizeof(struct mtget));
@@ -3050,5 +3088,6 @@ void cleanup_module( void)
     }
   }
   st_template.dev_max = 0;
+  printk(KERN_INFO "st: Unloaded.\n");
 }
 #endif /* MODULE */

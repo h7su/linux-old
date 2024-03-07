@@ -38,18 +38,20 @@
 #include <linux/config.h>
 #include <linux/module.h>
 
-#include <asm/system.h>
 #include <linux/sched.h>
 #include <linux/timer.h>
 #include <linux/string.h>
 #include <linux/malloc.h>
-#include <asm/irq.h>
-#include <asm/dma.h>
 #include <linux/ioport.h>
 #include <linux/kernel.h>
-#include<linux/stat.h>
-
+#include <linux/stat.h>
 #include <linux/blk.h>
+#include <linux/interrupt.h>
+
+#include <asm/system.h>
+#include <asm/irq.h>
+#include <asm/dma.h>
+
 #include "scsi.h"
 #include "hosts.h"
 #include "constants.h"
@@ -149,6 +151,7 @@ Scsi_Cmnd * last_cmnd = NULL;
 /* This is the pointer to the /proc/scsi code. 
  * It is only initialized to !=0 if the scsi code is present 
  */ 
+#if CONFIG_PROC_FS 
 extern int (* dispatch_scsi_info_ptr)(int ino, char *buffer, char **start, 
 				      off_t offset, int length, int inout); 
 extern int dispatch_scsi_info(int ino, char *buffer, char **start, 
@@ -161,6 +164,7 @@ struct proc_dir_entry proc_scsi_scsi = {
     NULL, NULL,
     NULL, NULL, NULL
 };
+#endif
 
 /*
  *  As the scsi do command functions are intelligent, and may need to
@@ -201,14 +205,14 @@ static void scsi_dump_status(void);
     #define ABORT_TIMEOUT SCSI_TIMEOUT
     #define RESET_TIMEOUT SCSI_TIMEOUT
 #else
-    #define SENSE_TIMEOUT (1*HZ)
-    #define RESET_TIMEOUT (5*HZ)
-    #define ABORT_TIMEOUT (5*HZ)
+    #define SENSE_TIMEOUT (5*HZ/10)
+    #define RESET_TIMEOUT (5*HZ/10)
+    #define ABORT_TIMEOUT (5*HZ/10)
 #endif
 
-#define MIN_RESET_DELAY (3*HZ)
+#define MIN_RESET_DELAY (2*HZ)
 
-/* Do not call reset on error if we just did a reset within 10 sec. */
+/* Do not call reset on error if we just did a reset within 15 sec. */
 #define MIN_RESET_PERIOD (15*HZ)
 
 /* The following devices are known not to tolerate a lun != 0 scan for
@@ -580,7 +584,7 @@ int scan_scsis_single (int channel, int dev, int lun, int *max_dev_lun,
   printk("\n");
 #endif
 
-if (host_byte(SCpnt->result) != DID_OK) {
+  if (SCpnt->result) {
     if (((driver_byte (SCpnt->result) & DRIVER_SENSE) ||
          (status_byte (SCpnt->result) & CHECK_CONDITION)) &&
         ((SCpnt->sense_buffer[0] & 0x70) >> 4) == 7) {
@@ -1180,27 +1184,38 @@ Scsi_Cmnd * allocate_device (struct request ** reqp, Scsi_Device * device,
 
 inline void internal_cmnd (Scsi_Cmnd * SCpnt)
 {
-    int temp;
+    unsigned long flags, timeout;
     struct Scsi_Host * host;
-    unsigned int flags;
 #ifdef DEBUG_DELAY
-    int clock;
+    unsigned long clock;
 #endif
     
     host = SCpnt->host;
     
-    /*
-     * We will wait MIN_RESET_DELAY clock ticks after the last reset so
-     * we can avoid the drive not being ready.
-     */
     save_flags(flags);
     cli();
     /* Assign a unique nonzero serial_number. */
     if (++serial_number == 0) serial_number = 1;
     SCpnt->serial_number = serial_number;
-    sti();
-    temp = host->last_reset + MIN_RESET_DELAY;
-    while (jiffies < temp);
+
+    /*
+     * We will wait MIN_RESET_DELAY clock ticks after the last reset so
+     * we can avoid the drive not being ready.
+     */
+    timeout = host->last_reset + MIN_RESET_DELAY;
+    if (jiffies < timeout) {
+        /*
+         * NOTE: This may be executed from within an interrupt
+         * handler!  This is bad, but for now, it'll do.  The irq
+         * level of the interrupt handler has been masked out by the
+         * platform dependent interrupt handling code already, so the
+         * sti() here will not cause another call to the SCSI host's
+         * interrupt handler (assuming there is one irq-level per
+         * host).
+         */
+        sti();
+        while (jiffies < timeout) barrier();
+    }
     restore_flags(flags);
     
     update_timeout(SCpnt, SCpnt->timeout_per_command);
@@ -1241,15 +1256,16 @@ inline void internal_cmnd (Scsi_Cmnd * SCpnt)
     }
     else
     {
-	
+	int temp;
+
 #ifdef DEBUG
 	printk("command() :  routine at %p\n", host->hostt->command);
 #endif
-	temp=host->hostt->command (SCpnt);
+	temp = host->hostt->command (SCpnt);
 	SCpnt->result = temp;
 #ifdef DEBUG_DELAY
 	clock = jiffies + 4 * HZ;
-	while (jiffies < clock);
+	while (jiffies < clock) barrier();
 	printk("done(host = %d, result = %04x) : routine at %p\n", 
 	       host->host_no, temp, host->hostt->command);
 #endif
@@ -1569,9 +1585,15 @@ static void scsi_done (Scsi_Cmnd * SCpnt)
 		    case SUGGEST_IS_OK:
 			break;
 		    case SUGGEST_REMAP:
+#ifdef DEBUG
+			printk("SENSE SUGGEST REMAP - status = FINISHED\n");
+#endif
+			status = FINISHED;
+			exit = DRIVER_SENSE | SUGGEST_ABORT;
+			break;
 		    case SUGGEST_RETRY:
 #ifdef DEBUG
-			printk("SENSE SUGGEST REMAP or SUGGEST RETRY - status = MAYREDO\n");
+			printk("SENSE SUGGEST RETRY - status = MAYREDO\n");
 #endif
 			status = MAYREDO;
 			exit = DRIVER_SENSE | SUGGEST_RETRY;
@@ -1606,6 +1628,9 @@ static void scsi_done (Scsi_Cmnd * SCpnt)
 		    status = REDO;
 		    break;
 		case SUGGEST_REMAP:
+		    status = FINISHED;
+		    exit =  DRIVER_SENSE | SUGGEST_ABORT;
+		    break;
 		case SUGGEST_RETRY:
 		    status = MAYREDO;
 		    exit = DRIVER_SENSE | SUGGEST_RETRY;
@@ -2042,10 +2067,11 @@ int scsi_reset (Scsi_Cmnd * SCpnt, unsigned int reset_flags)
 	 * Protect against races here.  If the command is done, or we are
 	 * on a different command forget it.
 	 */
-	if (SCpnt->serial_number != SCpnt->serial_number_at_timeout) {
+	if (reset_flags & SCSI_RESET_ASYNCHRONOUS)
+	  if (SCpnt->serial_number != SCpnt->serial_number_at_timeout) {
 	    restore_flags(flags);
 	    return 0;
-	}
+	  }
 
 	if (SCpnt->internal_timeout & IN_RESET)
 	{
@@ -2255,15 +2281,16 @@ static int update_timeout(Scsi_Cmnd * SCset, int timeout)
      * it is called twice per SCSI operation: once when internal_cmnd is
      * called, and again when scsi_done completes the command.  To limit
      * the load this routine can cause, we shortcut processing if no clock
-     * ticks have occurred since the last time it was called.  This may
-     * cause the computation of least below to be inaccurate, but it will
-     * be corrected after the next clock tick.
+     * ticks have occurred since the last time it was called.
      */
 
     if (jiffies == time_start && timer_table[SCSI_TIMER].expires > 0) {
 	if(SCset){
 	    oldto = SCset->timeout;
 	    SCset->timeout = timeout;
+	    if (timeout > 0 &&
+		jiffies + timeout < timer_table[SCSI_TIMER].expires)
+		    timer_table[SCSI_TIMER].expires = jiffies + timeout;
 	}
 	restore_flags(flags);
 	return oldto;
@@ -2491,7 +2518,9 @@ int scsi_dev_init(void)
 #endif
 
     /* Yes we're here... */
+#if CONFIG_PROC_FS 
     dispatch_scsi_info_ptr = dispatch_scsi_info;
+#endif
 
     /* Init a few things so we can "malloc" memory. */
     scsi_loadable_module_flag = 0;
@@ -3379,7 +3408,9 @@ int init_module(void) {
     /*
      * This makes /proc/scsi visible.
      */
+#if CONFIG_PROC_FS
     dispatch_scsi_info_ptr = dispatch_scsi_info;
+#endif
 
     timer_table[SCSI_TIMER].fn = scsi_main_timeout;
     timer_table[SCSI_TIMER].expires = 0;
@@ -3416,10 +3447,10 @@ void cleanup_module( void)
 {
 #if CONFIG_PROC_FS
     proc_scsi_unregister(0, PROC_SCSI_SCSI);
-#endif
 
     /* No, we're not here anymore. Don't show the /proc/scsi files. */
     dispatch_scsi_info_ptr = 0L;
+#endif
 
     /*
      * Free up the DMA pool.

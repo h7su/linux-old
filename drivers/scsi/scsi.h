@@ -21,6 +21,8 @@
  */
 #include <scsi/scsi.h>
 
+#include <linux/random.h>
+
 
 /*
  * Some defs, in case these are not defined elsewhere.
@@ -200,7 +202,7 @@ typedef struct scsi_device {
  *  Use these to separate status msg and our bytes
  */
 
-#define status_byte(result) (((result) >> 1) & 0xf)
+#define status_byte(result) (((result) >> 1) & 0x1f)
 #define msg_byte(result)    (((result) >> 8) & 0xff)
 #define host_byte(result)   (((result) >> 16) & 0xff)
 #define driver_byte(result) (((result) >> 24) & 0xff)
@@ -521,11 +523,12 @@ static Scsi_Cmnd * end_scsi_request(Scsi_Cmnd * SCpnt, int uptodate, int sectors
     if (req->bh){
 	req->buffer = bh->b_data;
 	return SCpnt;
-    };
+    }
     DEVICE_OFF(req->rq_dev);
     if (req->sem != NULL) {
 	up(req->sem);
     }
+    add_blkdev_randomness(MAJOR(req->rq_dev));
     
     if (SCpnt->host->block) {
 	struct Scsi_Host * next;
