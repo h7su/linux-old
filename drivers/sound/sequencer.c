@@ -35,7 +35,7 @@ static int      max_synthdev = 0;
 /*
  * The seq_mode gives the operating mode of the sequencer:
  *      1 = level1 (the default)
- *      2 = level2 (extended capabilites)
+ *      2 = level2 (extended capabilities)
  */
 
 #define SEQ_1	1
@@ -69,7 +69,7 @@ static volatile int qhead = 0, qtail = 0, qlen = 0;
 static volatile int iqhead = 0, iqtail = 0, iqlen = 0;
 static volatile int seq_playing = 0;
 static volatile int sequencer_busy = 0;
-static int      output_treshold;
+static int      output_threshold;
 static int      pre_event_timeout;
 static unsigned synth_open_mask;
 
@@ -549,6 +549,7 @@ seq_chn_voice_event (unsigned char *event_rec)
 	  if (chn == 9)
 	    {
 	      synth_devs[dev]->set_instr (dev, voice, 128 + note);
+              synth_devs[dev]->chn_info[chn].pgm_num = 128 + note;
 	      note = 60;	/* Middle C */
 
 	    }
@@ -688,7 +689,7 @@ seq_timing_event (unsigned char *event_rec)
 
       if ((ret = tmr->event (tmr_no, event_rec)) == TIMER_ARMED)
 	{
-	  if ((SEQ_MAX_QUEUE - qlen) >= output_treshold)
+	  if ((SEQ_MAX_QUEUE - qlen) >= output_threshold)
 	    {
 	      unsigned long   flags;
 
@@ -728,7 +729,7 @@ seq_timing_event (unsigned char *event_rec)
 
 	  request_sound_timer (time);
 
-	  if ((SEQ_MAX_QUEUE - qlen) >= output_treshold)
+	  if ((SEQ_MAX_QUEUE - qlen) >= output_threshold)
 	    {
 	      unsigned long   flags;
 
@@ -864,7 +865,7 @@ play_event (unsigned char *q)
 
 	  request_sound_timer (time);
 
-	  if ((SEQ_MAX_QUEUE - qlen) >= output_treshold)
+	  if ((SEQ_MAX_QUEUE - qlen) >= output_threshold)
 	    {
 	      unsigned long   flags;
 
@@ -1003,7 +1004,7 @@ seq_startplay (void)
 
   seq_playing = 0;
 
-  if ((SEQ_MAX_QUEUE - qlen) >= output_treshold)
+  if ((SEQ_MAX_QUEUE - qlen) >= output_threshold)
     {
       unsigned long   flags;
 
@@ -1203,7 +1204,7 @@ sequencer_open (int dev, struct fileinfo *file)
 
   seq_sleep_flag.flags = WK_NONE;
   midi_sleep_flag.flags = WK_NONE;
-  output_treshold = SEQ_MAX_QUEUE / 2;
+  output_threshold = SEQ_MAX_QUEUE / 2;
 
   for (i = 0; i < num_synths; i++)
     if (pmgr_present[i])
@@ -1373,7 +1374,7 @@ midi_outc (int dev, unsigned char data)
 
   /*
    * This routine sends one byte to the Midi channel.
-   * If the output Fifo is full, it waits until there
+   * If the output FIFO is full, it waits until there
    * is space in the queue
    */
 
@@ -1543,7 +1544,7 @@ sequencer_ioctl (int dev, struct fileinfo *file,
 
       if (seq_mode != SEQ_2)
 	return -(EINVAL);
-      pending_timer = get_fs_long ((long *) arg);
+      pending_timer = get_user ((int *) arg);
 
       if (pending_timer < 0 || pending_timer >= num_sound_timers)
 	{
@@ -1590,7 +1591,7 @@ sequencer_ioctl (int dev, struct fileinfo *file,
 				 */
 	return -(EIO);
 
-      midi_dev = get_fs_long ((long *) arg);
+      midi_dev = get_user ((int *) arg);
       if (midi_dev >= max_mididev)
 	return -(ENXIO);
 
@@ -1638,7 +1639,7 @@ sequencer_ioctl (int dev, struct fileinfo *file,
       if (seq_mode == SEQ_2)
 	return tmr->ioctl (tmr_no, cmd, arg);
 
-      if (get_fs_long ((long *) arg) != 0)
+      if (get_user ((int *) arg) != 0)
 	return -(EINVAL);
 
       return snd_ioctl_return ((int *) arg, HZ);
@@ -1648,7 +1649,7 @@ sequencer_ioctl (int dev, struct fileinfo *file,
       {
 	int             err;
 
-	dev = get_fs_long ((long *) arg);
+	dev = get_user ((int *) arg);
 	if (dev < 0 || dev >= num_synths)
 	  {
 	    return -(ENXIO);
@@ -1677,7 +1678,7 @@ sequencer_ioctl (int dev, struct fileinfo *file,
 
     case SNDCTL_SYNTH_MEMAVL:
       {
-	int             dev = get_fs_long ((long *) arg);
+	int             dev = get_user ((int *) arg);
 
 	if (dev < 0 || dev >= num_synths)
 	  return -(ENXIO);
@@ -1691,7 +1692,7 @@ sequencer_ioctl (int dev, struct fileinfo *file,
 
     case SNDCTL_FM_4OP_ENABLE:
       {
-	int             dev = get_fs_long ((long *) arg);
+	int             dev = get_user ((int *) arg);
 
 	if (dev < 0 || dev >= num_synths)
 	  return -(ENXIO);
@@ -1832,7 +1833,7 @@ sequencer_ioctl (int dev, struct fileinfo *file,
 
     case SNDCTL_SEQ_THRESHOLD:
       {
-	int             tmp = get_fs_long ((long *) arg);
+	int             tmp = get_user ((int *) arg);
 
 	if (dev)		/*
 				 * Patch manager
@@ -1843,14 +1844,14 @@ sequencer_ioctl (int dev, struct fileinfo *file,
 	  tmp = 1;
 	if (tmp >= SEQ_MAX_QUEUE)
 	  tmp = SEQ_MAX_QUEUE - 1;
-	output_treshold = tmp;
+	output_threshold = tmp;
 	return 0;
       }
       break;
 
     case SNDCTL_MIDI_PRETIME:
       {
-	int             val = get_fs_long ((long *) arg);
+	int             val = get_user ((int *) arg);
 
 	if (val < 0)
 	  val = 0;
@@ -1908,7 +1909,7 @@ sequencer_select (int dev, struct fileinfo *file, int sel_type, select_table_han
     case SEL_OUT:
       save_flags (flags);
       cli ();
-      if ((SEQ_MAX_QUEUE - qlen) < output_treshold)
+      if ((SEQ_MAX_QUEUE - qlen) < output_threshold)
 	{
 
 	  seq_sleep_flag.flags = WK_SLEEP;

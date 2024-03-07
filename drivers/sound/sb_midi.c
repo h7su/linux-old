@@ -1,7 +1,7 @@
 /*
  * sound/sb_dsp.c
  *
- * The low level driver for the SoundBlaster DS chips.
+ * The low level driver for the Sound Blaster DS chips.
  */
 /*
  * Copyright (C) by Hannu Savolainen 1993-1996
@@ -87,6 +87,7 @@ sb_midi_close (int dev)
   sb_dsp_reset (devc);
   devc->intr_active = 0;
   devc->input_opened = 0;
+  devc->opened = 0;
   restore_flags (flags);
 }
 
@@ -147,13 +148,13 @@ sb_midi_interrupt (sb_devc * devc)
   restore_flags (flags);
 }
 
-#define MIDI_SYNTH_NAME	"SoundBlaster Midi"
+#define MIDI_SYNTH_NAME	"Sound Blaster Midi"
 #define MIDI_SYNTH_CAPS	0
 #include "midi_synth.h"
 
 static struct midi_operations sb_midi_operations =
 {
-  {"SoundBlaster", 0, 0, SNDCARD_SB},
+  {"Sound Blaster", 0, 0, SNDCARD_SB},
   &std_midi_synth,
   {0},
   sb_midi_open,

@@ -19,6 +19,7 @@
 #include <linux/kernel_stat.h>
 #include <linux/mm.h>
 #include <linux/malloc.h>
+#include <linux/vmalloc.h>
 #include <linux/ptrace.h>
 #include <linux/sys.h>
 #include <linux/utsname.h>
@@ -45,6 +46,7 @@
 #include <linux/skbuff.h>
 #include <linux/genhd.h>
 #include <linux/swap.h>
+#include <linux/ctype.h>
 
 extern unsigned char aux_device_present, kbd_read_mask;
 
@@ -120,8 +122,6 @@ struct symbol_table symbol_table = {
 	X(verify_area),
 	X(do_mmap),
 	X(do_munmap),
-	X(insert_vm_struct),
-	X(merge_segments),
 	X(exit_mm),
 
 	/* internal kernel memory management */
@@ -130,10 +130,10 @@ struct symbol_table symbol_table = {
 	X(kmalloc),
 	X(kfree),
 	X(vmalloc),
-	X(vremap),
 	X(vfree),
  	X(mem_map),
  	X(remap_page_range),
+	X(max_mapnr),
 	X(high_memory),
 	X(update_vm_cache),
 
@@ -297,6 +297,7 @@ struct symbol_table symbol_table = {
 	X(system_utsname),
 	X(sys_call_table),
 	X(hard_reset_now),
+	X(_ctype),
 
 	/* Signal interfaces */
 	X(send_sig),
@@ -333,6 +334,8 @@ struct symbol_table symbol_table = {
 	X(insert_inode_hash),
 	X(event),
 	X(__down),
+	X(__up),
+	X(securelevel),
 /* all busmice */
 	X(add_mouse_randomness),
 	X(fasync_helper),

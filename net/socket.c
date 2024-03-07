@@ -80,12 +80,12 @@
 extern void export_net_symbols(void);
 #endif
 
-static int sock_lseek(struct inode *inode, struct file *file, off_t offset,
-		      int whence);
-static int sock_read(struct inode *inode, struct file *file, char *buf,
-		     int size);
-static int sock_write(struct inode *inode, struct file *file, const char *buf,
-		      int size);
+static long long sock_lseek(struct inode *inode, struct file *file,
+			    long long offset, int whence);
+static long sock_read(struct inode *inode, struct file *file,
+		      char *buf, unsigned long size);
+static long sock_write(struct inode *inode, struct file *file,
+		       const char *buf, unsigned long size);
 
 static void sock_close(struct inode *inode, struct file *file);
 static int sock_select(struct inode *inode, struct file *file, int which, select_table *seltable);
@@ -172,36 +172,31 @@ int move_addr_to_user(void *kaddr, int klen, void *uaddr, int *ulen)
 static int get_fd(struct inode *inode)
 {
 	int fd;
-	struct file *file;
 
 	/*
 	 *	Find a file descriptor suitable for return to the user. 
 	 */
 
-	file = get_empty_filp();
-	if (!file) 
-		return(-1);
+	fd = get_unused_fd();
+	if (fd >= 0) {
+		struct file *file = get_empty_filp();
 
-	for (fd = 0; fd < NR_OPEN; ++fd)
-		if (!current->files->fd[fd]) 
-			break;
-	if (fd == NR_OPEN) 
-	{
-		file->f_count = 0;
-		return(-1);
-	}
+		if (!file) {
+			put_unused_fd(fd);
+			return -ENFILE;
+		}
 
-	FD_CLR(fd, &current->files->close_on_exec);
 		current->files->fd[fd] = file;
-	file->f_op = &socket_file_ops;
-	file->f_mode = 3;
-	file->f_flags = O_RDWR;
-	file->f_count = 1;
-	file->f_inode = inode;
-	if (inode) 
-		inode->i_count++;
-	file->f_pos = 0;
-	return(fd);
+		file->f_op = &socket_file_ops;
+		file->f_mode = 3;
+		file->f_flags = O_RDWR;
+		file->f_count = 1;
+		file->f_inode = inode;
+		if (inode) 
+			inode->i_count++;
+		file->f_pos = 0;
+	}
+	return fd;
 }
 
 
@@ -321,9 +316,10 @@ void sock_release(struct socket *sock)
  *	Sockets are not seekable.
  */
 
-static int sock_lseek(struct inode *inode, struct file *file, off_t offset, int whence)
+static long long sock_lseek(struct inode *inode, struct file *file,
+	long long offset, int whence)
 {
-	return(-ESPIPE);
+	return -ESPIPE;
 }
 
 /*
@@ -331,7 +327,8 @@ static int sock_lseek(struct inode *inode, struct file *file, off_t offset, int 
  *	area ubuf...ubuf+size-1 is writable before asking the protocol.
  */
 
-static int sock_read(struct inode *inode, struct file *file, char *ubuf, int size)
+static long sock_read(struct inode *inode, struct file *file,
+	char *ubuf, unsigned long size)
 {
 	struct socket *sock;
 	int err;
@@ -363,7 +360,8 @@ static int sock_read(struct inode *inode, struct file *file, char *ubuf, int siz
  *	readable by the user process.
  */
 
-static int sock_write(struct inode *inode, struct file *file, const char *ubuf, int size)
+static long sock_write(struct inode *inode, struct file *file,
+	const char *ubuf, unsigned long size)
 {
 	struct socket *sock;
 	int err;
@@ -949,17 +947,22 @@ asmlinkage int sys_sendto(int fd, void * buff, int len, unsigned flags,
 	err=verify_area(VERIFY_READ,buff,len);
 	if(err)
 	  	return err;
-  	
-	if((err=move_addr_to_kernel(addr,addr_len,address))<0)
-	  	return err;
-	  	
+
 	iov.iov_base=buff;
 	iov.iov_len=len;
-	msg.msg_name=address;
-	msg.msg_namelen=addr_len;
+	msg.msg_name = NULL;
+	msg.msg_namelen = 0;
 	msg.msg_iov=&iov;
 	msg.msg_iovlen=1;
 	msg.msg_control=NULL;
+	if (addr && addr_len) {
+		err=move_addr_to_kernel(addr,addr_len,address);
+		if (err < 0)
+			return err;
+		msg.msg_name=address;
+		msg.msg_namelen=addr_len;
+	}
+	  	
 	return(sock->ops->sendmsg(sock, &msg, len, (file->f_flags & O_NONBLOCK),
 		flags));
 }

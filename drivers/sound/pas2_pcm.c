@@ -41,6 +41,9 @@ pcm_set_speed (int arg)
   int             foo, tmp;
   unsigned long   flags;
 
+  if (arg == 0)
+     return pcm_speed;
+
   if (arg > 44100)
     arg = 44100;
   if (arg < 5000)
@@ -62,7 +65,7 @@ pcm_set_speed (int arg)
   tmp = pas_read (0x0B8A);
 
   /*
-     * Set anti-aliasing filters according to sample rate. You reall *NEED*
+     * Set anti-aliasing filters according to sample rate. You really *NEED*
      * to enable this feature for all normal recording unless you want to
      * experiment with aliasing effects.
      * These filters apply to the selected "recording" source.
@@ -127,6 +130,9 @@ pcm_set_channels (int arg)
 int
 pcm_set_bits (int arg)
 {
+  if (arg == 0)
+     return pcm_bits;
+
   if ((arg & pcm_bitsok) != arg)
     return pcm_bits;
 
@@ -150,7 +156,7 @@ pas_audio_ioctl (int dev, unsigned int cmd, caddr_t arg, int local)
     case SOUND_PCM_WRITE_RATE:
       if (local)
 	return pcm_set_speed ((int) arg);
-      return snd_ioctl_return ((int *) arg, pcm_set_speed (get_fs_long ((long *) arg)));
+      return snd_ioctl_return ((int *) arg, pcm_set_speed (get_user ((int *) arg)));
       break;
 
     case SOUND_PCM_READ_RATE:
@@ -162,13 +168,13 @@ pas_audio_ioctl (int dev, unsigned int cmd, caddr_t arg, int local)
     case SNDCTL_DSP_STEREO:
       if (local)
 	return pcm_set_channels ((int) arg + 1) - 1;
-      return snd_ioctl_return ((int *) arg, pcm_set_channels (get_fs_long ((long *) arg) + 1) - 1);
+      return snd_ioctl_return ((int *) arg, pcm_set_channels (get_user ((int *) arg) + 1) - 1);
       break;
 
     case SOUND_PCM_WRITE_CHANNELS:
       if (local)
 	return pcm_set_channels ((int) arg);
-      return snd_ioctl_return ((int *) arg, pcm_set_channels (get_fs_long ((long *) arg)));
+      return snd_ioctl_return ((int *) arg, pcm_set_channels (get_user ((int *) arg)));
       break;
 
     case SOUND_PCM_READ_CHANNELS:
@@ -180,7 +186,7 @@ pas_audio_ioctl (int dev, unsigned int cmd, caddr_t arg, int local)
     case SNDCTL_DSP_SETFMT:
       if (local)
 	return pcm_set_bits ((int) arg);
-      return snd_ioctl_return ((int *) arg, pcm_set_bits (get_fs_long ((long *) arg)));
+      return snd_ioctl_return ((int *) arg, pcm_set_bits (get_user ((int *) arg)));
       break;
 
     case SOUND_PCM_READ_BITS:
@@ -191,9 +197,9 @@ pas_audio_ioctl (int dev, unsigned int cmd, caddr_t arg, int local)
     case SOUND_PCM_WRITE_FILTER:	/*
 					 * NOT YET IMPLEMENTED
 					 */
-      if (get_fs_long ((long *) arg) > 1)
+      if (get_user ((int *) arg) > 1)
 	return -(EINVAL);
-      pcm_filter = get_fs_long ((long *) arg);
+      pcm_filter = get_user ((int *) arg);
       break;
 
     case SOUND_PCM_READ_FILTER:

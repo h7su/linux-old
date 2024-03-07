@@ -133,6 +133,10 @@
 #include "53c7,8xx.h"
 #endif
 
+#ifdef CONFIG_SCSI_NCR53C8XX
+#include "ncr53c8xx.h"
+#endif
+
 #ifdef CONFIG_SCSI_ULTRASTOR
 #include "ultrastor.h"
 #endif
@@ -257,6 +261,9 @@ static Scsi_Host_Template builtin_scsi_hosts[] =
 #ifdef CONFIG_SCSI_QLOGIC_FAS
     QLOGICFAS,
 #endif
+#ifdef CONFIG_SCSI_QLOGIC_ISP
+    QLOGICISP,
+#endif
 #ifdef CONFIG_SCSI_PAS16
     MV_PAS16,
 #endif
@@ -272,6 +279,9 @@ static Scsi_Host_Template builtin_scsi_hosts[] =
 #ifdef CONFIG_SCSI_NCR53C7xx
     NCR53c7xx,
 #endif
+#ifdef CONFIG_SCSI_NCR53C8XX
+    NCR53C8XX,
+#endif
 #ifdef CONFIG_SCSI_EATA_DMA
     EATA_DMA,
 #endif
@@ -286,9 +296,6 @@ static Scsi_Host_Template builtin_scsi_hosts[] =
 #endif
 #ifdef CONFIG_SCSI_AM53C974
     AM53C974,
-#endif
-#ifdef CONFIG_SCSI_QLOGIC_ISP
-    QLOGICISP,
 #endif
 #ifdef CONFIG_SCSI_PPA
     PPA,

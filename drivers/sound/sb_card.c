@@ -1,7 +1,7 @@
 /*
  * sound/sb_card.c
  *
- * Detection routine for the SoundBlaster cards.
+ * Detection routine for the Sound Blaster cards.
  */
 /*
  * Copyright (C) by Hannu Savolainen 1993-1996
@@ -15,7 +15,7 @@
 
 #include "sound_config.h"
 
-#if defined(CONFIG_SB)
+#if defined(CONFIG_SBDSP)
 
 #include "sb_mixer.h"
 #include "sb.h"

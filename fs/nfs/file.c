@@ -30,8 +30,8 @@
 #include <asm/system.h>
 
 static int nfs_file_mmap(struct inode *, struct file *, struct vm_area_struct *);
-static int nfs_file_read(struct inode *, struct file *, char *, int);
-static int nfs_file_write(struct inode *, struct file *, const char *, int);
+static long nfs_file_read(struct inode *, struct file *, char *, unsigned long);
+static long nfs_file_write(struct inode *, struct file *, const char *, unsigned long);
 static int nfs_fsync(struct inode *, struct file *);
 
 static struct file_operations nfs_file_operations = {
@@ -70,22 +70,25 @@ static inline void revalidate_inode(struct nfs_server * server, struct inode * i
 {
 	struct nfs_fattr fattr;
 
-	if (jiffies - NFS_READTIME(inode) < server->acregmax)
+	if (jiffies - NFS_READTIME(inode) < NFS_ATTRTIMEO(inode))
 		return;
 
 	NFS_READTIME(inode) = jiffies;
 	if (nfs_proc_getattr(server, NFS_FH(inode), &fattr) == 0) {
 		nfs_refresh_inode(inode, &fattr);
-		if (fattr.mtime.seconds == NFS_OLDMTIME(inode))
+		if (fattr.mtime.seconds == NFS_OLDMTIME(inode)) {
+			if ((NFS_ATTRTIMEO(inode) <<= 1) > server->acregmax)
+				NFS_ATTRTIMEO(inode) = server->acregmax;
 			return;
+		}
 		NFS_OLDMTIME(inode) = fattr.mtime.seconds;
 	}
 	invalidate_inode_pages(inode);
 }
 
 
-static int nfs_file_read(struct inode * inode, struct file * file,
-	char * buf, int count)
+static long nfs_file_read(struct inode * inode, struct file * file,
+	char * buf, unsigned long count)
 {
 	revalidate_inode(NFS_SERVER(inode), inode);
 	return generic_file_read(inode, file, buf, count);
@@ -102,8 +105,8 @@ static int nfs_fsync(struct inode *inode, struct file *file)
 	return 0;
 }
 
-static int nfs_file_write(struct inode *inode, struct file *file, const char *buf,
-			  int count)
+static long nfs_file_write(struct inode *inode, struct file *file,
+	const char *buf, unsigned long count)
 {
 	int result, written, wsize;
 	struct nfs_fattr fattr;
@@ -118,7 +121,7 @@ static int nfs_file_write(struct inode *inode, struct file *file, const char *bu
 			inode->i_mode);
 		return -EINVAL;
 	}
-	if (count <= 0)
+	if (count == 0)
 		return 0;
 
 	pos = file->f_pos;

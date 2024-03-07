@@ -2,7 +2,7 @@
 /*
  * sound/sb_mixer.c
  *
- * The low level mixer driver for the SoundBlaster compatible cards.
+ * The low level mixer driver for the Sound Blaster compatible cards.
  */
 /*
  * Copyright (C) by Hannu Savolainen 1993-1996
@@ -307,12 +307,12 @@ sb_mixer_ioctl (int dev, unsigned int cmd, caddr_t arg)
 	switch (cmd & 0xff)
 	  {
 	  case SOUND_MIXER_RECSRC:
-	    return snd_ioctl_return ((int *) arg, set_recmask (devc, get_fs_long ((long *) arg)));
+	    return snd_ioctl_return ((int *) arg, set_recmask (devc, get_user ((int *) arg)));
 	    break;
 
 	  default:
 
-	    return snd_ioctl_return ((int *) arg, sb_mixer_set (devc, cmd & 0xff, get_fs_long ((long *) arg)));
+	    return snd_ioctl_return ((int *) arg, sb_mixer_set (devc, cmd & 0xff, get_user ((int *) arg)));
 	  }
       else
 	switch (cmd & 0xff)
@@ -352,7 +352,7 @@ sb_mixer_ioctl (int dev, unsigned int cmd, caddr_t arg)
 static struct mixer_operations sb_mixer_operations =
 {
   "SB",
-  "SoundBlaster",
+  "Sound Blaster",
   sb_mixer_ioctl
 };
 

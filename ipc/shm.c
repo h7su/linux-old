@@ -92,16 +92,14 @@ found:
 	shp = (struct shmid_ds *) kmalloc (sizeof (*shp), GFP_KERNEL);
 	if (!shp) {
 		shm_segs[id] = (struct shmid_ds *) IPC_UNUSED;
-		if (shm_lock)
-			wake_up (&shm_lock);
+		wake_up (&shm_lock);
 		return -ENOMEM;
 	}
 
 	shp->shm_pages = (ulong *) kmalloc (numpages*sizeof(ulong),GFP_KERNEL);
 	if (!shp->shm_pages) {
 		shm_segs[id] = (struct shmid_ds *) IPC_UNUSED;
-		if (shm_lock)
-			wake_up (&shm_lock);
+		wake_up (&shm_lock);
 		kfree(shp);
 		return -ENOMEM;
 	}
@@ -125,8 +123,7 @@ found:
 		max_shmid = id;
 	shm_segs[id] = shp;
 	used_segs++;
-	if (shm_lock)
-		wake_up (&shm_lock);
+	wake_up (&shm_lock);
 	return (unsigned int) shp->shm_perm.seq * SHMMNI + id;
 }
 
@@ -428,8 +425,8 @@ static int shm_map (struct vm_area_struct *shmd)
 
 	/* add new mapping */
 	current->mm->total_vm += (shmd->vm_end - shmd->vm_start) >> PAGE_SHIFT;
-	insert_vm_struct(current, shmd);
-	merge_segments(current, shmd->vm_start, shmd->vm_end);
+	insert_vm_struct(current->mm, shmd);
+	merge_segments(current->mm, shmd->vm_start, shmd->vm_end);
 
 	/* map page range */
 	error = 0;
@@ -467,6 +464,7 @@ asmlinkage int sys_shmat (int shmid, char *shmaddr, int shmflg, ulong *raddr)
 	int err;
 	unsigned int id;
 	unsigned long addr;
+	unsigned long len;
 
 	if (shmid < 0) {
 		/* printk("shmat() -> EINVAL because shmid = %d < 0\n",shmid); */
@@ -491,6 +489,12 @@ asmlinkage int sys_shmat (int shmid, char *shmaddr, int shmflg, ulong *raddr)
 			return -EINVAL;
 	}
 	/*
+	 * Check if addr exceeds TASK_SIZE (from do_mmap)
+	 */
+	len = PAGE_SIZE*shp->shm_npages;
+       if (addr >= TASK_SIZE || len > TASK_SIZE  || addr > TASK_SIZE - len)
+		return -EINVAL;
+	/*
 	 * If shm segment goes below stack, make sure there is some
 	 * space left for the stack to grow (presently 4 pages).
 	 */
@@ -501,7 +505,7 @@ asmlinkage int sys_shmat (int shmid, char *shmaddr, int shmflg, ulong *raddr)
 		return -EINVAL;
 	}
 	if (!(shmflg & SHM_REMAP))
-		if ((shmd = find_vma_intersection(current, addr, addr + shp->shm_segsz))) {
+		if ((shmd = find_vma_intersection(current->mm, addr, addr + shp->shm_segsz))) {
 			/* printk("shmat() -> EINVAL because the interval [0x%lx,0x%lx) intersects an already mapped interval [0x%lx,0x%lx).\n",
 				addr, addr + shp->shm_segsz, shmd->vm_start, shmd->vm_end); */
 			return -EINVAL;

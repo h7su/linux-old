@@ -48,7 +48,7 @@ snd_ioctl_return (int *addr, int value)
   if (value < 0)
     return value;
 
-  put_fs_long (value, (long *) &((addr)[0]));
+  put_user (value, addr);
   return 0;
 }
 
@@ -98,7 +98,7 @@ sound_open (inode_handle * inode, file_handle * file)
 
   if (!soundcard_configured && dev != SND_DEV_CTL && dev != SND_DEV_STATUS)
     {
-      printk ("SoundCard Error: The soundcard system has not been configured\n");
+      printk ("Sound Card Error: The soundcard system has not been configured\n");
       return -(ENXIO);
     }
 
@@ -289,7 +289,7 @@ sound_mmap (inode_handle * inode, file_handle * file, vm_area_handle * vma)
 	      size, dmap->bytes_in_use);
     }
 
-  if (remap_page_range (vma_get_start (vma), dmap->raw_buf_phys,
+  if (remap_page_range (vma_get_start (vma), virt_to_phys(dmap->raw_buf),
 			vma_get_end (vma) - vma_get_start (vma),
 			vma_get_page_prot (vma)))
     return -EAGAIN;
@@ -487,6 +487,10 @@ int
 snd_set_irq_handler (int interrupt_level, void (*iproc) (int, void *, struct pt_regs *), char *name, int *osp)
 {
   int             retcode;
+  unsigned long   flags;
+
+  save_flags (flags);
+  cli ();
 
   retcode = request_irq (interrupt_level, iproc, 0 /* SA_INTERRUPT */ , name, NULL);
   if (retcode < 0)
@@ -496,6 +500,7 @@ snd_set_irq_handler (int interrupt_level, void (*iproc) (int, void *, struct pt_
   else
     irqs |= (1ul << interrupt_level);
 
+  restore_flags (flags);
   return retcode;
 }
 
@@ -663,7 +668,7 @@ sound_alloc_dmap (int dev, struct dma_buffparms *dmap, int chan)
 
       audio_devs[dev]->buffsize = PAGE_SIZE * (1 << sz);
 
-      if ((start_addr = (char *) __get_free_pages (GFP_ATOMIC, sz, MAX_DMA_ADDRESS)) == NULL)
+      if ((start_addr = (char *) __get_dma_pages (GFP_ATOMIC, sz)) == NULL)
 	audio_devs[dev]->buffsize /= 2;
     }
 
@@ -734,7 +739,7 @@ sound_free_dmap (int dev, struct dma_buffparms *dmap)
 }
 
 int
-soud_map_buffer (int dev, struct dma_buffparms *dmap, buffmem_desc * info)
+sound_map_buffer (int dev, struct dma_buffparms *dmap, buffmem_desc * info)
 {
   printk ("Entered sound_map_buffer()\n");
   printk ("Exited sound_map_buffer()\n");

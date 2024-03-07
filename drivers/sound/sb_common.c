@@ -1,7 +1,7 @@
 /*
  * sound/sb_common.c
  *
- * Common routines for SoundBlaster compatible cards.
+ * Common routines for Sound Blaster compatible cards.
  */
 /*
  * Copyright (C) by Hannu Savolainen 1993-1996
@@ -25,7 +25,7 @@
 #include "sb.h"
 
 static sb_devc *detected_devc = NULL;	/* For communication from probe to init */
-static sb_devc *last_devc = NULL;	/* For MPU401 initalization */
+static sb_devc *last_devc = NULL;	/* For MPU401 initialization */
 static sb_devc *irq2devc[16] =
 {NULL};
 static unsigned char jazz_irq_bits[] =
@@ -34,14 +34,14 @@ static unsigned char jazz_dma_bits[] =
 {0, 1, 0, 2, 0, 3, 0, 4};
 
 /*
- * Jazz16 chipset spesific control variables
+ * Jazz16 chipset specific control variables
  */
 
 static int      jazz16_base = 0;	/* Not detected */
 static unsigned char jazz16_bits = 0;	/* I/O relocation bits */
 
 /*
- * Logitech Soundman Wave spesific initialization code
+ * Logitech SoundMan Wave specific initialization code
  */
 
 #ifdef SMW_MIDI0001_INCLUDED
@@ -59,7 +59,7 @@ sb_dsp_command (sb_devc * devc, unsigned char val)
   unsigned long   limit;
 
   limit = jiffies + HZ / 10;	/*
-				   * The timeout is 0.1 secods
+				   * The timeout is 0.1 seconds
 				 */
 
   /*
@@ -79,7 +79,7 @@ sb_dsp_command (sb_devc * devc, unsigned char val)
 	}
     }
 
-  printk ("SoundBlaster: DSP Command(%x) Timeout.\n", val);
+  printk ("Sound Blaster: DSP Command(%x) Timeout.\n", val);
   return 0;
 }
 
@@ -130,13 +130,13 @@ sbintr (int irq, void *dev_id, struct pt_regs *dummy)
 
   sb_devc        *devc = irq2devc[irq];
 
-  devc->irq_ok = 1;
-
   if (devc == NULL || devc->irq != irq)
     {
       DEB (printk ("sbintr: Bogus interrupt IRQ%d\n", irq));
       return;
     }
+
+  devc->irq_ok = 1;
 
   if (devc->model == MDL_SB16)
     {
@@ -173,7 +173,7 @@ sbintr (int irq, void *dev_id, struct pt_regs *dummy)
 	break;
 
       default:
-	printk ("SoundBlaster: Unexpected interrupt\n");
+	printk ("Sound Blaster: Unexpected interrupt\n");
       }
 /*
  * Acknowledge interrupts 
@@ -261,6 +261,29 @@ sb16_set_dma_hw (sb_devc * devc)
   return 1;
 }
 
+static void
+sb16_set_mpu_port(sb_devc *devc, struct address_info *hw_config)
+{
+/*
+ * This routine initializes new MIDI port setup register of SB Vibra.
+ */
+	unsigned char bits = sb_getmixer(devc, 0x84) & ~0x06;
+	switch (hw_config->io_base)
+	{
+	case 0x300:
+  		sb_setmixer (devc, 0x84, bits | 0x04);
+		break;
+
+	case 0x330:
+  		sb_setmixer (devc, 0x84, bits | 0x00);
+		break;
+
+	default:
+  		sb_setmixer (devc, 0x84, bits | 0x02); /* Disable MPU */
+		printk("SB16: Invalid MIDI I/O port %x\n", hw_config->io_base);
+	}
+}
+
 static int
 sb16_set_irq_hw (sb_devc * devc, int level)
 {
@@ -345,7 +368,7 @@ init_Jazz16 (sb_devc * devc, struct address_info *hw_config)
     return 0;
 
 /*
- * OK so far. Now configure the IRQ and DMA channel used by the acrd.
+ * OK so far. Now configure the IRQ and DMA channel used by the card.
  */
   if (hw_config->irq < 1 || hw_config->irq > 15 ||
       jazz_irq_bits[hw_config->irq] == 0)
@@ -501,7 +524,7 @@ ess_init (sb_devc * devc, struct address_info *hw_config)
  *    Set DMA configuration register
  */
 
-  cfg = 0x50;			/* Extended mode DMA ebable */
+  cfg = 0x50;			/* Extended mode DMA enable */
 
   if (devc->dma8 > 3 || devc->dma8 < 0 || devc->dma8 == 2)
     {
@@ -619,8 +642,11 @@ void
 sb_dsp_init (struct address_info *hw_config)
 {
   sb_devc        *devc;
-  int             n;
   char            name[100];
+
+#ifndef NO_SB_IRQ_TEST
+  int             n;
+#endif
 
 /*
  * Check if we had detected a SB device earlier
@@ -649,11 +675,15 @@ sb_dsp_init (struct address_info *hw_config)
   devc->caps = hw_config->driver_use_1;
 
   if (snd_set_irq_handler (hw_config->irq,
-			   sbintr, "soundblaster", devc->osp) < 0)
+			   sbintr, "sound blaster", devc->osp) < 0)
     {
       printk ("SB: Can't allocate IRQ%d\n", hw_config->irq);
+      irq2devc[hw_config->irq] = NULL;
       return;
     }
+
+  irq2devc[hw_config->irq] = devc;
+  devc->irq_ok = 0;
 
   if (devc->major == 4)
     if (!sb16_set_irq_hw (devc, devc->irq))	/* Unsupported IRQ */
@@ -674,15 +704,15 @@ sb_dsp_init (struct address_info *hw_config)
 	  }
     }
 
-  irq2devc[hw_config->irq] = devc;
-  devc->irq_ok = 0;
-
-  for (n = 0; n < 3 && devc->irq_ok == 0; n++)
+#ifndef NO_SB_IRQ_TEST
+  if (devc->major != 4 || devc->minor > 11) /* Not Sb16 v4.5 or v4.11 */
+  {
+    for (n = 0; n < 3 && devc->irq_ok == 0; n++)
     if (sb_dsp_command (devc, 0xf2))	/* Cause interrupt immediately */
       {
 	int             i;
 
-	for (i = 0; !devc->irq_ok && i < 10000000; i++);
+	for (i = 0; !devc->irq_ok && i < 10000; i++);
       }
 
   if (!devc->irq_ok)
@@ -695,8 +725,10 @@ sb_dsp_init (struct address_info *hw_config)
     {
       DDB (printk ("IRQ test OK (IRQ%d)\n", devc->irq));
     }
+  }
+#endif
 
-  request_region (hw_config->io_base, 16, "soundblaster");
+  request_region (hw_config->io_base, 16, "sound blaster");
 
   switch (devc->major)
     {
@@ -758,12 +790,12 @@ sb_dsp_init (struct address_info *hw_config)
 
   if (!(devc->caps & SB_NO_AUDIO))
     {
-      if (sound_alloc_dma (devc->dma8, "SoundBlaster8"))
+      if (sound_alloc_dma (devc->dma8, "Sound Blaster8"))
 	{
 	  printk ("SB: Can't allocate 8 bit DMA channel %d\n", devc->dma8);
 	}
       if (devc->dma16 >= 0 && devc->dma16 != devc->dma8)
-	if (sound_alloc_dma (devc->dma16, "SoundBlaster16"))
+	if (sound_alloc_dma (devc->dma16, "Sound Blaster16"))
 	  {
 	    printk ("SB: Can't allocate 16 bit DMA channel %d\n", devc->dma16);
 	  }
@@ -958,7 +990,7 @@ smw_midi_init (sb_devc * devc, struct address_info *hw_config)
      * Set the SCSI interrupt (IRQ2/9, IRQ3 or IRQ10). The SCSI interrupt
      * is disabled by default.
      *
-     * Btw the Zilog 5380 SCSI controller is located at MPU base + 0x10.
+     * BTW the Zilog 5380 SCSI controller is located at MPU base + 0x10.
    */
   {
     static unsigned char scsi_irq_bits[] =
@@ -1134,6 +1166,9 @@ probe_sbmpu (struct address_info *hw_config)
 
   last_devc = 0;
 
+  if (hw_config->io_base <= 0)
+     return 0;
+
   if (check_region (hw_config->io_base, 4))
     {
       printk ("sbmpu: I/O port conflict (%x)\n", hw_config->io_base);
@@ -1150,6 +1185,7 @@ probe_sbmpu (struct address_info *hw_config)
 	}
       hw_config->name = "Sound Blaster 16";
       hw_config->irq = -devc->irq;
+      sb16_set_mpu_port(devc, hw_config);
       break;
 
     case MDL_ESS:

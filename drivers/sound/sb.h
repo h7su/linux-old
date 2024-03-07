@@ -37,7 +37,7 @@
 #define MDL_SBPRO	4	/* SB Pro */
 #define MDL_SB16	5	/* SB16/32/AWE */
 #define MDL_JAZZ	10	/* Media Vision Jazz16 */
-#define MDL_SMW		11	/* Logitech Soundman Wave (Jazz16) */
+#define MDL_SMW		11	/* Logitech SoundMan Wave (Jazz16) */
 #define MDL_ESS		12	/* ESS ES688 and ES1688 */
 #define MDL_AZTECH	13	/* Aztech Sound Galaxy family */
 
@@ -83,7 +83,7 @@ typedef struct sb_devc {
 	   volatile int intr_active, irq_mode;
 
 	/* Mixer fields */
-	   int levels[SOUND_MIXER_NRDEVICES];
+	   unsigned short levels[SOUND_MIXER_NRDEVICES];
 	   mixer_tab *iomap;
 	   int mixer_caps, recmask, supported_devices;
 	   int supported_rec_devices;

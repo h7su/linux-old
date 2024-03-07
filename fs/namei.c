@@ -32,7 +32,7 @@ static inline int get_max_filename(unsigned long address)
 
 	if (get_fs() == KERNEL_DS)
 		return 0;
-	vma = find_vma(current, address);
+	vma = find_vma(current->mm, address);
 	if (!vma || vma->vm_start > address || !(vma->vm_flags & VM_READ))
 		return -EFAULT;
 	address = vma->vm_end - address;
@@ -102,6 +102,9 @@ int permission(struct inode * inode,int mask)
 
 	if (inode->i_op && inode->i_op->permission)
 		return inode->i_op->permission(inode, mask);
+	else if ((mask & S_IWOTH) && IS_RDONLY(inode) &&
+		 (S_ISREG(mode) || S_ISDIR(mode) || S_ISLNK(mode)))
+		return -EROFS; /* Nobody gets write access to a read-only fs */
 	else if ((mask & S_IWOTH) && IS_IMMUTABLE(inode))
 		return -EACCES; /* Nobody gets write access to an immutable file */
 	else if (current->fsuid == inode->i_uid)
@@ -363,12 +366,12 @@ int open_namei(const char * pathname, int flag, int mode,
 				iput(inode);
 				error = -EEXIST;
 			}
-		} else if ((error = permission(dir,MAY_WRITE | MAY_EXEC)) != 0)
-			;	/* error is already set! */
+		} else if (IS_RDONLY(dir))
+			error = -EROFS;
 		else if (!dir->i_op || !dir->i_op->create)
 			error = -EACCES;
-		else if (IS_RDONLY(dir))
-			error = -EROFS;
+		else if ((error = permission(dir,MAY_WRITE | MAY_EXEC)) != 0)
+			;	/* error is already set! */
 		else {
 			dir->i_count++;		/* create eats the dir */
 			if (dir->i_sb && dir->i_sb->dq_op)
@@ -405,6 +408,7 @@ int open_namei(const char * pathname, int flag, int mode,
 		 * If there was something like IS_NODEV(inode) for
 		 * pipes and/or sockets I'd check it here.
 		 */
+	    	flag &= ~O_TRUNC;
 	}
 	else if (S_ISBLK(inode->i_mode) || S_ISCHR(inode->i_mode)) {
 		if (IS_NODEV(inode)) {
@@ -581,7 +585,7 @@ static int do_mkdir(const char * pathname, int mode)
 	if (dir->i_sb && dir->i_sb->dq_op)
 		dir->i_sb->dq_op->initialize(dir, -1);
 	down(&dir->i_sem);
-	error = dir->i_op->mkdir(dir, basename, namelen, mode & 0777 & ~current->fs->umask);
+	error = dir->i_op->mkdir(dir, basename, namelen, mode & 01777 & ~current->fs->umask);
 	up(&dir->i_sem);
 	iput(dir);
 	return error;

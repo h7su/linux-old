@@ -202,6 +202,7 @@
  *					improvement.
  *	Stefan Magdalinski	:	adjusted tcp_readable() to fix FIONREAD
  *	Willy Konynenberg	:	Transparent proxying support.
+ *		Theodore Ts'o	:	Do secure TCP sequence numbers.
  *					
  * To Fix:
  *		Fast path the code. Two things here - fix the window calculation
@@ -427,6 +428,7 @@
 #include <linux/config.h>
 #include <linux/types.h>
 #include <linux/fcntl.h>
+#include <linux/random.h>
 
 #include <net/icmp.h>
 #include <net/tcp.h>
@@ -724,12 +726,7 @@ static int tcp_select(struct sock *sk, int sel_type, select_table *wait)
 			return 0;
 		if (sk->state == TCP_SYN_SENT || sk->state == TCP_SYN_RECV)
 			break;
-		/*
-		 * This is now right thanks to a small fix
-		 * by Matt Dillon.
-		 */
-
-		if (sock_wspace(sk) < sk->mtu+128+sk->prot->max_header)
+		if (sk->wmem_alloc*2 > sk->sndbuf)
 			break;
 		return 1;
 
@@ -859,21 +856,35 @@ static void wait_for_tcp_connect(struct sock * sk)
 	lock_sock(sk);
 }
 
+static inline int tcp_memory_free(struct sock *sk)
+{
+	return sk->wmem_alloc < sk->sndbuf;
+}
+
 /*
  *	Wait for more memory for a socket
  */
 static void wait_for_tcp_memory(struct sock * sk)
 {
 	release_sock(sk);
-	cli();
-	if (sk->wmem_alloc*2 > sk->sndbuf &&
-	    (sk->state == TCP_ESTABLISHED||sk->state == TCP_CLOSE_WAIT)
-		&& sk->err == 0)
-	{
+	if (!tcp_memory_free(sk)) {
+		struct wait_queue wait = { current, NULL };
+
 		sk->socket->flags &= ~SO_NOSPACE;
-		interruptible_sleep_on(sk->sleep);
+		add_wait_queue(sk->sleep, &wait);
+		for (;;) {
+			current->state = TASK_INTERRUPTIBLE;
+			if (tcp_memory_free(sk))
+				break;
+			if (sk->shutdown & SEND_SHUTDOWN)
+				break;
+			if (sk->err)
+				break;
+			schedule();
+		}
+		current->state = TASK_RUNNING;
+		remove_wait_queue(sk->sleep, &wait);
 	}
-	sti();
 	lock_sock(sk);
 }
 
@@ -947,6 +958,7 @@ static int do_tcp_sendmsg(struct sock *sk,
 			{
 				if (copied)
 					return copied;
+				send_sig(SIGPIPE,current,0);
 				return -EPIPE;
 			}
 
@@ -967,16 +979,20 @@ static int do_tcp_sendmsg(struct sock *sk,
 			 */
 #ifndef CONFIG_NO_PATH_MTU_DISCOVERY
 			/*
-			 *	FIXME:  I'm almost sure that this fragment is BUG,
-			 *		but it works... I do not know why 8) --ANK
-			 *
 			 *	Really, we should rebuild all the queues...
 			 *	It's difficult. Temporary hack is to send all
 			 *	queued segments with allowed fragmentation.
 			 */
 			{
+				/*
+				 *	new_mss may be zero. That indicates
+				 *	we don't have a window estimate for
+				 *	the remote box yet. 
+				 *		-- AC
+				 */
+				
 				int new_mss = min(sk->mtu, sk->max_window);
-				if (new_mss < sk->mss)
+				if (new_mss && new_mss < sk->mss)
 				{
 					tcp_send_partial(sk);
 					sk->mss = new_mss;
@@ -1431,7 +1447,7 @@ static int tcp_recvmsg(struct sock *sk, struct msghdr *msg,
 		if (copied)
 			break;
 
-		if (sk->err)
+		if (sk->err && !(flags&MSG_PEEK))
 		{
 			copied = sock_error(sk);
 			break;
@@ -1886,6 +1902,36 @@ no_listen:
 	goto out;
 }
 
+/*
+ * Check that a TCP address is unique, don't allow multiple
+ * connects to/from the same address
+ */
+static int tcp_unique_address(u32 saddr, u16 snum, u32 daddr, u16 dnum)
+{
+	int retval = 1;
+	struct sock * sk;
+
+	/* Make sure we are allowed to connect here. */
+	cli();
+	for (sk = tcp_prot.sock_array[snum & (SOCK_ARRAY_SIZE -1)];
+			sk != NULL; sk = sk->next)
+	{
+		/* hash collision? */
+		if (sk->num != snum)
+			continue;
+		if (sk->saddr != saddr)
+			continue;
+		if (sk->daddr != daddr)
+			continue;
+		if (sk->dummy_th.dest != dnum)
+			continue;
+		retval = 0;
+		break;
+	}
+	sti();
+	return retval;
+}
+
 
 /*
  *	This will initiate an outgoing connection.
@@ -1921,7 +1967,7 @@ static int tcp_connect(struct sock *sk, struct sockaddr_in *usin, int addr_len)
   	 *	connect() to INADDR_ANY means loopback (BSD'ism).
   	 */
 
-  	if(usin->sin_addr.s_addr==INADDR_ANY)
+  	if (usin->sin_addr.s_addr==INADDR_ANY)
 		usin->sin_addr.s_addr=ip_my_addr();
 
 	/*
@@ -1931,26 +1977,25 @@ static int tcp_connect(struct sock *sk, struct sockaddr_in *usin, int addr_len)
 	if ((atype=ip_chk_addr(usin->sin_addr.s_addr)) == IS_BROADCAST || atype==IS_MULTICAST)
 		return -ENETUNREACH;
 
+	if (!tcp_unique_address(sk->saddr, sk->num, usin->sin_addr.s_addr, usin->sin_port))
+		return -EADDRNOTAVAIL;
+
 	lock_sock(sk);
 	sk->daddr = usin->sin_addr.s_addr;
-	sk->write_seq = tcp_init_seq();
-	sk->window_seq = sk->write_seq;
-	sk->rcv_ack_seq = sk->write_seq -1;
+
 	sk->rcv_ack_cnt = 1;
 	sk->err = 0;
 	sk->dummy_th.dest = usin->sin_port;
-	release_sock(sk);
 
 	buff = sock_wmalloc(sk,MAX_SYN_SIZE,0, GFP_KERNEL);
 	if (buff == NULL)
 	{
+		release_sock(sk);
 		return(-ENOMEM);
 	}
-	lock_sock(sk);
 	buff->sk = sk;
 	buff->free = 0;
 	buff->localroute = sk->localroute;
-
 
 	/*
 	 *	Put in the IP header and routing stuff.
@@ -1967,6 +2012,15 @@ static int tcp_connect(struct sock *sk, struct sockaddr_in *usin, int addr_len)
 	if ((rt = sk->ip_route_cache) != NULL && !sk->saddr)
 		sk->saddr = rt->rt_src;
 	sk->rcv_saddr = sk->saddr;
+
+	/*
+	 * Set up our outgoing TCP sequence number
+	 */
+	sk->write_seq = secure_tcp_sequence_number(sk->saddr, sk->daddr,
+						   sk->dummy_th.source,
+						   usin->sin_port);
+	sk->window_seq = sk->write_seq;
+	sk->rcv_ack_seq = sk->write_seq -1;
 
 	t1 = (struct tcphdr *) skb_put(buff,sizeof(struct tcphdr));
 

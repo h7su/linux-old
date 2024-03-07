@@ -28,9 +28,12 @@
  *		Eric Schenk	: 	Skip fast retransmit on small windows.
  *		Eric schenk	:	Fixes to retransmission code to
  *				:	avoid extra retransmission.
+ *		Theodore Ts'o	:	Do secure TCP sequence numbers.
  */
 
 #include <linux/config.h>
+#include <linux/types.h>
+#include <linux/random.h>
 #include <net/tcp.h>
 
 /*
@@ -208,7 +211,17 @@ static void bad_tcp_sequence(struct sock *sk, struct tcphdr *th, u32 end_seq,
 	 * 	from the far end, but sometimes it means the far end lost
 	 *	an ACK we sent, so we better send an ACK.
 	 */
-	tcp_send_ack(sk);
+	/*
+	 *	BEWARE! Unconditional answering by ack to out-of-window ack
+	 *	can result in infinite exchange of empty acks.
+	 *	This check cures bug, found by Michiel Boland, but
+	 *	not another possible cases.
+	 *	If we are in TCP_TIME_WAIT, we have already received
+	 *	FIN, so that our peer need not window update. If our
+	 *	ACK were lost, peer would retransmit his FIN anyway. --ANK
+	 */
+	if (sk->state != TCP_TIME_WAIT || ntohl(th->seq) != end_seq)
+		tcp_send_ack(sk);
 }
 
 /*
@@ -965,10 +978,11 @@ static int tcp_ack(struct sock *sk, struct tcphdr *th, u32 ack, int len)
 	/*
 	 * Maybe we can take some stuff off of the write queue,
 	 * and put it onto the xmit queue.
-	 * FIXME: (?) There is bizarre case being tested here, to check if
+	 * There is bizarre case being tested here, to check if
 	 * the data at the head of the queue ends before the start of
-	 * the sequence we already ACKed. This does not appear to be
-	 * a case that can actually occur. Why are we testing it?
+	 * the sequence we already ACKed. This is not an error,
+	 * it can occur when we send a packet directly off of the write_queue
+	 * in a zero window probe.
 	 */
 
 	if (!skb_queue_empty(&sk->write_queue) &&
@@ -1282,7 +1296,7 @@ static int tcp_fin(struct sk_buff *skb, struct sock *sk, struct tcphdr *th)
 					 * and lost it from the queue before
 					 * changing the ack properly].
 					 */
-					printk(KERN_ERR "Lost timer or fin packet in tcp_fin.");
+					printk(KERN_ERR "Lost timer or fin packet in tcp_fin.\n");
 				}
 			}
 			tcp_set_state(sk,TCP_CLOSING);
@@ -1722,6 +1736,7 @@ int tcp_rcv(struct sk_buff *skb, struct device *dev, struct options *opt,
 	struct tcphdr *th;
 	struct sock *sk;
 	int syn_ok=0;
+	__u32 seq;
 #ifdef CONFIG_IP_TRANSPARENT_PROXY
 	int r;
 #endif
@@ -1849,7 +1864,7 @@ int tcp_rcv(struct sk_buff *skb, struct device *dev, struct options *opt,
 			 * handle them locally, due to transparent proxying.
 			 * Thus, narrow down the test to what is really meant.
 			 */
-			if(th->rst || !th->syn || th->ack || (r = ip_chk_addr(daddr) == IS_BROADCAST || r == IS_MULTICAST))
+			if(th->rst || !th->syn || th->ack || (r = ip_chk_addr(daddr)) == IS_BROADCAST || r == IS_MULTICAST)
 #else
 			if(th->rst || !th->syn || th->ack || ip_chk_addr(daddr)!=IS_MYADDR)
 #endif
@@ -1859,10 +1874,12 @@ int tcp_rcv(struct sk_buff *skb, struct device *dev, struct options *opt,
 			}
 		
 			/*	
-			 *	Guess we need to make a new socket up 
+			 *	Guess we need to make a new socket up
 			 */
-		
-			tcp_conn_request(sk, skb, daddr, saddr, opt, dev, tcp_init_seq());
+			seq = secure_tcp_sequence_number(saddr, daddr,
+							 skb->h.th->dest,
+							 skb->h.th->source);
+			tcp_conn_request(sk, skb, daddr, saddr, opt, dev, seq);
 		
 			/*
 			 *	Now we have several options: In theory there is nothing else

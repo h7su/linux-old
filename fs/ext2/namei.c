@@ -163,10 +163,12 @@ int ext2_lookup (struct inode * dir, const char * name, int len,
 		return -ENOENT;
 	if (!S_ISDIR(dir->i_mode)) {
 		iput (dir);
-		return -ENOENT;
+		return -ENOTDIR;
 	}
-	if (len > EXT2_NAME_LEN)
+	if (len > EXT2_NAME_LEN) {
+		iput (dir);
 		return -ENAMETOOLONG;
+	}
 	if (dcache_lookup(dir, name, len, &ino)) {
 		if (!ino) {
 			iput(dir);
@@ -407,8 +409,10 @@ int ext2_mknod (struct inode * dir, const char * name, int len, int mode,
 	if (!dir)
 		return -ENOENT;
 
-	if (len > EXT2_NAME_LEN)
+	if (len > EXT2_NAME_LEN) {
+		iput (dir);
 		return -ENAMETOOLONG;
+	}
 	bh = ext2_find_entry (dir, name, len, &de);
 	if (bh) {
 		brelse (bh);
@@ -472,8 +476,10 @@ int ext2_mkdir (struct inode * dir, const char * name, int len, int mode)
 
 	if (!dir)
 		return -ENOENT;
-	if (len > EXT2_NAME_LEN)
+	if (len > EXT2_NAME_LEN) {
+		iput (dir);
 		return -ENAMETOOLONG;
+	}
 	bh = ext2_find_entry (dir, name, len, &de);
 	if (bh) {
 		brelse (bh);
@@ -513,7 +519,7 @@ int ext2_mkdir (struct inode * dir, const char * name, int len, int mode)
 	inode->i_nlink = 2;
 	mark_buffer_dirty(dir_block, 1);
 	brelse (dir_block);
-	inode->i_mode = S_IFDIR | (mode & S_IRWXUGO & ~current->fs->umask);
+	inode->i_mode = S_IFDIR | (mode & (S_IRWXUGO|S_ISVTX) & ~current->fs->umask);
 	if (dir->i_mode & S_ISGID)
 		inode->i_mode |= S_ISGID;
 	inode->i_dirt = 1;
@@ -611,8 +617,10 @@ repeat:
 	if (!dir)
 		return -ENOENT;
 	inode = NULL;
-	if (len > EXT2_NAME_LEN)
+	if (len > EXT2_NAME_LEN) {
+		iput (dir);
 		return -ENAMETOOLONG;
+	}
 	bh = ext2_find_entry (dir, name, len, &de);
 	retval = -ENOENT;
 	if (!bh)
@@ -699,8 +707,10 @@ repeat:
 		return -ENOENT;
 	retval = -ENOENT;
 	inode = NULL;
-	if (len > EXT2_NAME_LEN)
+	if (len > EXT2_NAME_LEN) {
+		iput (dir);
 		return -ENAMETOOLONG;
+	}
 	bh = ext2_find_entry (dir, name, len, &de);
 	if (!bh)
 		goto end_unlink;

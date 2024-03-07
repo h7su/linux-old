@@ -90,7 +90,7 @@ trix_set_wss_port (struct address_info *hw_config)
   if (kilroy_was_here)		/* Already initialized */
     return 0;
 
-  if (trix_read (0x15) != 0x71)	/* No asic signature */
+  if (trix_read (0x15) != 0x71)	/* No ASIC signature */
     {
       DDB (printk ("No AudioTrix ASIC signature found\n"));
       return 0;
@@ -442,7 +442,9 @@ unload_trix_mpu (struct address_info *hw_config)
 void
 unload_trix_sb (struct address_info *hw_config)
 {
+#ifdef CONFIG_SBDSP
   unload_sb (hw_config);
+#endif
 }
 
 

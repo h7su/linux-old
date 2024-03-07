@@ -1549,7 +1549,7 @@ guswave_start_note2 (int dev, int voice, int note_num, int volume)
       gus_write_addr (0x02, sample_ptrs[sample] + samples[sample].loop_start,
 		      samples[sample].fractions & 0x0f,
 		      is16bits);	/* Loop start location */
-      gus_write_addr (0x04, sample_ptrs[sample] + samples[sample].len,
+      gus_write_addr (0x04, sample_ptrs[sample] + samples[sample].loop_end,
 		      (samples[sample].fractions >> 4) & 0x0f,
 		      is16bits);	/* Loop end location */
     }
@@ -1560,7 +1560,7 @@ guswave_start_note2 (int dev, int voice, int note_num, int volume)
       voices[voice].loop_irq_parm = 1;
       gus_write_addr (0x02, sample_ptrs[sample],
 		      0, is16bits);	/* Loop start location */
-      gus_write_addr (0x04, sample_ptrs[sample] + samples[sample].loop_end - 1,
+      gus_write_addr (0x04, sample_ptrs[sample] + samples[sample].len - 1,
 		      (samples[sample].fractions >> 4) & 0x0f,
 		      is16bits);	/* Loop end location */
     }
@@ -1666,7 +1666,7 @@ guswave_open (int dev, int mode)
 
   if ((err = DMAbuf_open_dma (gus_devnum)) < 0)
     {
-      /* printk ("GUS: Loading saples without DMA\n"); */
+      /* printk ("GUS: Loading samples without DMA\n"); */
       gus_no_dma = 1;		/* Upload samples using PIO */
     }
   else
@@ -1788,7 +1788,7 @@ guswave_load_patch (int dev, int format, const char *addr,
       if ((free_mem_ptr / GUS_BANK_SIZE) !=
 	  ((free_mem_ptr + patch.len) / GUS_BANK_SIZE))
 	{
-	  unsigned long   tmp_mem =	/* Aling to 256K */
+	  unsigned long   tmp_mem =	/* Align to 256K */
 	  ((free_mem_ptr / GUS_BANK_SIZE) + 1) * GUS_BANK_SIZE;
 
 	  if ((tmp_mem + patch.len) > gus_mem_size)
@@ -2195,7 +2195,7 @@ gus_audio_ioctl (int dev, unsigned int cmd, caddr_t arg, int local)
     case SOUND_PCM_WRITE_RATE:
       if (local)
 	return gus_audio_set_speed ((int) arg);
-      return snd_ioctl_return ((int *) arg, gus_audio_set_speed (get_fs_long ((long *) arg)));
+      return snd_ioctl_return ((int *) arg, gus_audio_set_speed (get_user ((int *) arg)));
       break;
 
     case SOUND_PCM_READ_RATE:
@@ -2207,13 +2207,13 @@ gus_audio_ioctl (int dev, unsigned int cmd, caddr_t arg, int local)
     case SNDCTL_DSP_STEREO:
       if (local)
 	return gus_audio_set_channels ((int) arg + 1) - 1;
-      return snd_ioctl_return ((int *) arg, gus_audio_set_channels (get_fs_long ((long *) arg) + 1) - 1);
+      return snd_ioctl_return ((int *) arg, gus_audio_set_channels (get_user ((int *) arg) + 1) - 1);
       break;
 
     case SOUND_PCM_WRITE_CHANNELS:
       if (local)
 	return gus_audio_set_channels ((int) arg);
-      return snd_ioctl_return ((int *) arg, gus_audio_set_channels (get_fs_long ((long *) arg)));
+      return snd_ioctl_return ((int *) arg, gus_audio_set_channels (get_user ((int *) arg)));
       break;
 
     case SOUND_PCM_READ_CHANNELS:
@@ -2225,7 +2225,7 @@ gus_audio_ioctl (int dev, unsigned int cmd, caddr_t arg, int local)
     case SNDCTL_DSP_SETFMT:
       if (local)
 	return gus_audio_set_bits ((int) arg);
-      return snd_ioctl_return ((int *) arg, gus_audio_set_bits (get_fs_long ((long *) arg)));
+      return snd_ioctl_return ((int *) arg, gus_audio_set_bits (get_user ((int *) arg)));
       break;
 
     case SOUND_PCM_READ_BITS:
@@ -2514,7 +2514,7 @@ gus_transfer_output_block (int dev, unsigned long buf,
   if (audio_devs[dev]->dmachan1 > 3)
     dma_command |= 0x04;	/* 16 bit DMA channel */
 
-  gus_write8 (0x41, dma_command);	/* Kickstart */
+  gus_write8 (0x41, dma_command);	/* Kick start */
 
   if (chn == (gus_audio_channels - 1))	/* Last channel */
     {
@@ -2715,7 +2715,7 @@ guswave_setup_voice (int dev, int voice, int chn)
   guswave_set_instr (dev, voice, info->pgm_num);
 
   voices[voice].expression_vol =
-    info->controllers[CTL_EXPRESSION];	/* Just msb */
+    info->controllers[CTL_EXPRESSION];	/* Just MSB */
   voices[voice].main_vol =
     (info->controllers[CTL_MAIN_VOLUME] * 100) / (unsigned) 128;
   voices[voice].panning =
@@ -2862,7 +2862,7 @@ guswave_patchmgr (int dev, struct patmgr_info *rec)
 				 */
 
 	offs += sample_ptrs[sample];	/*
-					 * Begin offsess + offset to DRAM
+					 * Begin offsets + offset to DRAM
 					 */
 
 	for (n = 0; n < l; n++)
@@ -2907,7 +2907,7 @@ guswave_patchmgr (int dev, struct patmgr_info *rec)
 				 */
 
 	offs += sample_ptrs[sample];	/*
-					 * Begin offsess + offset to DRAM
+					 * Begin offsets + offset to DRAM
 					 */
 
 	for (n = 0; n < l; n++)
@@ -3046,7 +3046,7 @@ gus_default_mixer_ioctl (int dev, unsigned int cmd, caddr_t arg)
 	switch (cmd & 0xff)
 	  {
 	  case SOUND_MIXER_RECSRC:
-	    gus_recmask = get_fs_long ((long *) arg) & MIX_DEVS;
+	    gus_recmask = get_user ((int *) arg) & MIX_DEVS;
 	    if (!(gus_recmask & (SOUND_MASK_MIC | SOUND_MASK_LINE)))
 	      gus_recmask = SOUND_MASK_MIC;
 	    /* Note! Input volumes are updated during next open for recording */
@@ -3055,7 +3055,7 @@ gus_default_mixer_ioctl (int dev, unsigned int cmd, caddr_t arg)
 
 	  case SOUND_MIXER_MIC:
 	    {
-	      int             vol = get_fs_long ((long *) arg) & 0xff;
+	      int             vol = get_user ((int *) arg) & 0xff;
 
 	      if (vol < 0)
 		vol = 0;
@@ -3069,7 +3069,7 @@ gus_default_mixer_ioctl (int dev, unsigned int cmd, caddr_t arg)
 
 	  case SOUND_MIXER_LINE:
 	    {
-	      int             vol = get_fs_long ((long *) arg) & 0xff;
+	      int             vol = get_user ((int *) arg) & 0xff;
 
 	      if (vol < 0)
 		vol = 0;
@@ -3082,7 +3082,7 @@ gus_default_mixer_ioctl (int dev, unsigned int cmd, caddr_t arg)
 	    break;
 
 	  case SOUND_MIXER_PCM:
-	    gus_pcm_volume = get_fs_long ((long *) arg) & 0xff;
+	    gus_pcm_volume = get_user ((int *) arg) & 0xff;
 	    if (gus_pcm_volume < 0)
 	      gus_pcm_volume = 0;
 	    if (gus_pcm_volume > 100)
@@ -3095,7 +3095,7 @@ gus_default_mixer_ioctl (int dev, unsigned int cmd, caddr_t arg)
 	    {
 	      int             voice;
 
-	      gus_wave_volume = get_fs_long ((long *) arg) & 0xff;
+	      gus_wave_volume = get_user ((int *) arg) & 0xff;
 
 	      if (gus_wave_volume < 0)
 		gus_wave_volume = 0;

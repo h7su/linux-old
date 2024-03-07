@@ -32,12 +32,16 @@ extern void timer_interrupt(struct pt_regs * regs);
 #  error Unable to handle more than 64 irq levels.
 #endif
 
+/* Reserved interrupts.  These must NEVER be requested by any driver!
+ */
+#define	IS_RESERVED_IRQ(irq)	((irq)==2)	/* IRQ 2 used by hw cascade */
+
 /*
  * Shadow-copy of masked interrupts.
  *  The bits are used as follows:
- *	 0.. 7	first ISA PIC (irq level 0..7)
- *	 8..15	second ISA PIC (irq level 8..15)
- *   Systems with 32 PCI interrupt lines (e.g., Alcor):
+ *	 0.. 7	first (E)ISA PIC (irq level 0..7)
+ *	 8..15	second (E)ISA PIC (irq level 8..15)
+ *   Systems with PCI interrupt lines managed by GRU (e.g., Alcor, XLT):
  *	16..47	PCI interrupts 0..31 (int at GRU_INT_MASK)
  *   Mikasa:
  *	16..31	PCI interrupts 0..15 (short at I/O port 536)
@@ -60,8 +64,7 @@ static void update_hw(unsigned long irq, unsigned long mask)
 #if NR_IRQS == 48
 	      default:
 		/* note inverted sense of mask bits: */
-		*(unsigned int *)GRU_INT_MASK = ~(mask >> 16);
-		mb();
+		*(unsigned int *)GRU_INT_MASK = ~(mask >> 16); mb();
 		break;
 
 #elif NR_IRQS == 33
@@ -166,17 +169,12 @@ static inline void ack_irq(int irq)
 		}
 		/* .. then the master */
 		outb(0xE0 | irq, 0x20);
+#if defined(CONFIG_ALPHA_ALCOR) || defined(CONFIG_ALPHA_XLT)
+		/* on ALCOR/XLT, need to dismiss interrupt via GRU */
+		*(int *)GRU_INT_CLEAR = 0x80000000; mb();
+		*(int *)GRU_INT_CLEAR = 0x00000000; mb();
+#endif /* ALCOR || XLT */
 	}
-#if 0
-	/* This is not needed since all interrupt are level-sensitive */
-#if defined(CONFIG_ALPHA_ALCOR)
-	/* on ALCOR, need to dismiss interrupt via GRU */
-	*(int *)GRU_INT_CLEAR = 0x80000000;
-	mb();
-	*(int *)GRU_INT_CLEAR = 0x00000000;
-	mb();
-#endif /* CONFIG_ALPHA_ALCOR */
-#endif
 }
 
 int request_irq(unsigned int irq, 
@@ -190,6 +188,8 @@ int request_irq(unsigned int irq,
 	unsigned long flags;
 
 	if (irq >= NR_IRQS)
+		return -EINVAL;
+	if (IS_RESERVED_IRQ(irq))
 		return -EINVAL;
 	if (!handler)
 		return -EINVAL;
@@ -245,6 +245,10 @@ void free_irq(unsigned int irq, void *dev_id)
 
 	if (irq >= NR_IRQS) {
 		printk("Trying to free IRQ%d\n",irq);
+		return;
+	}
+	if (IS_RESERVED_IRQ(irq)) {
+		printk("Trying to free reserved IRQ %d\n", irq);
 		return;
 	}
 	for (p = irq + irq_action; (action = *p) != NULL; p = &action->next) {
@@ -413,6 +417,42 @@ static inline void isa_device_interrupt(unsigned long vector,
 #endif
 }
 
+#if defined(CONFIG_ALPHA_ALCOR) || defined(CONFIG_ALPHA_XLT)
+/* we have to conditionally compile this because of GRU_xxx symbols */
+static inline void alcor_and_xlt_device_interrupt(unsigned long vector,
+                                                  struct pt_regs * regs)
+{
+        unsigned long pld;
+        unsigned int i;
+        unsigned long flags;
+
+        save_flags(flags);
+        cli();
+
+        /* read the interrupt summary register of the GRU */
+        pld = (*(unsigned int *)GRU_INT_REQ) & GRU_INT_REQ_BITS;
+
+#if 0
+        printk("[0x%08lx/0x%04x]", pld, inb(0x20) | (inb(0xA0) << 8));
+#endif
+
+        /*
+         * Now for every possible bit set, work through them and call
+         * the appropriate interrupt handler.
+         */
+        while (pld) {
+                i = ffz(~pld);
+                pld &= pld - 1; /* clear least bit set */
+                if (i == 31) {
+                        isa_device_interrupt(vector, regs);
+                } else {
+                        device_interrupt(16 + i, 16 + i, regs);
+                }
+        }
+        restore_flags(flags);
+}
+#endif /* ALCOR || XLT */
+
 static inline void cabriolet_and_eb66p_device_interrupt(unsigned long vector,
 							struct pt_regs * regs)
 {
@@ -443,6 +483,41 @@ static inline void cabriolet_and_eb66p_device_interrupt(unsigned long vector,
 			device_interrupt(16 + i, 16 + i, regs);
 		}
 	}
+	restore_flags(flags);
+}
+
+static inline void mikasa_device_interrupt(unsigned long vector,
+					   struct pt_regs * regs)
+{
+	unsigned long pld;
+	unsigned int i;
+	unsigned long flags;
+
+	save_flags(flags);
+	cli();
+
+        /* read the interrupt summary registers */
+        pld = (((unsigned long) (~inw(0x534)) & 0x0000ffffUL) << 16) |
+	       (((unsigned long) inb(0xa0))  <<  8) |
+	       ((unsigned long) inb(0x20));
+
+#if 0
+        printk("[0x%08lx]", pld);
+#endif
+
+        /*
+         * Now for every possible bit set, work through them and call
+         * the appropriate interrupt handler.
+         */
+        while (pld) {
+		i = ffz(~pld);
+		pld &= pld - 1; /* clear least bit set */
+		if (i < 16) {
+			isa_device_interrupt(vector, regs);
+		} else {
+			device_interrupt(i, i, regs);
+		}
+        }
 	restore_flags(flags);
 }
 
@@ -620,14 +695,14 @@ asmlinkage void do_entInt(unsigned long type, unsigned long vector, unsigned lon
 #if defined(CONFIG_ALPHA_JENSEN) || defined(CONFIG_ALPHA_NONAME) || \
     defined(CONFIG_ALPHA_P2K) || defined(CONFIG_ALPHA_SRM)
 			srm_device_interrupt(vector, &regs);
+#elif NR_IRQS == 48
+			alcor_and_xlt_device_interrupt(vector, &regs);
 #elif NR_IRQS == 33
 			cabriolet_and_eb66p_device_interrupt(vector, &regs);
+#elif defined(CONFIG_ALPHA_MIKASA)
+			mikasa_device_interrupt(vector, &regs);
 #elif NR_IRQS == 32
-# ifdef CONFIG_ALPHA_MIKASA
-#	error  we got a problem here Charlie MIKASA should be SRM console
-# else
 			eb66_and_eb64p_device_interrupt(vector, &regs);
-# endif
 #elif NR_IRQS == 16
 			isa_device_interrupt(vector, &regs);
 #endif
@@ -651,9 +726,8 @@ void init_IRQ(void)
 	dma_outb(0, DMA1_CLR_MASK_REG);
 	dma_outb(0, DMA2_CLR_MASK_REG);
 #if NR_IRQS == 48
-	*(unsigned int *)GRU_INT_MASK = ~(irq_mask >> 16);	/* invert */
-	mb();
-	enable_irq(16 + 31);	/* enable EISA PIC cascade */
+	*(unsigned int *)GRU_INT_MASK = ~(irq_mask >> 16); mb();/* invert */
+	enable_irq(16 + 31);	/* enable (E)ISA PIC cascade */
 #elif NR_IRQS == 33
 	outl(irq_mask >> 16, 0x804);
 	enable_irq(16 +  4);	/* enable SIO cascade */

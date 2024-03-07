@@ -161,6 +161,7 @@ extern void tcp_send_reset(unsigned long saddr, unsigned long daddr, struct tcph
 
 extern void tcp_enqueue_partial(struct sk_buff *, struct sock *);
 extern struct sk_buff * tcp_dequeue_partial(struct sock *);
+extern void tcp_shrink_skb(struct sock *,struct sk_buff *,u32);
 
 /* tcp_input.c */
 extern void tcp_cache_zap(void);
@@ -173,22 +174,6 @@ extern int tcp_chkaddr(struct sk_buff *);
 extern void tcp_reset_xmit_timer(struct sock *, int, unsigned long);
 extern void tcp_delack_timer(unsigned long);
 extern void tcp_retransmit_timer(unsigned long);
-
-/*
- *	Default sequence number picking algorithm.
- *	As close as possible to RFC 793, which
- *	suggests using a 250kHz clock.
- *	Further reading shows this assumes 2MB/s networks.
- *	For 10MB/s ethernet, a 1MHz clock is appropriate.
- *	That's funny, Linux has one built in!  Use it!
- */
-
-static inline u32 tcp_init_seq(void)
-{
-	struct timeval tv;
-	do_gettimeofday(&tv);
-	return tv.tv_usec+tv.tv_sec*1000000;
-}
 
 static __inline__ int tcp_old_window(struct sock * sk)
 {

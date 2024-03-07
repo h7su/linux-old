@@ -16,7 +16,7 @@
 #define DEB(what)		/* (what) */
 #endif
 
-extern int      translat_code;
+extern int      translate_code;
 extern char     pas_model;
 extern int     *pas_osp;
 extern int      pas_audiodev;
@@ -61,7 +61,7 @@ mix_write (unsigned char data, int ioaddr)
 
   if (pas_model == 4)
     {
-      outw (data | (data << 8), (ioaddr ^ translat_code) - 1);
+      outw (data | (data << 8), (ioaddr ^ translate_code) - 1);
       outb (0x80, 0);
     }
   else
@@ -218,7 +218,7 @@ pas_mixer_ioctl (int dev, unsigned int cmd, caddr_t arg)
 
   if (cmd == SOUND_MIXER_PRIVATE1)	/* Set loudness bit */
     {
-      int             level = get_fs_long ((long *) arg);
+      int             level = get_user ((int *) arg);
 
       if (level == -1)		/* Return current settings */
 	{
@@ -240,7 +240,7 @@ pas_mixer_ioctl (int dev, unsigned int cmd, caddr_t arg)
 
   if (cmd == SOUND_MIXER_PRIVATE2)	/* Set enhance bit */
     {
-      int             level = get_fs_long ((long *) arg);
+      int             level = get_user ((int *) arg);
 
       if (level == -1)		/* Return current settings */
 	{
@@ -269,7 +269,7 @@ pas_mixer_ioctl (int dev, unsigned int cmd, caddr_t arg)
 
   if (cmd == SOUND_MIXER_PRIVATE3)	/* Set mute bit */
     {
-      int             level = get_fs_long ((long *) arg);
+      int             level = get_user ((int *) arg);
 
       if (level == -1)		/* Return current settings */
 	{
@@ -293,7 +293,7 @@ pas_mixer_ioctl (int dev, unsigned int cmd, caddr_t arg)
   if (((cmd >> 8) & 0xff) == 'M')
     {
       if (_IOC_DIR (cmd) & _IOC_WRITE)
-	return snd_ioctl_return ((int *) arg, pas_mixer_set (cmd & 0xff, get_fs_long ((long *) arg)));
+	return snd_ioctl_return ((int *) arg, pas_mixer_set (cmd & 0xff, get_user ((int *) arg)));
       else
 	{			/*
 				 * Read parameters

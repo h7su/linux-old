@@ -10,6 +10,7 @@
 #include <linux/stat.h>
 #include <linux/kernel.h>
 #include <linux/malloc.h>
+#include <linux/vmalloc.h>
 #include <linux/mm.h>
 #include <linux/ncp_fs.h>
 #include <asm/segment.h>
@@ -92,6 +93,20 @@ str_lower(char *name)
 	}
 }
 
+static inline int
+ncp_namespace(struct inode *i)
+{
+	struct ncp_server *server   = NCP_SERVER(i);
+	struct nw_info_struct *info = NCP_ISTRUCT(i);
+	return server->name_space[info->volNumber];
+}
+
+static inline int
+ncp_preserve_case(struct inode *i)
+{
+	return (ncp_namespace(i) == NW_NS_OS2);
+}
+
 static struct file_operations ncp_dir_operations = {
         NULL,			/* lseek - default */
 	ncp_dir_read,		/* read - bad */
@@ -128,7 +143,7 @@ struct inode_operations ncp_dir_inode_operations = {
 /* Here we encapsulate the inode number handling that depends upon the
  * mount mode: When we mount a complete server, the memory address of
  * the ncp_inode_info is used as the inode number. When only a single
- * volume is mounted, then the DosDirNum is used as the inode
+ * volume is mounted, then the dirEntNum is used as the inode
  * number. As this is unique for the complete volume, this should
  * enable the NFS exportability of a ncpfs-mounted volume.
  */
@@ -143,7 +158,7 @@ inline ino_t
 ncp_info_ino(struct ncp_server *server, struct ncp_inode_info *info)
 {
 	return ncp_single_volume(server)
-		? info->finfo.i.DosDirNum : (ino_t)info;
+		? info->finfo.i.dirEntNum : (ino_t)info;
 }
 
 static inline int
@@ -177,8 +192,6 @@ ncp_find_inode(struct inode *inode)
 	return NULL;
 }
 	
-
-
 static int 
 ncp_dir_read(struct inode *inode, struct file *filp, char *buf, int count)
 {
@@ -240,7 +253,7 @@ ncp_readdir(struct inode *inode, struct file *filp,
 	if (c_entry == NULL) 
 	{
 		i = sizeof (struct ncp_dirent) * NCP_READDIR_CACHE_SIZE;
-		c_entry = (struct ncp_dirent *) ncp_kmalloc(i, GFP_KERNEL);
+		c_entry = (struct ncp_dirent *) vmalloc(i);
 		if (c_entry == NULL)
 		{
 			printk("ncp_readdir: no MEMORY for cache\n");
@@ -326,9 +339,12 @@ ncp_readdir(struct inode *inode, struct file *filp,
                         c_last_returned_index = 0;
                         index = 0;
 
-			for (i = 0; i < c_size; i++)
+			if (!ncp_preserve_case(inode))
 			{
-				str_lower(c_entry[i].i.entryName);
+				for (i = 0; i < c_size; i++)
+				{
+					str_lower(c_entry[i].i.entryName);
+				}
 			}
 		}
 	}
@@ -345,7 +361,7 @@ ncp_readdir(struct inode *inode, struct file *filp,
 
 		if (ncp_single_volume(server))
 		{
-			ino = (ino_t)(entry->i.DosDirNum);
+			ino = (ino_t)(entry->i.dirEntNum);
 		}
 		else
 		{
@@ -545,9 +561,8 @@ ncp_free_dir_cache(void)
                 return;
 	}
 
-        ncp_kfree_s(c_entry,
-                    sizeof(struct ncp_dirent) * NCP_READDIR_CACHE_SIZE);
-        c_entry = NULL;
+	vfree(c_entry);
+	c_entry = NULL;
 
         DPRINTK("ncp_free_dir_cache: exit\n");
 }
@@ -652,7 +667,7 @@ ncp_init_root(struct ncp_server *server)
         root->finfo.opened = 0;
 	i->attributes  = aDIR;
 	i->dataStreamSize = 1024;
-	i->DosDirNum = 0;
+	i->dirEntNum = i->DosDirNum = 0;
 	i->volNumber = NCP_NUMBER_OF_VOLUMES+1;	/* illegal volnum */
 	ncp_date_unix2dos(0, &(i->creationTime), &(i->creationDate));
 	ncp_date_unix2dos(0, &(i->modifyTime), &(i->modifyDate));
@@ -729,7 +744,7 @@ ncp_find_dir_inode(struct inode *dir, const char *name)
 
         do
 	{
-		if (   (result->dir->finfo.i.DosDirNum == dir_info->DosDirNum)
+		if (   (result->dir->finfo.i.dirEntNum == dir_info->dirEntNum)
 		    && (result->dir->finfo.i.volNumber == dir_info->volNumber)
 		    && (strcmp(result->finfo.i.entryName, name) == 0)
 		    /* The root dir is never looked up using this
@@ -757,6 +772,7 @@ ncp_lookup(struct inode *dir, const char *__name, int len,
 	struct ncp_server *server;
 	struct ncp_inode_info *result_info;
 	int found_in_cache;
+	int down_case = 0;
 	char name[len+1];
 
 	*result = NULL;
@@ -867,20 +883,26 @@ ncp_lookup(struct inode *dir, const char *__name, int len,
         if (found_in_cache == 0)
 	{
 		int res;
-		str_upper(name);
 
 		DDPRINTK("ncp_lookup: do_lookup on %s/%s\n",
 			 NCP_ISTRUCT(dir)->entryName, name);
 
 		if (ncp_is_server_root(dir))
 		{
+			str_upper(name);
+			down_case = 1;
 			res = ncp_lookup_volume(server, name, &(finfo.i));
 		}
 		else
 		{
+			if (!ncp_preserve_case(dir))
+			{
+				str_upper(name);
+				down_case = 1;
+			}
 			res = ncp_obtain_info(server,
 					      NCP_ISTRUCT(dir)->volNumber,
-					      NCP_ISTRUCT(dir)->DosDirNum,
+					      NCP_ISTRUCT(dir)->dirEntNum,
 					      name, &(finfo.i));
 		}
 		if (res != 0)
@@ -892,7 +914,11 @@ ncp_lookup(struct inode *dir, const char *__name, int len,
         }
 
 	finfo.opened = 0;
-	str_lower(finfo.i.entryName);
+
+	if (down_case != 0)
+	{
+		str_lower(finfo.i.entryName);
+	}
 
 	if (!(*result = ncp_iget(dir, &finfo)))
 	{
@@ -929,7 +955,11 @@ ncp_create(struct inode *dir, const char *name, int len, int mode,
 
 	strncpy(_name, name, len);
 	_name[len] = '\0';
-	str_upper(_name);
+
+	if (!ncp_preserve_case(dir))
+	{
+		str_upper(_name);
+	}
 
 	lock_super(dir->i_sb);
 	if (ncp_open_create_file_or_subdir(NCP_SERVER(dir),
@@ -946,7 +976,11 @@ ncp_create(struct inode *dir, const char *name, int len, int mode,
 
 	ncp_invalid_dir_cache(dir);
 
-	str_lower(finfo.i.entryName);
+	if (!ncp_preserve_case(dir))
+	{
+		str_lower(finfo.i.entryName);
+	}
+
 	finfo.access = O_RDWR;
 
 	if (!(*result = ncp_iget(dir, &finfo)) < 0)
@@ -980,7 +1014,11 @@ ncp_mkdir(struct inode *dir, const char *name, int len, int mode)
 
 	strncpy(_name, name, len);
 	_name[len] = '\0';
-	str_upper(_name);
+
+	if (!ncp_preserve_case(dir))
+	{
+		str_upper(_name);
+	}
 
 	if (!dir || !S_ISDIR(dir->i_mode))
 	{
@@ -1038,7 +1076,11 @@ ncp_rmdir(struct inode *dir, const char *name, int len)
 
 		strncpy(_name, name, len);
 		_name[len] = '\0';
-		str_upper(_name);
+
+		if (!ncp_preserve_case(dir))
+		{
+			str_upper(_name);
+		}
 
                 if ((error = ncp_del_file_or_subdir(NCP_SERVER(dir),
 						    NCP_ISTRUCT(dir),
@@ -1081,7 +1123,11 @@ ncp_unlink(struct inode *dir, const char *name, int len)
 	{
 		strncpy(_name, name, len);
 		_name[len] = '\0';
-		str_upper(_name);
+
+		if (!ncp_preserve_case(dir))
+		{
+			str_upper(_name);
+		}
 
                 if ((error = ncp_del_file_or_subdir(NCP_SERVER(dir),
 						    NCP_ISTRUCT(dir),
@@ -1136,11 +1182,19 @@ ncp_rename(struct inode *old_dir, const char *old_name, int old_len,
 
 	strncpy(_old_name, old_name, old_len);
 	_old_name[old_len] = '\0';
-	str_upper(_old_name);
+
+	if (!ncp_preserve_case(old_dir))
+	{
+		str_upper(_old_name);
+	}
 
 	strncpy(_new_name, new_name, new_len);
 	_new_name[new_len] = '\0';
-	str_upper(_new_name);
+
+	if (!ncp_preserve_case(new_dir))
+	{
+		str_upper(_new_name);
+	}
 
 	res = ncp_ren_or_mov_file_or_subdir(NCP_SERVER(old_dir),
 					    NCP_ISTRUCT(old_dir), _old_name,
@@ -1175,13 +1229,15 @@ extern struct timezone sys_tz;
 static int
 utc2local(int time)
 {
-        return time - sys_tz.tz_minuteswest*60;
+        return time - sys_tz.tz_minuteswest*60 +
+	    (sys_tz.tz_dsttime ? 3600 : 0);
 }
 
 static int
 local2utc(int time)
 {
-        return time + sys_tz.tz_minuteswest*60;
+        return time + sys_tz.tz_minuteswest*60 -
+	    (sys_tz.tz_dsttime ? 3600 : 0);
 }
 
 /* Convert a MS-DOS time/date pair to a UNIX date (seconds since 1 1 70). */

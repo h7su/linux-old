@@ -1,6 +1,10 @@
 /*
  *      u14-34f.c - Low-level driver for UltraStor 14F/34F SCSI host adapters.
  *
+ *      09 Jul 1996 rev. 2.11 for linux 2.0.4
+ *          "Data over/under-run" no longer implies a redo on all targets.
+ *          Number of internal retries is now limited.
+ *
  *      16 Apr 1996 rev. 2.10 for linux 1.3.90
  *          New argument "reset_flags" to the reset routine.
  *
@@ -199,6 +203,7 @@ struct proc_dir_entry proc_scsi_u14_34f = {
 #define MAX_MAILBOXES 16
 #define MAX_SGLIST 32
 #define MAX_SAFE_SGLIST 16
+#define MAX_INTERNAL_RETRIES 64
 #define MAX_CMD_PER_LUN 2
 
 #define FALSE 0
@@ -280,6 +285,8 @@ struct hostdata {
    int in_reset;                        /* True if board is doing a reset */
    int target_time_out[MAX_TARGET];     /* N. of timeout errors on target */
    int target_reset[MAX_TARGET];        /* If TRUE redo operation on target */
+   unsigned int retries;                /* Number of internal retries */
+   unsigned long last_retried_pid;      /* Pid of last retried command */
    unsigned char subversion;            /* Bus type, either ISA or ESA */
    unsigned char heads;
    unsigned char sectors;
@@ -315,7 +322,7 @@ static int board_inquiry(unsigned int j) {
    memset(cpp, 0, sizeof(struct mscp));
    cpp->opcode = OP_HOST_ADAPTER;
    cpp->xdir = DTD_IN;
-   cpp->data_address = (unsigned int) HD(j)->board_id;
+   cpp->data_address = virt_to_bus(HD(j)->board_id);
    cpp->data_len = sizeof(HD(j)->board_id);
    cpp->scsi_cdbs_len = 6;
    cpp->scsi_cdbs[0] = HA_CMD_INQUIRY;
@@ -331,7 +338,7 @@ static int board_inquiry(unsigned int j) {
    outb(CMD_CLR_INTR, sh[j]->io_port + REG_SYS_INTR);
 
    /* Store pointer in OGM address bytes */
-   outl((unsigned int)cpp, sh[j]->io_port + REG_OGM);
+   outl(virt_to_bus(cpp), sh[j]->io_port + REG_OGM);
 
    /* Issue OGM interrupt */
    outb(CMD_OGM_INTR, sh[j]->io_port + REG_LCL_INTR);
@@ -561,13 +568,13 @@ static inline void build_sg_list(struct mscp *cpp, Scsi_Cmnd *SCpnt) {
    sgpnt = (struct scatterlist *) SCpnt->request_buffer;
 
    for (k = 0; k < SCpnt->use_sg; k++) {
-      cpp->sglist[k].address = (unsigned int) sgpnt[k].address;
+      cpp->sglist[k].address = virt_to_bus(sgpnt[k].address);
       cpp->sglist[k].num_bytes = sgpnt[k].length;
       data_len += sgpnt[k].length;
       }
 
    cpp->use_sg = SCpnt->use_sg;
-   cpp->data_address = (unsigned int) cpp->sglist;
+   cpp->data_address = virt_to_bus(cpp->sglist);
    cpp->data_len = data_len;
 }
 
@@ -642,7 +649,7 @@ int u14_34f_queuecommand(Scsi_Cmnd *SCpnt, void (*done)(Scsi_Cmnd *)) {
    cpp->target = SCpnt->target;
    cpp->lun = SCpnt->lun;
    cpp->SCpnt = SCpnt;
-   cpp->sense_addr = (unsigned int) SCpnt->sense_buffer;
+   cpp->sense_addr = virt_to_bus(SCpnt->sense_buffer);
    cpp->sense_len = sizeof SCpnt->sense_buffer;
 
    if (SCpnt->use_sg) {
@@ -650,7 +657,7 @@ int u14_34f_queuecommand(Scsi_Cmnd *SCpnt, void (*done)(Scsi_Cmnd *)) {
       build_sg_list(cpp, SCpnt);
       }
    else {
-      cpp->data_address = (unsigned int)SCpnt->request_buffer;
+      cpp->data_address = virt_to_bus(SCpnt->request_buffer);
       cpp->data_len = SCpnt->request_bufflen;
       }
 
@@ -668,7 +675,7 @@ int u14_34f_queuecommand(Scsi_Cmnd *SCpnt, void (*done)(Scsi_Cmnd *)) {
       }
 
    /* Store pointer in OGM address bytes */
-   outl((unsigned int)cpp, sh[j]->io_port + REG_OGM);
+   outl(virt_to_bus(cpp), sh[j]->io_port + REG_OGM);
 
    /* Issue OGM interrupt */
    outb(CMD_OGM_INTR, sh[j]->io_port + REG_LCL_INTR);
@@ -762,6 +769,8 @@ int u14_34f_reset(Scsi_Cmnd * SCarg, unsigned int reset_flags) {
       restore_flags(flags);
       return SCSI_RESET_ERROR;
       }
+
+   HD(j)->retries = 0;
 
    for (k = 0; k < MAX_TARGET; k++) HD(j)->target_reset[k] = TRUE;
 
@@ -892,7 +901,7 @@ static void u14_34f_interrupt_handler(int irq, void *dev_id, struct pt_regs * re
 	 if (do_trace) printk("%s: ihdlr, start service, count %d.\n",
 			      BN(j), HD(j)->iocount);
 
-	 spp = (struct mscp *)inl(sh[j]->io_port + REG_ICM);
+	 spp = (struct mscp *)bus_to_virt(inl(sh[j]->io_port + REG_ICM));
 
 	 /* Clear interrupt pending flag */
 	 outb(CMD_CLR_INTR, sh[j]->io_port + REG_SYS_INTR);
@@ -972,6 +981,8 @@ static void u14_34f_interrupt_handler(int irq, void *dev_id, struct pt_regs * re
 
 	       HD(j)->target_time_out[SCpnt->target] = 0;
 
+               if (HD(j)->last_retried_pid == SCpnt->pid) HD(j)->retries = 0;
+
 	       break;
 	    case ASST:     /* Selection Time Out */
 
@@ -983,19 +994,26 @@ static void u14_34f_interrupt_handler(int irq, void *dev_id, struct pt_regs * re
 		  }
 
 	       break;
-	    case 0x92:     /* Data over/under-run */
+
+            /* Perform a limited number of internal retries */
 	    case 0x93:     /* Unexpected bus free */
 	    case 0x94:     /* Target bus phase sequence failure */
 	    case 0x96:     /* Illegal SCSI command */
 	    case 0xa3:     /* SCSI bus reset error */
 
-	       if (SCpnt->device->type != TYPE_TAPE)
-		  status = DID_BUS_BUSY << 16;
-	       else
-		  status = DID_ERROR << 16;
-
 	       for (k = 0; k < MAX_TARGET; k++) 
 		  HD(j)->target_reset[k] = TRUE;
+
+	    case 0x92:     /* Data over/under-run */
+
+	       if (SCpnt->device->type != TYPE_TAPE
+                   && HD(j)->retries < MAX_INTERNAL_RETRIES) {
+		  status = DID_BUS_BUSY << 16;
+		  HD(j)->retries++;
+                  HD(j)->last_retried_pid = SCpnt->pid;
+                  }
+	       else 
+		  status = DID_ERROR << 16;
 
 	       break;
 	    case 0x01:     /* Invalid command */
@@ -1023,7 +1041,7 @@ static void u14_34f_interrupt_handler(int irq, void *dev_id, struct pt_regs * re
 	      spp->adapter_status != ASST && HD(j)->iocount <= 1000) ||
 	     do_trace)
 #endif
-	    printk("%s: ihdlr, mbox %d, err 0x%x:%x,"\
+	    printk("%s: ihdlr, mbox %2d, err 0x%x:%x,"\
 		   " target %d:%d, pid %ld, count %d.\n",
 		   BN(j), i, spp->adapter_status, spp->target_status,
 		   SCpnt->target, SCpnt->lun, SCpnt->pid, HD(j)->iocount);

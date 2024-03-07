@@ -692,7 +692,6 @@ static int inet_create(struct socket *sock, int protocol)
 	sk->timer.function = &net_timer;
 	skb_queue_head_init(&sk->back_log);
 	sock->data =(void *) sk;
-	sk->dummy_th.doff = sizeof(sk->dummy_th)/4;
 	sk->ip_ttl=ip_statistics.IpDefaultTTL;
 	if(sk->type==SOCK_RAW && protocol==IPPROTO_RAW)
 		sk->ip_hdrincl=1;
@@ -815,7 +814,7 @@ static int inet_bind(struct socket *sock, struct sockaddr *uaddr,
 		
 	/* check this error. */
 	if (sk->state != TCP_CLOSE)
-		return(-EIO);
+		return(-EINVAL);
 	if(addr_len<sizeof(struct sockaddr_in))
 		return -EINVAL;
 		
@@ -926,7 +925,7 @@ static int inet_bind(struct socket *sock, struct sockaddr *uaddr,
 			 *	Reuse ?
 			 */
 			 
-			if (!sk2->dead)
+			if (!sk2->reuse || sk2->state==TCP_LISTEN)
 			{
 				sti();
 				return(-EADDRINUSE);
@@ -1105,6 +1104,12 @@ static int inet_accept(struct socket *sock, struct socket *newsock, int flags)
 		destroy_sock(sk2);
 		newsock->data = NULL;
 		return err;
+	}
+	if (sk2->state == TCP_CLOSE)
+	{
+		destroy_sock(sk2);
+		newsock->data=NULL;
+		return -ECONNABORTED;
 	}
 	newsock->state = SS_CONNECTED;
 	return(0);

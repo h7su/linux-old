@@ -100,13 +100,17 @@
  * 3.13  May 19, 1996 -- Fixes for changer code.
  * 3.14  May 29, 1996 -- Add work-around for Vertos 600.
  *                        (From Hennus Bergman <hennus@sky.ow.nl>.)
+ * 3.15  July 2, 1996 -- Added support for Sanyo 3 CD changers
+ *                        from Ben Galliart <bgallia@luc.edu> with 
+ *                        special help from Jeff Lightfoot 
+ *                        <jeffml@netcom.com>
+ * 3.15a July 9, 1996 -- Improved Sanyo 3 CD changer identification
+ * 3.16  Jul 28, 1996 -- Fix from Gadi to reduce kernel stack usage for ioctl.
+ * 3.17  Sep 17, 1996 -- Tweak audio reads for some drives.
+ *                       Start changing CDROMLOADFROMSLOT to CDROM_SELECT_DISC.
  *
  * NOTE: Direct audio reads will only work on some types of drive.
  * So far, i've received reports of success for Sony and Toshiba drives.
- *
- * NOTE: The changer functions were tested with the NEC CDR-251 drive.
- * They may not work with the Sanyo 3-cd changer, which i understand
- * uses a different protocol.
  *
  * ATAPI cd-rom driver.  To be used with ide.c.
  * See Documentation/cdrom/ide-cd for usage information.
@@ -130,6 +134,7 @@
 #include <linux/errno.h>
 #include <linux/hdreg.h>
 #include <linux/cdrom.h>
+#include <linux/ucdrom.h>
 #include <asm/irq.h>
 #include <asm/io.h>
 #include <asm/byteorder.h>
@@ -163,6 +168,13 @@
 
 #ifndef NO_DOOR_LOCKING
 #define NO_DOOR_LOCKING 0
+#endif
+
+
+/* Size of buffer to allocate, in blocks, for audio reads. */
+
+#ifndef CDROM_NBLOCKS_BUFFER
+#define CDROM_NBLOCKS_BUFFER 8
 #endif
 
 
@@ -237,7 +249,8 @@ struct ide_cd_state_flags {
 	__u8 toc_valid     : 1; /* Saved TOC information is current. */
 	__u8 door_locked   : 1; /* We think that the drive door is locked. */
 	__u8 eject_on_close: 1; /* Drive should eject when device is closed. */
-	__u8 reserved : 4;
+	__u8 sanyo_slot    : 2; /* Sanyo 3 CD changer support */
+	__u8 reserved      : 2;
 };
 #define CDROM_STATE_FLAGS(drive)  ((struct ide_cd_state_flags *)&((drive)->bios_head))
 
@@ -1503,6 +1516,11 @@ cdrom_check_status (ide_drive_t  *drive,
 	pc.sense_data = reqbuf;
 	pc.c[0] = TEST_UNIT_READY;
 
+        /* the Sanyo 3 CD changer uses byte 7 of TEST_UNIT_READY to 
+           switch CDs instead of supporting the LOAD_UNLOAD opcode   */
+
+        pc.c[7] = CDROM_STATE_FLAGS (drive)->sanyo_slot % 3;
+
 	return cdrom_queue_packet_command (drive, &pc);
 }
 
@@ -1910,7 +1928,7 @@ int cdrom_get_toc_entry (ide_drive_t *drive, int track,
 
 
 static int
-cdrom_read_block (ide_drive_t *drive, int format, int lba,
+cdrom_read_block (ide_drive_t *drive, int format, int lba, int nblocks,
 		  char *buf, int buflen,
 		  struct atapi_request_sense *reqbuf)
 {
@@ -1936,8 +1954,13 @@ cdrom_read_block (ide_drive_t *drive, int format, int lba,
 
 	pc.c[1] = (format << 2);
 	put_unaligned(htonl(lba), (unsigned int *) &pc.c[2]);
-	pc.c[8] = 1;  /* one block */
-	pc.c[9] = 0x10;
+	pc.c[8] = (nblocks & 0xff);
+	pc.c[7] = ((nblocks>>8) & 0xff);
+	pc.c[6] = ((nblocks>>16) & 0xff);
+	if (format <= 1)
+		pc.c[9] = 0xf0;
+	else
+		pc.c[9] = 0x10;
 
 	stat = cdrom_queue_packet_command (drive, &pc);
 
@@ -1951,8 +1974,8 @@ cdrom_read_block (ide_drive_t *drive, int format, int lba,
 			"trying opcode 0xd4\n",
 			drive->name);
 		CDROM_CONFIG_FLAGS (drive)->old_readcd = 1;
-		return cdrom_read_block (drive, format, lba, buf, buflen,
-					 reqbuf);
+		return cdrom_read_block (drive, format, lba, nblocks,
+					 buf, buflen, reqbuf);
 	}
 #endif  /* not STANDARD_ATAPI */
 
@@ -1965,15 +1988,38 @@ static int
 cdrom_load_unload (ide_drive_t *drive, int slot,
 		   struct atapi_request_sense *reqbuf)
 {
-	struct packet_command pc;
+	/* if the drive is a Sanyo 3 CD changer then TEST_UNIT_READY
+           (used in the cdrom_check_status function) is used to 
+           switch CDs instead of LOAD_UNLOAD */
 
-	memset (&pc, 0, sizeof (pc));
-	pc.sense_data = reqbuf;
+	if (CDROM_STATE_FLAGS (drive)->sanyo_slot > 0) {
 
-	pc.c[0] = LOAD_UNLOAD;
-	pc.c[4] = 2 + (slot >= 0);
-	pc.c[8] = slot;
-	return cdrom_queue_packet_command (drive, &pc);
+        	if ((slot == 1) || (slot == 2)) {
+			CDROM_STATE_FLAGS (drive)->sanyo_slot = slot;
+		} else if (slot >= 0) {
+			CDROM_STATE_FLAGS (drive)->sanyo_slot = 3;
+		} else {
+			return 0;
+		}
+
+		return cdrom_check_status (drive, NULL);
+
+	} else {
+
+		/* ATAPI Rev. 2.2+ standard for requesting switching of
+                   CDs in a multiplatter device */
+
+		struct packet_command pc;
+
+		memset (&pc, 0, sizeof (pc));
+		pc.sense_data = reqbuf;
+
+		pc.c[0] = LOAD_UNLOAD;
+		pc.c[4] = 2 + (slot >= 0);
+		pc.c[8] = slot;
+		return cdrom_queue_packet_command (drive, &pc);
+
+	}
 }
 
 
@@ -2278,7 +2324,7 @@ int ide_cdrom_ioctl (ide_drive_t *drive, struct inode *inode,
 		int stat, lba;
 		struct atapi_toc *toc;
 		struct cdrom_read_audio ra;
-		char buf[CD_FRAMESIZE_RAW];
+		char *buf;
 
 		/* Make sure the TOC is up to date. */
 		stat = cdrom_read_toc (drive, NULL);
@@ -2312,17 +2358,29 @@ int ide_cdrom_ioctl (ide_drive_t *drive, struct inode *inode,
 		if (lba < 0 || lba >= toc->capacity)
 			return -EINVAL;
 
+		buf = (char *) kmalloc (CDROM_NBLOCKS_BUFFER*CD_FRAMESIZE_RAW,
+					GFP_KERNEL);
+		if (buf == NULL)
+			return -ENOMEM;
+
 		while (ra.nframes > 0) {
-			stat = cdrom_read_block (drive, 1, lba, buf,
-						 CD_FRAMESIZE_RAW, NULL);
-			if (stat) return stat;
-			memcpy_tofs (ra.buf, buf, CD_FRAMESIZE_RAW);
-			ra.buf += CD_FRAMESIZE_RAW;
-			--ra.nframes;
-			++lba;
+			int this_nblocks = ra.nframes;
+			if (this_nblocks > CDROM_NBLOCKS_BUFFER)
+				this_nblocks = CDROM_NBLOCKS_BUFFER;
+			stat = cdrom_read_block
+				(drive, 1, lba, this_nblocks,
+				 buf, this_nblocks * CD_FRAMESIZE_RAW, NULL);
+			if (stat) break;
+
+			memcpy_tofs (ra.buf, buf,
+				     this_nblocks * CD_FRAMESIZE_RAW);
+			ra.buf += this_nblocks * CD_FRAMESIZE_RAW;
+			ra.nframes -= this_nblocks;
+			lba += this_nblocks;
 		}
 
-		return 0;
+		kfree (buf);
+		return stat;
 	}
 
 	case CDROMREADMODE1:
@@ -2330,7 +2388,7 @@ int ide_cdrom_ioctl (ide_drive_t *drive, struct inode *inode,
 		struct cdrom_msf msf;
 		int blocksize, format, stat, lba;
 		struct atapi_toc *toc;
-		char buf[CD_FRAMESIZE_RAW0];
+		char *buf;
 
 		if (cmd == CDROMREADMODE1) {
 			blocksize = CD_FRAMESIZE;
@@ -2358,12 +2416,17 @@ int ide_cdrom_ioctl (ide_drive_t *drive, struct inode *inode,
 		if (lba < 0 || lba >= toc->capacity)
 			return -EINVAL;
 
-		stat = cdrom_read_block (drive, format, lba, buf, blocksize,
-					 NULL);
-		if (stat) return stat;
+		buf = (char *) kmalloc (CD_FRAMESIZE_RAW0, GFP_KERNEL);
+		if (buf == NULL)
+			return -ENOMEM;
 
-		memcpy_tofs ((char *)arg, buf, blocksize);
-		return 0;
+		stat = cdrom_read_block (drive, format, lba, 1, buf, blocksize,
+					 NULL);
+		if (stat == 0)
+			memcpy_tofs ((char *)arg, buf, blocksize);
+
+		kfree (buf);
+		return stat;
 	}
 
 	case CDROM_GET_UPC: {
@@ -2390,7 +2453,12 @@ int ide_cdrom_ioctl (ide_drive_t *drive, struct inode *inode,
 		return stat;
 	}
 
-	case CDROMLOADFROMSLOT: {
+	case CDROMLOADFROMSLOT:
+		printk ("%s: Use CDROM_SELECT_DISC "
+			" instead of CDROMLOADFROMSLOT.\n", drive->name);
+		/* Fall through. */
+
+	case CDROM_SELECT_DISC: {
 		struct atapi_request_sense my_reqbuf;
 		int stat;
 
@@ -2574,6 +2642,10 @@ void ide_cdrom_setup (ide_drive_t *drive)
 	CDROM_CONFIG_FLAGS (drive)->no_doorlock = 0;
 #endif
 
+	/* by default Sanyo 3 CD changer support is turned off and
+           ATAPI Rev 2.2+ standard support for CD changers is used */
+	CDROM_STATE_FLAGS (drive)->sanyo_slot = 0;
+
 	if (drive->id != NULL)
 		CDROM_CONFIG_FLAGS (drive)->drq_interrupt =
 			((drive->id->config & 0x0060) == 0x20);
@@ -2621,6 +2693,15 @@ void ide_cdrom_setup (ide_drive_t *drive)
 			CDROM_CONFIG_FLAGS (drive)->playmsf_as_bcd = 1;
 			CDROM_CONFIG_FLAGS (drive)->subchan_as_bcd = 1;
 		}
+
+		/* Sanyo 3 CD changer uses a non-standard command 
+                   for CD changing */
+                else if ((strcmp(drive->id->model, "CD-ROM CDR-C3 G") == 0) ||
+                         (strcmp(drive->id->model, "CD-ROM CDR-C3G") == 0)) {
+			/* uses CD in slot 0 when value is set to 3 */
+			CDROM_STATE_FLAGS (drive)->sanyo_slot = 3;
+		}
+
 	}
 #endif /* not STANDARD_ATAPI */
 
