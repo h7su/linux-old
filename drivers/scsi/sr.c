@@ -309,7 +309,7 @@ static void sr_photocd(struct inode *inode)
 
   if (scsi_CDs[MINOR(inode->i_rdev)].xa_flags & 0x02) {
 #ifdef DEBUG
-    printk("sr_photocd: drive does not support multisession CD's");
+    printk("sr_photocd: CDROM and/or the driver does not support multisession CD's");
 #endif
     return;
   }
@@ -452,11 +452,11 @@ static void sr_photocd(struct inode *inode)
     }
     break;
 
+  case SCSI_MAN_NEC_OLDCDR:
   case SCSI_MAN_UNKNOWN:
   default:
-#ifdef DEBUG
-    printk("sr_photocd: unknown drive, no special multisession code\n");
-#endif
+    sector = 0;
+    no_multi = 1;
     break; }
 
   scsi_CDs[MINOR(inode->i_rdev)].mpcd_sector = sector;
@@ -711,7 +711,7 @@ are any multiple of 512 bytes long.  */
 		if (count+1 != SCpnt->use_sg) panic("Bad sr request list");
 		break;
 	      };
-	      if (((int) sgpnt[count].address) + sgpnt[count].length > 
+	      if (((long) sgpnt[count].address) + sgpnt[count].length > 
 		  ISA_DMA_THRESHOLD & (SCpnt->host->unchecked_isa_dma)) {
 		sgpnt[count].alt_address = sgpnt[count].address;
 		/* We try and avoid exhausting the DMA pool, since it is easier
@@ -775,7 +775,7 @@ are any multiple of 512 bytes long.  */
 	    {
 	      this_count -= this_count % 4;
 	      buffer = (unsigned char *) SCpnt->request.buffer;
-	      if (((int) buffer) + (this_count << 9) > ISA_DMA_THRESHOLD & 
+	      if (((long) buffer) + (this_count << 9) > ISA_DMA_THRESHOLD & 
 		  (SCpnt->host->unchecked_isa_dma))
 		buffer = (unsigned char *) scsi_malloc(this_count << 9);
 	    }
@@ -926,7 +926,7 @@ static void get_sectorsize(int i){
 		 MAX_RETRIES);
     
     if (current == task[0])
-      while(SCpnt->request.dev != 0xfffe);
+      while(SCpnt->request.dev != 0xfffe) barrier();
     else
       if (SCpnt->request.dev != 0xfffe){
       	struct semaphore sem = MUTEX_LOCKED;

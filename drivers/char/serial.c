@@ -468,7 +468,8 @@ static _INLINE_ void check_modem_status(struct async_struct *info)
 #ifdef SERIAL_DEBUG_OPEN
 			printk("scheduling hangup...");
 #endif
-			rs_sched_event(info, RS_EVENT_HANGUP);
+			queue_task_irq_off(&info->tqueue_hangup,
+					   &tq_scheduler);
 		}
 	}
 	if (info->flags & ASYNC_CTS_FLOW) {
@@ -722,12 +723,6 @@ static void do_softint(void *private_)
 	if (!tty)
 		return;
 
-	if (clear_bit(RS_EVENT_HANGUP, &info->event)) {
-		tty_hangup(tty);
-		wake_up_interruptible(&info->open_wait);
-		info->flags &= ~(ASYNC_NORMAL_ACTIVE|
-				 ASYNC_CALLOUT_ACTIVE);
-	}
 	if (clear_bit(RS_EVENT_WRITE_WAKEUP, &info->event)) {
 		if ((tty->flags & (1 << TTY_DO_WRITE_WAKEUP)) &&
 		    tty->ldisc.write_wakeup)
@@ -735,6 +730,28 @@ static void do_softint(void *private_)
 		wake_up_interruptible(&tty->write_wait);
 	}
 }
+
+/*
+ * This routine is called from the scheduler tqueue when the interrupt
+ * routine has signalled that a hangup has occurred.  The path of
+ * hangup processing is:
+ *
+ * 	serial interrupt routine -> (scheduler tqueue) ->
+ * 	do_serial_hangup() -> tty->hangup() -> rs_hangup()
+ * 
+ */
+static void do_serial_hangup(void *private_)
+{
+	struct async_struct	*info = (struct async_struct *) private_;
+	struct tty_struct	*tty;
+	
+	tty = info->tty;
+	if (!tty)
+		return;
+
+	tty_hangup(tty);
+}
+
 
 /*
  * This subroutine is called when the RS_TIMER goes off.  It is used
@@ -833,11 +850,11 @@ static void free_all_interrupts(int irq_lines)
 static void figure_IRQ_timeout(int irq)
 {
 	struct	async_struct	*info;
-	int	timeout = 6000;	/* 60 seconds === a long time :-) */
+	int	timeout = 60*HZ;	/* 60 seconds === a long time :-) */
 
 	info = IRQ_ports[irq];
 	if (!info) {
-		IRQ_timeout[irq] = 6000;
+		IRQ_timeout[irq] = 60*HZ;
 		return;
 	}
 	while (info) {
@@ -954,7 +971,7 @@ static int startup(struct async_struct * info)
 		info->MCR = UART_MCR_DTR | UART_MCR_RTS | UART_MCR_OUT2;
 		info->MCR_noint = UART_MCR_DTR | UART_MCR_RTS;
 	}
-#ifdef __alpha__
+#if defined(__alpha__) && !defined(CONFIG_PCI)
 	info->MCR |= UART_MCR_OUT1 | UART_MCR_OUT2;
 	info->MCR_noint |= UART_MCR_OUT1 | UART_MCR_OUT2;
 #endif
@@ -1149,8 +1166,16 @@ static void change_speed(struct async_struct *info)
 		return;
 	}
 	/* byte size and parity */
-	cval = cflag & (CSIZE | CSTOPB);
-	cval >>= 4;
+	switch (cflag & CSIZE) {
+	      case CS5: cval = 0x00; break;
+	      case CS6: cval = 0x01; break;
+	      case CS7: cval = 0x02; break;
+	      case CS8: cval = 0x03; break;
+	      default:  cval = 0x00; break;	/* too keep GCC shut... */
+	}
+	if (cflag & CSTOPB) {
+		cval |= 0x04;
+	}
 	if (cflag & PARENB)
 		cval |= UART_LCR_PARITY;
 	if (!(cflag & PARODD))
@@ -2073,6 +2098,7 @@ void rs_hangup(struct tty_struct *tty)
 	if (serial_paranoia_check(info, tty->device, "rs_hangup"))
 		return;
 	
+	rs_flush_buffer(tty);
 	shutdown(info);
 	info->event = 0;
 	info->count = 0;
@@ -2512,7 +2538,7 @@ static void autoconfig(struct async_struct * info)
 	/*
 	 * Reset the UART.
 	 */
-#ifdef __alpha__
+#if defined(__alpha__) && !defined(CONFIG_PCI)
 	/*
 	 * I wonder what DEC did to the OUT1 and OUT2 lines?
 	 * clearing them results in endless interrupts.
@@ -2615,6 +2641,8 @@ long rs_init(long kmem_start)
 		info->blocked_open = 0;
 		info->tqueue.routine = do_softint;
 		info->tqueue.data = info;
+		info->tqueue_hangup.routine = do_serial_hangup;
+		info->tqueue_hangup.data = info;
 		info->callout_termios =callout_driver.init_termios;
 		info->normal_termios = serial_driver.init_termios;
 		info->open_wait = 0;

@@ -151,10 +151,10 @@ asmlinkage int do_signal(unsigned long oldmask, struct pt_regs * regs)
 	struct sigaction * sa;
 
 	while ((signr = current->signal & mask)) {
-		__asm__("bsf %2,%1\n\t"
+		__asm__("bsf %3,%1\n\t"
 			"btrl %1,%0"
 			:"=m" (current->signal),"=r" (signr)
-			:"1" (signr));
+			:"0" (current->signal), "1" (signr));
 		sa = current->sigaction + signr;
 		signr++;
 		if ((current->flags & PF_PTRACED) && signr != SIGKILL) {
@@ -200,7 +200,7 @@ asmlinkage int do_signal(unsigned long oldmask, struct pt_regs * regs)
 				continue;
 
 			case SIGQUIT: case SIGILL: case SIGTRAP:
-			case SIGIOT: case SIGFPE: case SIGSEGV:
+			case SIGABRT: case SIGFPE: case SIGSEGV:
 				if (current->binfmt && current->binfmt->core_dump) {
 					if (current->binfmt->core_dump(signr, regs))
 						signr |= 0x80;

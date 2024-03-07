@@ -625,7 +625,7 @@ static void n_tty_set_termios(struct tty_struct *tty, struct termios * old)
 	    I_IXON(tty) || L_ISIG(tty) || L_ECHO(tty) ||
 	    I_PARMRK(tty)) {
 		cli();
-		memset(tty->process_char_map, 0, 256/32);
+		memset(tty->process_char_map, 0, 256/8);
 
 		if (I_IGNCR(tty) || I_ICRNL(tty))
 			set_bit('\r', &tty->process_char_map);
@@ -676,7 +676,6 @@ static void n_tty_set_termios(struct tty_struct *tty, struct termios * old)
 
 static void n_tty_close(struct tty_struct *tty)
 {
-	tty_wait_until_sent(tty, 0);
 	n_tty_flush_buffer(tty);
 	if (tty->read_buf) {
 		free_page((unsigned long) tty->read_buf);

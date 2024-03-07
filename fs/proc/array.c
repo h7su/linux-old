@@ -1,4 +1,3 @@
-#define THREE_LEVEL
 /*
  *  linux/fs/proc/array.c
  *
@@ -41,7 +40,6 @@
 #include <linux/proc_fs.h>
 #include <linux/ioport.h>
 #include <linux/config.h>
-#include <linux/delay.h>
 #include <linux/mm.h>
 
 #include <asm/segment.h>
@@ -177,10 +175,11 @@ static int get_loadavg(char * buffer)
 	a = avenrun[0] + (FIXED_1/200);
 	b = avenrun[1] + (FIXED_1/200);
 	c = avenrun[2] + (FIXED_1/200);
-	return sprintf(buffer,"%d.%02d %d.%02d %d.%02d\n",
+	return sprintf(buffer,"%d.%02d %d.%02d %d.%02d %d/%d\n",
 		LOAD_INT(a), LOAD_FRAC(a),
 		LOAD_INT(b), LOAD_FRAC(b),
-		LOAD_INT(c), LOAD_FRAC(c));
+		LOAD_INT(c), LOAD_FRAC(c),
+		nr_running, nr_tasks);
 }
 
 static int get_kstat(char * buffer)
@@ -271,56 +270,6 @@ static int get_version(char * buffer)
 
 	strcpy(buffer, linux_banner);
 	return strlen(buffer);
-}
-
-static int get_cpuinfo(char * buffer)
-{
-#ifdef __i386__
-	char *model[2][9]={{"DX","SX","DX/2","4","SX/2","6",
-				"DX/2-WB","DX/4"},
-			{"Pentium 60/66","Pentium 90/100","3",
-				"4","5","6","7","8"}};
-	char mask[2];
-	mask[0] = x86_mask+'@';
-	mask[1] = '\0';
-	return sprintf(buffer,"cpu\t\t: %c86\n"
-			      "model\t\t: %s\n"
-			      "mask\t\t: %s\n"
-			      "vid\t\t: %s\n"
-			      "fdiv_bug\t: %s\n"
-			      "math\t\t: %s\n"
-			      "hlt\t\t: %s\n"
-			      "wp\t\t: %s\n"
-			      "Integrated NPU\t: %s\n"
-			      "Enhanced VM86\t: %s\n"
-			      "IO Breakpoints\t: %s\n"
-			      "4MB Pages\t: %s\n"
-			      "TS Counters\t: %s\n"
-			      "Pentium MSR\t: %s\n"
-			      "Mach. Ch. Exep.\t: %s\n"
-			      "CMPXCHGB8B\t: %s\n"
-		              "BogoMips\t: %lu.%02lu\n",
-			      x86+'0', 
-			      x86_model ? model[x86-4][x86_model-1] : "Unknown",
-			      x86_mask ? mask : "Unknown",
-			      x86_vendor_id,
-			      fdiv_bug ? "yes" : "no",
-			      hard_math ? "yes" : "no",
-			      hlt_works_ok ? "yes" : "no",
-			      wp_works_ok ? "yes" : "no",
-			      x86_capability & 1 ? "yes" : "no",
-			      x86_capability & 2 ? "yes" : "no",
-			      x86_capability & 4 ? "yes" : "no",
-			      x86_capability & 8 ? "yes" : "no",
-			      x86_capability & 16 ? "yes" : "no",
-			      x86_capability & 32 ? "yes" : "no",
-			      x86_capability & 128 ? "yes" : "no",
-			      x86_capability & 256 ? "yes" : "no",
-		              loops_per_sec/500000, (loops_per_sec/5000) % 100
-			      );
-#else
-	return 0;
-#endif
 }
 
 static struct task_struct ** get_task(pid_t pid)

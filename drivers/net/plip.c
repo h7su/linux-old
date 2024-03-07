@@ -98,6 +98,7 @@ static char *version = "NET3 PLIP version 2.0 gniibe@mri.co.jp\n";
 #include <linux/ioport.h>
 #include <asm/bitops.h>
 #include <asm/irq.h>
+#include <asm/byteorder.h>
 
 /* Use 0 for production, 1 for verification, >2 for debug */
 #ifndef NET_DEBUG
@@ -165,26 +166,14 @@ struct plip_local {
 	enum plip_nibble_state nibble;
 	union {
 		struct {
-#if defined(__i386__)
+#if defined(LITTLE_ENDIAN)
 			unsigned char lsb;
 			unsigned char msb;
-#elif defined(__mc68000__)
+#elif defined(BIG_ENDIAN)
 			unsigned char msb;
 			unsigned char lsb;
-#elif defined(__sparc__)
-			unsigned char msb;
-			unsigned char lsb;
-#elif defined(__MIPSEL__)
-			unsigned char lsb;
-			unsigned char msb;
-#elif defined(__MIPSEB__)
-			unsigned char msb;
-			unsigned char lsb;
-#elif defined(__alpha__)
-			unsigned char lsb;
-			unsigned char msb;
 #else
-#error	"Adjust this structure to match your CPU"
+#error	"Please fix the endianness defines in <asm/byteorder.h>"
 #endif						
 		} b;
 		unsigned short h;
@@ -570,6 +559,7 @@ plip_receive_packet(struct device *dev, struct net_local *nl,
 
 	case PLIP_PK_DONE:
 		/* Inform the upper layer for the arrival of a packet. */
+		rcv->skb->protocol=eth_type_trans(rcv->skb, dev);
 		netif_rx(rcv->skb);
 		nl->enet_stats.rx_packets++;
 		rcv->skb = NULL;

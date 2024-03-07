@@ -39,19 +39,37 @@ void enable_hlt(void)
 	hlt_counter--;
 }
 
+asmlinkage int sys_pipe(unsigned long * fildes)
+{
+	int fd[2];
+	int error;
+
+	error = verify_area(VERIFY_WRITE,fildes,8);
+	if (error)
+		return error;
+	error = do_pipe(fd);
+	if (error)
+		return error;
+	put_fs_long(fd[0],0+fildes);
+	put_fs_long(fd[1],1+fildes);
+	return 0;
+}
+
 /*
  * The idle loop on a i386..
  */
 asmlinkage int sys_idle(void)
 {
 	int i;
+	pmd_t * pmd;
 
 	if (current->pid != 0)
 		return -EPERM;
 
 	/* Map out the low memory: it's no longer needed */
+	pmd = pmd_offset(swapper_pg_dir, 0);
 	for (i = 0 ; i < 768 ; i++)
-		pgd_clear(swapper_pg_dir + i);
+		pmd_clear(pmd++);
 
 	/* endless idle loop with no priority at all */
 	current->counter = -100;

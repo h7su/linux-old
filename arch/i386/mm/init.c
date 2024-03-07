@@ -45,7 +45,7 @@ pte_t * __bad_pagetable(void)
 	__asm__ __volatile__("cld ; rep ; stosl":
 		:"a" (pte_val(BAD_PAGE)),
 		 "D" ((long) empty_bad_page_table),
-		 "c" (PTRS_PER_PAGE)
+		 "c" (PAGE_SIZE/4)
 		:"di","cx");
 	return (pte_t *) empty_bad_page_table;
 }
@@ -57,21 +57,9 @@ pte_t __bad_page(void)
 	__asm__ __volatile__("cld ; rep ; stosl":
 		:"a" (0),
 		 "D" ((long) empty_bad_page),
-		 "c" (PTRS_PER_PAGE)
+		 "c" (PAGE_SIZE/4)
 		:"di","cx");
 	return pte_mkdirty(mk_pte((unsigned long) empty_bad_page, PAGE_SHARED));
-}
-
-unsigned long __zero_page(void)
-{
-	extern char empty_zero_page[PAGE_SIZE];
-
-	__asm__ __volatile__("cld ; rep ; stosl":
-		:"a" (0),
-		 "D" ((long) empty_zero_page),
-		 "c" (PTRS_PER_PAGE)
-		:"di","cx");
-	return (unsigned long) empty_zero_page;
 }
 
 void show_mem(void)
@@ -132,17 +120,17 @@ unsigned long paging_init(unsigned long start_mem, unsigned long end_mem)
 	pg_dir = swapper_pg_dir;
 	while (address < end_mem) {
 		/* map the memory at virtual addr 0xC0000000 */
-		if (pgd_none(pg_dir[768])) {
-			pgd_set(pg_dir+768, (pte_t *) start_mem);
+		pg_table = (pte_t *) (PAGE_MASK & pgd_val(pg_dir[768]));
+		if (!pg_table) {
+			pg_table = (pte_t *) start_mem;
 			start_mem += PAGE_SIZE;
 		}
-		pg_table = (pte_t *) pgd_page(pg_dir[768]);
 
 		/* also map it temporarily at 0x0000000 for init */
-		pgd_set(pg_dir+768, pg_table);
-		pgd_set(pg_dir, pg_table);
+		pgd_val(pg_dir[0])   = _PAGE_TABLE | (unsigned long) pg_table;
+		pgd_val(pg_dir[768]) = _PAGE_TABLE | (unsigned long) pg_table;
 		pg_dir++;
-		for (tmp = 0 ; tmp < PTRS_PER_PAGE ; tmp++,pg_table++) {
+		for (tmp = 0 ; tmp < PTRS_PER_PTE ; tmp++,pg_table++) {
 			if (address < end_mem)
 				*pg_table = mk_pte(address, PAGE_SHARED);
 			else
@@ -165,6 +153,9 @@ void mem_init(unsigned long start_mem, unsigned long end_mem)
 
 	end_mem &= PAGE_MASK;
 	high_memory = end_mem;
+
+	/* clear the zero-page */
+	memset(empty_zero_page, 0, PAGE_SIZE);
 
 	/* mark usable pages in the mem_map[] */
 	start_low_mem = PAGE_ALIGN(start_low_mem);

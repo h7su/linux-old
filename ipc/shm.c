@@ -1,4 +1,3 @@
-#define THREE_LEVEL
 /*
  * linux/ipc/shm.c
  * Copyright (C) 1992, 1993 Krishna Balasubramanian
@@ -18,7 +17,7 @@
 #include <asm/pgtable.h>
 
 extern int ipcperms (struct ipc_perm *ipcp, short shmflg);
-extern unsigned int get_swap_page (void);
+extern unsigned long get_swap_page (void);
 static int findkey (key_t key);
 static int newseg (key_t key, int shmflg, int size);
 static int shm_map (struct vm_area_struct *shmd);
@@ -471,7 +470,7 @@ int sys_shmat (int shmid, char *shmaddr, int shmflg, ulong *raddr)
 	if (!(addr = (ulong) shmaddr)) {
 		if (shmflg & SHM_REMAP)
 			return -EINVAL;
-		if (!(addr = get_unmapped_area(shp->shm_segsz)))
+		if (!(addr = get_unmapped_area(0, shp->shm_segsz)))
 			return -ENOMEM;
 	} else if (addr & (SHMLBA-1)) {
 		if (shmflg & SHM_RND)
@@ -661,7 +660,7 @@ done:	/* pte_val(pte) == shp->shm_pages[idx] */
 }
 
 /*
- * Goes through counter = (shm_rss << prio) present shm pages.
+ * Goes through counter = (shm_rss >> prio) present shm pages.
  */
 static unsigned long swap_id = 0; /* currently being swapped */
 static unsigned long swap_idx = 0; /* next to swap */
@@ -671,8 +670,9 @@ int shm_swap (int prio)
 	pte_t page;
 	struct shmid_ds *shp;
 	struct vm_area_struct *shmd;
-	unsigned int swap_nr;
-	unsigned long id, idx, invalid = 0;
+	unsigned long swap_nr;
+	unsigned long id, idx;
+	int loop = 0, invalid = 0;
 	int counter;
 
 	counter = shm_rss >> prio;
@@ -682,21 +682,22 @@ int shm_swap (int prio)
  check_id:
 	shp = shm_segs[swap_id];
 	if (shp == IPC_UNUSED || shp == IPC_NOID || shp->shm_perm.mode & SHM_LOCKED ) {
+		next_id:
 		swap_idx = 0;
-		if (++swap_id > max_shmid)
+		if (++swap_id > max_shmid) {
+			if (loop)
+				goto failed;
+			loop = 1;
 			swap_id = 0;
+		}
 		goto check_id;
 	}
 	id = swap_id;
 
  check_table:
 	idx = swap_idx++;
-	if (idx >= shp->shm_npages) {
-		swap_idx = 0;
-		if (++swap_id > max_shmid)
-			swap_id = 0;
-		goto check_id;
-	}
+	if (idx >= shp->shm_npages)
+		goto next_id;
 
 	pte_val(page) = shp->shm_pages[idx];
 	if (!pte_present(page))
@@ -704,6 +705,7 @@ int shm_swap (int prio)
 	swap_attempts++;
 
 	if (--counter < 0) { /* failed */
+		failed:
 		if (invalid)
 			invalidate();
 		swap_free (swap_nr);

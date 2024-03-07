@@ -166,7 +166,6 @@ int lookup(struct inode * dir,const char * name, int len,
 			*result = dir;
 			return 0;
 		} else if ((sb = dir->i_sb) && (dir == sb->s_mounted)) {
-			sb = dir->i_sb;
 			iput(dir);
 			dir = sb->s_covered;
 			if (!dir)
@@ -483,7 +482,7 @@ asmlinkage int sys_mknod(const char * filename, int mode, dev_t dev)
 	case 0:
 		mode |= S_IFREG;
 		break;
-	case S_IFREG: case S_IFCHR: case S_IFBLK: case S_IFIFO:
+	case S_IFREG: case S_IFCHR: case S_IFBLK: case S_IFIFO: case S_IFSOCK:
 		break;
 	default:
 		return -EINVAL;

@@ -14,6 +14,9 @@
  *	don't consider it to be his standard of finished work.
  *		Alan.
  *
+ * Fixes:
+ *	Pauline Middelink	:	Added masquerading.
+ *
  *	All the real work was done by .....
  */
 
@@ -80,10 +83,11 @@ struct ip_fw
 				 * (ports[0] <= port <= ports[1])     *
 				 *                                    */
 #define IP_FW_F_PRN	0x020	/* In verbose mode print this firewall*/
-#define IP_FW_F_BIDIR	0x040	/* For accounting-count two way       */
+#define IP_FW_F_BIDIR	0x040	/* For bidirectional firewalls        */
 #define IP_FW_F_TCPSYN	0x080	/* For tcp packets-check SYN only     */
 #define IP_FW_F_ICMPRPL 0x100	/* Send back icmp unreachable packet  */
-#define IP_FW_F_MASK	0x1FF	/* All possible flag bits mask        */
+#define IP_FW_F_MASQ	0x200	/* Masquerading			      */
+#define IP_FW_F_MASK	0x3FF	/* All possible flag bits mask        */
 
 /*    
  *	New IP firewall options for [gs]etsockopt at the RAW IP level.
@@ -111,6 +115,15 @@ struct ip_fw
 #define IP_ACCT_FLUSH    (IP_FW_BASE_CTL+18)
 #define IP_ACCT_ZERO     (IP_FW_BASE_CTL+19)
 
+struct ip_fwpkt
+{
+	struct iphdr fwp_iph;			/* IP header */
+	union {
+		struct tcphdr fwp_tcph;		/* TCP header or */
+		struct udphdr fwp_udph;		/* UDP header */
+	} fwp_protoh;
+	struct in_addr fwp_via;			/* interface address */
+};
 
 /*
  *	Main firewall chains definitions and global var's definitions.
@@ -120,6 +133,22 @@ struct ip_fw
 
 #include <linux/config.h>
 
+#ifdef CONFIG_IP_MASQUERADE
+struct ip_masq {
+	struct ip_masq	*next;		/* next member in list */
+	struct timer_list timer;	/* Expiration timer */
+	__u16 		protocol;	/* Which protocol are we talking? */
+	__u32 		src, dst;	/* Source and destination IP addresses */
+	__u16		sport,dport;	/* Source and destoination ports */
+	__u16		mport;		/* Masquaraded port */
+	__u32		init_seq;	/* Add delta from this seq. on */
+	short		delta;		/* Delta in sequence numbers */
+	char		sawfin;		/* Did we saw an FIN packet? */
+};
+extern struct ip_masq *ip_msq_hosts;
+extern void ip_fw_masquerade(struct sk_buff **, struct device *);
+extern int ip_fw_demasquerade(struct sk_buff *);
+#endif
 #ifdef CONFIG_IP_FIREWALL
 extern struct ip_fw *ip_fw_blk_chain;
 extern struct ip_fw *ip_fw_fwd_chain;
@@ -129,10 +158,26 @@ extern int ip_fw_ctl(int, void *, int);
 #endif
 #ifdef CONFIG_IP_ACCT
 extern struct ip_fw *ip_acct_chain;
-extern int ip_acct_cnt(struct iphdr *, struct device *, struct ip_fw *);
+extern void ip_acct_cnt(struct iphdr *, struct device *, struct ip_fw *);
 extern int ip_acct_ctl(int, void *, int);
 #endif
-extern int ip_fw_chk(struct iphdr *, struct device *rif,struct ip_fw *, int);
+extern int ip_fw_chk(struct iphdr *, struct device *rif,struct ip_fw *, int, int);
 #endif /* KERNEL */
+
+#ifdef CONFIG_IP_MASQUERADE
+
+#undef DEBUG_MASQ
+
+#define MASQUERADE_EXPIRE_TCP     15*60*HZ
+#define MASQUERADE_EXPIRE_TCP_FIN  2*60*HZ
+#define MASQUERADE_EXPIRE_UDP      5*60*HZ
+
+/*
+ *	Linux ports don't normally get allocated above 32K. I used an extra 4K port-space
+ */
+ 
+#define PORT_MASQ_BEGIN	60000
+#define PORT_MASQ_END	(PORT_MASQ_BEGIN+4096)
+#endif
 
 #endif /* _IP_FW_H */
