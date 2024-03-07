@@ -5,68 +5,48 @@
 # removes any old dependencies. DON'T put your own dependencies here
 # unless it's something special (ie not a .c file).
 #
-
-AR	=ar
-AS	=as
-LD	=ld
-LDFLAGS	=-s -x
-CC	=gcc
-CFLAGS	=-Wall -O -fstrength-reduce -fomit-frame-pointer \
-	-finline-functions -nostdinc -I../../include
-CPP	=gcc -E -nostdinc -I../../include
+# Note 2! The CFLAGS definition is now inherited from the
+# parent makefile.
+#
 
 .c.s:
-	$(CC) $(CFLAGS) \
-	-S -o $*.s $<
+	$(CC) $(CFLAGS) $(RAMDISK) -S $<
 .s.o:
 	$(AS) -c -o $*.o $<
 .c.o:
-	$(CC) $(CFLAGS) \
-	-c -o $*.o $<
+	$(CC) $(CFLAGS) $(RAMDISK) -c $<
 
-OBJS  = ll_rw_blk.o floppy.o hd.o ramdisk.o
+SUBDIRS	= scsi
+
+OBJS = xd.o hd.o ll_rw_blk.o floppy.o ramdisk.o genhd.o
+
+all: blk_drv.a scsisubdirs
 
 blk_drv.a: $(OBJS)
+	rm -f blk_drv.a
 	$(AR) rcs blk_drv.a $(OBJS)
 	sync
 
+scsisubdirs: dummy
+	@for i in $(SUBDIRS); do (cd $$i && echo $$i && $(MAKE)) || exit; done
+
 clean:
-	rm -f core *.o *.a tmp_make
-	for i in *.c;do rm -f `basename $$i .c`.s;done
+	rm -f core *.o *.a *.s
+	for i in $(SUBDIRS); do (cd $$i && $(MAKE) clean); done
 
 dep:
-	sed '/\#\#\# Dependencies/q' < Makefile > tmp_make
-	(for i in *.c;do echo -n `echo $$i | sed 's,\.c,\.s,'`" "; \
-		$(CPP) -M $$i;done) >> tmp_make
-	cp tmp_make Makefile
+	$(CPP) -M *.c > .depend
+	for i in $(SUBDIRS); do (cd $$i && $(MAKE) dep); done
 
-### Dependencies:
-floppy.s floppy.o : floppy.c ../../include/linux/sched.h ../../include/linux/head.h \
-  ../../include/linux/fs.h ../../include/sys/types.h ../../include/linux/mm.h \
-  ../../include/linux/kernel.h ../../include/signal.h \
-  ../../include/sys/param.h ../../include/sys/time.h ../../include/time.h \
-  ../../include/sys/resource.h ../../include/linux/fdreg.h \
-  ../../include/asm/system.h ../../include/asm/io.h \
-  ../../include/asm/segment.h blk.h 
-hd.s hd.o : hd.c ../../include/linux/config.h ../../include/linux/sched.h \
-  ../../include/linux/head.h ../../include/linux/fs.h \
-  ../../include/sys/types.h ../../include/linux/mm.h \
-  ../../include/linux/kernel.h ../../include/signal.h \
-  ../../include/sys/param.h ../../include/sys/time.h ../../include/time.h \
-  ../../include/sys/resource.h ../../include/linux/timer.h \
-  ../../include/linux/hdreg.h ../../include/asm/system.h \
-  ../../include/asm/io.h ../../include/asm/segment.h blk.h 
-ll_rw_blk.s ll_rw_blk.o : ll_rw_blk.c ../../include/errno.h ../../include/linux/sched.h \
-  ../../include/linux/head.h ../../include/linux/fs.h \
-  ../../include/sys/types.h ../../include/linux/mm.h \
-  ../../include/linux/kernel.h ../../include/signal.h \
-  ../../include/sys/param.h ../../include/sys/time.h ../../include/time.h \
-  ../../include/sys/resource.h ../../include/asm/system.h blk.h 
-ramdisk.s ramdisk.o : ramdisk.c ../../include/string.h ../../include/linux/config.h \
-  ../../include/linux/sched.h ../../include/linux/head.h \
-  ../../include/linux/fs.h ../../include/sys/types.h ../../include/linux/mm.h \
-  ../../include/linux/kernel.h ../../include/signal.h \
-  ../../include/sys/param.h ../../include/sys/time.h ../../include/time.h \
-  ../../include/sys/resource.h ../../include/linux/minix_fs.h \
-  ../../include/asm/system.h ../../include/asm/segment.h \
-  ../../include/asm/memory.h blk.h 
+xd.o:	
+	$(CC) $(CFLAGS) -fno-omit-frame-pointer $(RAMDISK) -c $<
+
+dummy:
+
+#
+# include a dependency file if one exists
+#
+ifeq (.depend,$(wildcard .depend))
+include .depend
+endif
+
