@@ -4,7 +4,7 @@
  * This is a modified version of the CDU-31A device driver (see below).
  * Changes were made using documentation for the CDU-531 (which Sony
  * assures me is very similar to the 535) and partial disassembly of the
- * DOS driver.  I used Minyard's driver and replaced the the CDU-31A
+ * DOS driver.  I used Minyard's driver and replaced the CDU-31A
  * commands with the CDU-531 commands.  This was complicated by a different
  * interface protocol with the drive.  The driver is still polled.
  *
@@ -62,26 +62,24 @@
  * This interface is (unfortunately) a polled interface.  This is
  * because most Sony interfaces are set up with DMA and interrupts
  * disables.  Some (like mine) do not even have the capability to
- * handle interrupts or DMA.  For this reason you will see a lot of
+ * handle interrupts or DMA.  For this reason you will see a bit of
  * the following:
  *
- *   retry_count = jiffies+ SONY_JIFFIES_TIMEOUT;
- *   while ((retry_count > jiffies) && (! <some condition to wait for))
+ *   snap = jiffies;
+ *   while (jiffies-snap < SONY_JIFFIES_TIMEOUT)
  *   {
- *      while (handle_sony_cd_attention())
- *         ;
- *
+ *		if (some_condition())
+ *         break;
  *      sony_sleep();
  *   }
- *   if (the condition not met)
+ *   if (some_condition not met)
  *   {
- *      return an error;
+ *      return an_error;
  *   }
  *
  * This ugly hack waits for something to happen, sleeping a little
- * between every try.  it also handles attentions, which are
- * asynchronous events from the drive informing the driver that a disk
- * has been inserted, removed, etc.
+ * between every try.  (The conditional is written so that jiffies
+ * wrap-around is handled properly.)
  *
  * One thing about these drives: They talk in MSF (Minute Second Frame) format.
  * There are 75 frames a second, 60 seconds a minute, and up to 75 minutes on a
@@ -120,18 +118,19 @@
 #include <linux/genhd.h>
 #include <linux/mm.h>
 #include <linux/malloc.h>
+#include <linux/init.h>
 
 #define REALLY_SLOW_IO
 #include <asm/system.h>
 #include <asm/io.h>
-#include <asm/segment.h>
+#include <asm/uaccess.h>
 
 #include <linux/cdrom.h>
 
 #define MAJOR_NR CDU535_CDROM_MAJOR
 # include <linux/blk.h>
 #define sony535_cd_base_io sonycd535 /* for compatible parameter passing with "insmod" */
-#include <linux/sonycd535.h>
+#include "sonycd535.h"
 
 /*
  * this is the base address of the interface card for the Sony CDU-535
@@ -152,6 +151,8 @@
 # define CDU535_MESSAGE_NAME	"Sony CDU-535"
 #endif
 
+#define CDU535_BLOCK_SIZE	2048 
+ 
 #ifndef MAX_SPINUP_RETRY
 # define MAX_SPINUP_RETRY		3	/* 1 is sufficient for most drives... */
 #endif
@@ -198,6 +199,7 @@ static int do_sony_cmd(Byte * cmd, int nCmd, Byte status[2],
 /* The base I/O address of the Sony Interface.  This is a variable (not a
    #define) so it can be easily changed via some future ioctl() */
 static unsigned int sony535_cd_base_io = CDU535_ADDRESS;
+MODULE_PARM(sony535_cd_base_io, "i");
 
 /*
  * The following are I/O addresses of the various registers for the drive.  The
@@ -325,17 +327,14 @@ cdu535_interrupt(int irq, void *dev_id, struct pt_regs *regs)
 
 
 /*
- * Wait a little while (used for polling the drive).  If in initialization,
- * setting a timeout doesn't work, so just loop for a while.  (We trust
- * that the sony_sleep() call is protected by a test for proper jiffies count.)
+ * Wait a little while.
  */
 static inline void
 sony_sleep(void)
 {
 	if (sony535_irq_used <= 0) {	/* poll */
 		current->state = TASK_INTERRUPTIBLE;
-		current->timeout = jiffies;
-		schedule();
+		schedule_timeout(0);
 	} else {	/* Interrupt driven */
 		cli();
 		enable_interrupts();
@@ -368,12 +367,13 @@ select_unit(int unit_no)
 static int
 read_result_reg(Byte *data_ptr)
 {
-	int retry_count;
+	unsigned long snap;
 	int read_status;
 
-	retry_count = jiffies + SONY_JIFFIES_TIMEOUT;
-	while (jiffies < retry_count) {
-		if (((read_status = inb(read_status_reg)) & SONY535_RESULT_NOT_READY_BIT) == 0) {
+	snap = jiffies;
+	while (jiffies-snap < SONY_JIFFIES_TIMEOUT) {
+		read_status = inb(read_status_reg);
+		if ((read_status & SONY535_RESULT_NOT_READY_BIT) == 0) {
 #if DEBUG > 1
 			printk(CDU535_MESSAGE_NAME
 					": read_result_reg(): readStatReg = 0x%x\n", read_status);
@@ -593,15 +593,14 @@ static int
 seek_and_read_N_blocks(Byte params[], int n_blocks, Byte status[2],
 					   Byte **buff, int buf_size)
 {
-	const int block_size = 2048;
 	Byte cmd_buff[7];
 	int  i;
 	int  read_status;
-	int  retry_count;
+	unsigned long snap;
 	Byte *data_buff;
 	int  sector_count = 0;
 
-	if (buf_size < ((long)block_size) * n_blocks)
+	if (buf_size < CDU535_BLOCK_SIZE * n_blocks)
 		return NO_ROOM;
 
 	set_drive_mode(SONY535_CDROM_DRIVE_MODE, status);
@@ -616,8 +615,9 @@ seek_and_read_N_blocks(Byte params[], int n_blocks, Byte status[2],
 	/* read back the data one block at a time */
 	while (0 < n_blocks--) {
 		/* wait for data to be ready */
-		retry_count = jiffies + SONY_JIFFIES_TIMEOUT;
-		while (jiffies < retry_count) {
+		int data_valid = 0;
+		snap = jiffies;
+		while (jiffies-snap < SONY_JIFFIES_TIMEOUT) {
 			read_status = inb(read_status_reg);
 			if ((read_status & SONY535_RESULT_NOT_READY_BIT) == 0) {
 				read_exec_status(status);
@@ -626,20 +626,21 @@ seek_and_read_N_blocks(Byte params[], int n_blocks, Byte status[2],
 			if ((read_status & SONY535_DATA_NOT_READY_BIT) == 0) {
 				/* data is ready, read it */
 				data_buff = buff[sector_count++];
-				for (i = 0; i < block_size; i++)
+				for (i = 0; i < CDU535_BLOCK_SIZE; i++)
 					*data_buff++ = inb(data_reg);	/* unrolling this loop does not seem to help */
+				data_valid = 1;
 				break;			/* exit the timeout loop */
 			}
 			sony_sleep();		/* data not ready, sleep a while */
 		}
-		if (retry_count <= jiffies)
+		if (!data_valid)
 			return TIME_OUT;	/* if we reach this stage */
 	}
 
 	/* read all the data, now read the status */
 	if ((i = read_exec_status(status)) != 0)
 		return i;
-	return block_size * sector_count;
+	return CDU535_BLOCK_SIZE * sector_count;
 }	/* seek_and_read_N_blocks() */
 
 /****************************************************************************
@@ -776,7 +777,7 @@ size_to_buf(unsigned int size, Byte *buf)
  * The OS calls this to perform a read or write operation to the drive.
  * Write obviously fail.  Reads to a read ahead of sony_buffer_size
  * bytes to help speed operations.  This especially helps since the OS
- * uses 1024 byte blocks and the drive uses 2048 byte blocks.  Since most
+ * may use 1024 byte blocks and the drive uses 2048 byte blocks.  Since most
  * data access on a CD is done sequentially, this saves a lot of operations.
  */
 static void
@@ -873,7 +874,7 @@ do_cdu535_request(void)
 						 * seek_and_read_N_blocks for the various cases.
 						 */
 						int readStatus = seek_and_read_N_blocks(params, read_size,
-									status, sony_buffer, (read_size * 2048));
+									status, sony_buffer, (read_size * CDU535_BLOCK_SIZE));
 						if (0 <= readStatus)	/* Good data; common case, placed first */
 							break;
 						if (readStatus == NO_ROOM || spin_up_retry == MAX_SPINUP_RETRY) {
@@ -891,8 +892,7 @@ do_cdu535_request(void)
 						if (readStatus == BAD_STATUS) {
 							/* Sleep for a while, then retry */
 							current->state = TASK_INTERRUPTIBLE;
-							current->timeout = jiffies + RETRY_FOR_BAD_STATUS;
-							schedule();
+							schedule_timeout(RETRY_FOR_BAD_STATUS*HZ/10);
 						}
 #if DEBUG > 0
 						printk(CDU535_MESSAGE_NAME
@@ -1017,7 +1017,7 @@ sony_get_subchnl_info(long arg)
 	if (err)
 		return err;
 
-	memcpy_fromfs(&schi, (char *)arg, sizeof schi);
+	copy_from_user(&schi, (char *)arg, sizeof schi);
 
 	switch (sony_audio_status) {
 	case CDROM_AUDIO_PLAY:
@@ -1032,7 +1032,7 @@ sony_get_subchnl_info(long arg)
 
 	case CDROM_AUDIO_NO_STATUS:
 		schi.cdsc_audiostatus = sony_audio_status;
-		memcpy_tofs((char *)arg, &schi, sizeof schi);
+		copy_to_user((char *)arg, &schi, sizeof schi);
 		return 0;
 		break;
 
@@ -1059,7 +1059,7 @@ sony_get_subchnl_info(long arg)
 		schi.cdsc_absaddr.lba = msf_to_log(last_sony_subcode->abs_msf);
 		schi.cdsc_reladdr.lba = msf_to_log(last_sony_subcode->rel_msf);
 	}
-	memcpy_tofs((char *)arg, &schi, sizeof schi);
+	copy_to_user((char *)arg, &schi, sizeof schi);
 	return 0;
 }
 
@@ -1173,7 +1173,7 @@ cdu_ioctl(struct inode *inode,
 			return err;
 		spin_up_drive(status);
 		set_drive_mode(SONY535_AUDIO_DRIVE_MODE, status);
-		memcpy_fromfs(params, (void *)arg, 6);
+		copy_from_user(params, (void *)arg, 6);
 
 		/* The parameters are given in int, must be converted */
 		for (i = 0; i < 3; i++) {
@@ -1214,7 +1214,7 @@ cdu_ioctl(struct inode *inode,
 				return err;
 			loc_hdr.cdth_trk0 = bcd_to_int(sony_toc->first_track_num);
 			loc_hdr.cdth_trk1 = bcd_to_int(sony_toc->last_track_num);
-			memcpy_tofs(hdr, &loc_hdr, sizeof *hdr);
+			copy_to_user(hdr, &loc_hdr, sizeof *hdr);
 		}
 		return 0;
 		break;
@@ -1235,7 +1235,7 @@ cdu_ioctl(struct inode *inode,
 			if (err)
 				return err;
 
-			memcpy_fromfs(&loc_entry, entry, sizeof loc_entry);
+			copy_from_user(&loc_entry, entry, sizeof loc_entry);
 
 			/* Lead out is handled separately since it is special. */
 			if (loc_entry.cdte_track == CDROM_LEADOUT) {
@@ -1259,7 +1259,7 @@ cdu_ioctl(struct inode *inode,
 				loc_entry.cdte_addr.msf.second = bcd_to_int(*(msf_val + 1));
 				loc_entry.cdte_addr.msf.frame = bcd_to_int(*(msf_val + 2));
 			}
-			memcpy_tofs(entry, &loc_entry, sizeof *entry);
+			copy_to_user(entry, &loc_entry, sizeof *entry);
 		}
 		return 0;
 		break;
@@ -1276,7 +1276,7 @@ cdu_ioctl(struct inode *inode,
 			if (err)
 				return err;
 
-			memcpy_fromfs(&ti, (char *)arg, sizeof ti);
+			copy_from_user(&ti, (char *)arg, sizeof ti);
 			if ((ti.cdti_trk0 < sony_toc->first_track_num)
 				|| (sony_toc->last_track_num < ti.cdti_trk0)
 				|| (ti.cdti_trk1 < ti.cdti_trk0)) {
@@ -1347,7 +1347,7 @@ cdu_ioctl(struct inode *inode,
 			if (err)
 				return err;
 
-			memcpy_fromfs(&volctrl, (char *)arg, sizeof volctrl);
+			copy_from_user(&volctrl, (char *)arg, sizeof volctrl);
 			cmd_buff[0] = SONY535_SET_VOLUME;
 			cmd_buff[1] = volctrl.channel0;
 			cmd_buff[2] = volctrl.channel1;
@@ -1433,7 +1433,7 @@ cdu_open(struct inode *inode,
  * Close the drive.  Spin it down if no task is using it.  The spin
  * down will fail if playing audio, so audio play is OK.
  */
-static void
+static int
 cdu_release(struct inode *inode,
 			struct file *filp)
 {
@@ -1459,6 +1459,7 @@ cdu_release(struct inode *inode,
 		do_sony_cmd(&cmd_no, 1, status, NULL, 0, 0);
 #endif
 	}
+	return 0;
 }
 
 
@@ -1466,30 +1467,34 @@ static struct file_operations cdu_fops =
 {
 	NULL,						/* lseek - default */
 	block_read,					/* read - general block-dev read */
-	block_write,				/* write - general block-dev write */
+	block_write,					/* write - general block-dev write */
 	NULL,						/* readdir - bad */
-	NULL,						/* select */
+	NULL,						/* poll */
 	cdu_ioctl,					/* ioctl */
 	NULL,						/* mmap */
 	cdu_open,					/* open */
-	cdu_release,				/* release */
+	NULL,						/* flush */
+	cdu_release,					/* release */
 	NULL,						/* fsync */
 	NULL,						/* fasync */
-	cdu535_check_media_change,	/* check media change */
+	cdu535_check_media_change,			/* check media change */
 	NULL						/* revalidate */
 };
+
+static int sonycd535_block_size = CDU535_BLOCK_SIZE;
 
 /*
  * Initialize the driver.
  */
-int
-sony535_init(void)
+__initfunc(int
+sony535_init(void))
 {
 	struct s535_sony_drive_config drive_config;
 	Byte cmd_buff[3];
 	Byte ret_buff[2];
 	Byte status[2];
-	int  retry_count;
+	unsigned long snap;
+	int  got_result = 0;
 	int  tmp_irq;
 	int  i;
 
@@ -1521,21 +1526,22 @@ sony535_init(void)
 	}
 	/* look for the CD-ROM, follows the procedure in the DOS driver */
 	inb(select_unit_reg);
-	retry_count = jiffies + 2 * HZ;
-	while (jiffies < retry_count)
-		sony_sleep();			/* wait for 40 18 Hz ticks (from DOS driver) */
+	/* wait for 40 18 Hz ticks (reverse-engineered from DOS driver) */
+	schedule_timeout((HZ+17)*40/18);
 	inb(result_reg);
 
 	outb(0, read_status_reg);	/* does a reset? */
-	retry_count = jiffies + SONY_JIFFIES_TIMEOUT;
-	while (jiffies < retry_count) {
+	snap = jiffies;
+	while (jiffies-snap < SONY_JIFFIES_TIMEOUT) {
 		select_unit(0);
-		if (inb(result_reg) != 0xff)
+		if (inb(result_reg) != 0xff) {
+			got_result = 1;
 			break;
+		}
 		sony_sleep();
 	}
 
-	if ((jiffies < retry_count) && (check_drive_status() != TIME_OUT)) {
+	if (got_result && (check_drive_status() != TIME_OUT)) {
 		/* CD-ROM drive responded --  get the drive configuration */
 		cmd_buff[0] = SONY535_INQUIRY;
 		if (do_sony_cmd(cmd_buff, 1, status,
@@ -1577,7 +1583,7 @@ sony535_init(void)
 			if (do_sony_cmd(cmd_buff, 2, status, ret_buff, 1, 1) == 0) {
 				/* set the drive mode successful, we are set! */
 				sony_buffer_size = SONY535_BUFFER_SIZE;
-				sony_buffer_sectors = sony_buffer_size / 2048;
+				sony_buffer_sectors = sony_buffer_size / CDU535_BLOCK_SIZE;
 
 				printk(KERN_INFO CDU535_MESSAGE_NAME " I/F CDROM : %8.8s %16.16s %4.4s",
 					   drive_config.vendor_id,
@@ -1594,6 +1600,7 @@ sony535_init(void)
 					return -EIO;
 				}
 				blk_dev[MAJOR_NR].request_fn = DEVICE_REQUEST;
+				blksize_size[MAJOR_NR] = &sonycd535_block_size;
 				read_ahead[MAJOR_NR] = 8;	/* 8 sector (4kB) read-ahead */
 
 				sony_toc = (struct s535_sony_toc *)
@@ -1614,7 +1621,8 @@ sony535_init(void)
 					return -ENOMEM;
 				}
 				for (i = 0; i < sony_buffer_sectors; i++) {
-					sony_buffer[i] = (Byte *)kmalloc(2048, GFP_KERNEL);
+					sony_buffer[i] =
+								(Byte *)kmalloc(CDU535_BLOCK_SIZE, GFP_KERNEL);
 					if (sony_buffer[i] == NULL) {
 						while (--i>=0)
 							kfree(sony_buffer[i]);
@@ -1647,8 +1655,8 @@ sony535_init(void)
  *
  * the address value has to be the existing CDROM port address.
  */
-void
-sonycd535_setup(char *strings, int *ints)
+__initfunc(void
+sonycd535_setup(char *strings, int *ints))
 {
 	/* if IRQ change and default io base desired,
 	 * then call with io base of 0
@@ -1677,7 +1685,7 @@ cleanup_module(void)
 
 	release_region(sony535_cd_base_io, 4);
 	for (i = 0; i < sony_buffer_sectors; i++)
-		kfree_s(sony_buffer[i], 2048);
+		kfree_s(sony_buffer[i], CDU535_BLOCK_SIZE);
 	kfree_s(sony_buffer, 4 * sony_buffer_sectors);
 	kfree_s(last_sony_subcode, sizeof *last_sony_subcode);
 	kfree_s(sony_toc, sizeof *sony_toc);

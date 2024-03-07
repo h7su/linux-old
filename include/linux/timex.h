@@ -17,6 +17,13 @@
 /*
  * Modification history timex.h
  *
+ * 29 Dec 97	Russell King
+ *	Moved CLOCK_TICK_RATE, CLOCK_TICK_FACTOR and FINETUNE to asm/timex.h
+ *	for ARM machines
+ *
+ *  9 Jan 97    Adrian Sun
+ *      Shifted LATCH define to allow access to alpha machines.
+ *
  * 26 Sep 94	David L. Mills
  *	Added defines for hybrid phase/frequency-lock loop.
  *
@@ -38,6 +45,8 @@
  *      Derived linux/timex.h
  * 1995-08-13    Torsten Duwe
  *      kernel PLL updated to 1994-12-13 specs (rfc-1589)
+ * 1997-08-30    Ulrich Windl
+ *      Added new constant NTP_PHASE_LIMIT
  */
 #ifndef _LINUX_TIMEX_H
 #define _LINUX_TIMEX_H
@@ -73,7 +82,7 @@
 
 /*
  * The SHIFT_SCALE define establishes the decimal point of the time_phase
- * variable which serves as a an extension to the low-order bits of the
+ * variable which serves as an extension to the low-order bits of the
  * system clock variable. The SHIFT_UPDATE define establishes the decimal
  * point of the time_offset variable which represents the current offset
  * with respect to standard time. The FINEUSEC define represents 1 usec in
@@ -95,6 +104,7 @@
 #define MAXTIME (200L << PPS_AVG) /* max PPS error (jitter) (200 us) */
 #define MINSEC 16L              /* min interval between updates (s) */
 #define MAXSEC 1200L            /* max interval between updates (s) */
+#define	NTP_PHASE_LIMIT	(MAXPHASE << 5)	/* beyond max. dispersion */
 
 /*
  * The following defines are used only if a pulse-per-second (PPS)
@@ -122,19 +132,13 @@
 #define PPS_VALID 120		/* pps signal watchdog max (s) */
 #define MAXGLITCH 30		/* pps signal glitch max (s) */
 
-#ifndef __alpha__
 /*
- * This definitively is wrong for the Alpha and none of the
- * kernel code seems to reference this anymore.
+ * Pick up the architecture specific timex specifications
  */
-#define CLOCK_TICK_RATE	1193180 /* Underlying HZ */
-#define CLOCK_TICK_FACTOR	20	/* Factor of both 1000000 and CLOCK_TICK_RATE */
-#define LATCH  ((CLOCK_TICK_RATE + HZ/2) / HZ)	/* For divider */
+#include <asm/timex.h>
 
-#define FINETUNE ((((((long)LATCH * HZ - CLOCK_TICK_RATE) << SHIFT_HZ) * \
-	(1000000/CLOCK_TICK_FACTOR) / (CLOCK_TICK_RATE/CLOCK_TICK_FACTOR)) \
-		<< (SHIFT_SCALE-SHIFT_HZ)) / HZ)
-#endif /* !__alpha__ */
+/* LATCH is used in the interval timer and ftape setup. */
+#define LATCH  ((CLOCK_TICK_RATE + HZ/2) / HZ)	/* For divider */
 
 /*
  * syscall interface - used (mainly by NTP daemon)

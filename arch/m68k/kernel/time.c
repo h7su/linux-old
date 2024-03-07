@@ -5,8 +5,12 @@
  *
  * This file contains the m68k-specific time handling details.
  * Most of the stuff is located in the machine specific files.
+ *
+ * 1997-09-10	Updated NTP code according to technical memorandum Jan '96
+ *		"A Kernel Model for Precision Timekeeping" by Dave Mills
  */
 
+#include <linux/config.h> /* CONFIG_HEARTBEAT */
 #include <linux/errno.h>
 #include <linux/sched.h>
 #include <linux/kernel.h>
@@ -15,7 +19,6 @@
 #include <linux/mm.h>
 
 #include <asm/machdep.h>
-#include <asm/segment.h>
 #include <asm/io.h>
 
 #include <linux/timex.h>
@@ -26,6 +29,24 @@ static inline int set_rtc_mmss(unsigned long nowtime)
   if (mach_set_clock_mmss)
     return mach_set_clock_mmss (nowtime);
   return -1;
+}
+
+static inline void do_profile (unsigned long pc)
+{
+	if (prof_buffer && current->pid) {
+		extern int _stext;
+		pc -= (unsigned long) &_stext;
+		pc >>= prof_shift;
+		if (pc < prof_len)
+			++prof_buffer[pc];
+		else
+		/*
+		 * Don't ignore out-of-bounds PC values silently,
+		 * put them into the last histogram slot, so if
+		 * present, they will show up as a sharp peak.
+		 */
+			++prof_buffer[prof_len-1];
+	}
 }
 
 /*
@@ -39,18 +60,46 @@ static void timer_interrupt(int irq, void *dummy, struct pt_regs * regs)
 
 	do_timer(regs);
 
+	if (!user_mode(regs))
+		do_profile(regs->pc);
+
 	/*
 	 * If we have an externally synchronized Linux clock, then update
 	 * CMOS clock accordingly every ~11 minutes. Set_rtc_mmss() has to be
 	 * called as close as possible to 500 ms before the new second starts.
 	 */
-	if (time_state != TIME_BAD && xtime.tv_sec > last_rtc_update + 660 &&
-	    xtime.tv_usec > 500000 - (tick >> 1) &&
-	    xtime.tv_usec < 500000 + (tick >> 1))
+	if ((time_status & STA_UNSYNC) == 0 &&
+	    xtime.tv_sec > last_rtc_update + 660 &&
+	    xtime.tv_usec >= 500000 - ((unsigned) tick) / 2 &&
+	    xtime.tv_usec <= 500000 + ((unsigned) tick) / 2) {
 	  if (set_rtc_mmss(xtime.tv_sec) == 0)
 	    last_rtc_update = xtime.tv_sec;
 	  else
 	    last_rtc_update = xtime.tv_sec - 600; /* do it again in 60 s */
+	}
+#ifdef CONFIG_HEARTBEAT
+	/* use power LED as a heartbeat instead -- much more useful
+	   for debugging -- based on the version for PReP by Cort */
+	/* acts like an actual heart beat -- ie thump-thump-pause... */
+	if (mach_heartbeat) {
+	    static unsigned cnt = 0, period = 0, dist = 0;
+
+	    if (cnt == 0 || cnt == dist)
+		mach_heartbeat( 1 );
+	    else if (cnt == 7 || cnt == dist+7)
+		mach_heartbeat( 0 );
+
+	    if (++cnt > period) {
+		cnt = 0;
+		/* The hyperbolic function below modifies the heartbeat period
+		 * length in dependency of the current (5min) load. It goes
+		 * through the points f(0)=126, f(1)=86, f(5)=51,
+		 * f(inf)->30. */
+		period = ((672<<FSHIFT)/(5*avenrun[0]+(7<<FSHIFT))) + 30;
+		dist = period / 4;
+	    }
+	}
+#endif /* CONFIG_HEARTBEAT */
 }
 
 /* Converts Gregorian date to seconds since 1970-01-01 00:00:00.
@@ -101,27 +150,38 @@ void time_init(void)
 	mach_sched_init(timer_interrupt);
 }
 
+extern rwlock_t xtime_lock;
+
 /*
  * This version of gettimeofday has near microsecond resolution.
  */
 void do_gettimeofday(struct timeval *tv)
 {
+	extern volatile unsigned long lost_ticks;
 	unsigned long flags;
+	unsigned long usec, sec, lost;
 
-	save_flags(flags);
-	cli();
-	*tv = xtime;
-	tv->tv_usec += mach_gettimeoffset();
-	if (tv->tv_usec >= 1000000) {
-		tv->tv_usec -= 1000000;
-		tv->tv_sec++;
+	read_lock_irqsave(&xtime_lock, flags);
+	usec = mach_gettimeoffset();
+	lost = lost_ticks;
+	if (lost)
+		usec += lost * (1000000/HZ);
+	sec = xtime.tv_sec;
+	usec += xtime.tv_usec;
+	read_unlock_irqrestore(&xtime_lock, flags);
+
+	while (usec >= 1000000) {
+		usec -= 1000000;
+		sec++;
 	}
-	restore_flags(flags);
+
+	tv->tv_sec = sec;
+	tv->tv_usec = usec;
 }
 
 void do_settimeofday(struct timeval *tv)
 {
-	cli();
+	write_lock_irq(&xtime_lock);
 	/* This is revolting. We need to set the xtime.tv_usec
 	 * correctly. However, the value in this location is
 	 * is value at the last tick.
@@ -130,14 +190,16 @@ void do_settimeofday(struct timeval *tv)
 	 */
 	tv->tv_usec -= mach_gettimeoffset();
 
-	if (tv->tv_usec < 0) {
+	while (tv->tv_usec < 0) {
 		tv->tv_usec += 1000000;
 		tv->tv_sec--;
 	}
 
 	xtime = *tv;
-	time_state = TIME_BAD;
-	time_maxerror = MAXPHASE;
-	time_esterror = MAXPHASE;
+	time_adjust = 0;		/* stop active adjtime() */
+	time_status |= STA_UNSYNC;
+	time_state = TIME_ERROR;	/* p. 24, (a) */
+	time_maxerror = NTP_PHASE_LIMIT;
+	time_esterror = NTP_PHASE_LIMIT;
 	sti();
 }

@@ -32,7 +32,7 @@
 */
 
 static const char *version =
-	"fmv18x.c:v1.3.71e 03/04/96  Yutaka TAMIYA (tamy@flab.fujitsu.co.jp)\n";
+	"fmv18x.c:v2.2.0 09/24/98  Yutaka TAMIYA (tamy@flab.fujitsu.co.jp)\n";
 
 #include <linux/module.h>
 
@@ -46,6 +46,7 @@ static const char *version =
 #include <linux/in.h>
 #include <linux/malloc.h>
 #include <linux/string.h>
+#include <linux/init.h>
 #include <asm/system.h>
 #include <asm/bitops.h>
 #include <asm/io.h>
@@ -57,7 +58,7 @@ static const char *version =
 #include <linux/skbuff.h>
 #include <linux/delay.h>
 
-static int fmv18x_probe_list[] =
+static int fmv18x_probe_list[] __initdata =
 {0x220, 0x240, 0x260, 0x280, 0x2a0, 0x2c0, 0x300, 0x340, 0};
 
 /* use 0 for production, 1 for verification, >2 for debug */
@@ -70,9 +71,11 @@ typedef unsigned char uchar;
 
 /* Information that need to be kept for each board. */
 struct net_local {
-	struct enet_statistics stats;
+	struct net_device_stats stats;
 	long open_time;				/* Useless example local info. */
 	uint tx_started:1;			/* Number of packet on the Tx queue. */
+	uint tx_queue_ready:1;		/* Tx queue is ready to be sent. */
+	uint rx_started:1;			/* Packets are Rxing. */
 	uchar tx_queue;				/* Number of packet on the Tx queue. */
 	ushort tx_queue_len;		/* Current length of the Tx queue. */
 };
@@ -91,7 +94,7 @@ struct net_local {
 /* Run-time register bank 2 definitions. */
 #define DATAPORT		8		/* Word-wide DMA or programmed-I/O dataport. */
 #define TX_START		10
-#define COL16CNTL		11
+#define COL16CNTL		11		/* Controll Reg for 16 collisions */
 #define MODE13			13
 /* Fujitsu FMV-18x Card Configuration */
 #define	FJ_STATUS0		0x10
@@ -113,7 +116,7 @@ static int	net_send_packet(struct sk_buff *skb, struct device *dev);
 static void net_interrupt(int irq, void *dev_id, struct pt_regs *regs);
 static void net_rx(struct device *dev);
 static int net_close(struct device *dev);
-static struct enet_statistics *net_get_stats(struct device *dev);
+static struct net_device_stats *net_get_stats(struct device *dev);
 static void set_multicast_list(struct device *dev);
 
 
@@ -124,13 +127,13 @@ static void set_multicast_list(struct device *dev);
    (detachable devices only).
    */
 #ifdef HAVE_DEVLIST
-/* Support for a alternate probe manager, which will eliminate the
+/* Support for an alternate probe manager, which will eliminate the
    boilerplate below. */
 struct netdev_entry fmv18x_drv =
 {"fmv18x", fmv18x_probe1, FMV18X_IO_EXTENT, fmv18x_probe_list};
 #else
-int
-fmv18x_probe(struct device *dev)
+__initfunc(int
+fmv18x_probe(struct device *dev))
 {
 	int i;
 	int base_addr = dev ? dev->base_addr : 0;
@@ -160,9 +163,10 @@ fmv18x_probe(struct device *dev)
    that can be done is checking a few bits and then diving right into MAC
    address check. */
 
-int fmv18x_probe1(struct device *dev, short ioaddr)
+__initfunc(int fmv18x_probe1(struct device *dev, short ioaddr))
 {
 	char irqmap[4] = {3, 7, 10, 15};
+	char irqmap_pnp[8] = {3, 4, 5, 7, 9, 10, 11, 15};
 	unsigned int i, irq;
 
 	/* Resetting the chip doesn't reset the ISA interface, so don't bother.
@@ -170,16 +174,29 @@ int fmv18x_probe1(struct device *dev, short ioaddr)
 	   */
 
 	/* Check I/O address configuration and Fujitsu vendor code */
-	if (fmv18x_probe_list[inb(ioaddr + FJ_CONFIG0) & 0x07] != ioaddr
- 	||  inb(ioaddr+FJ_MACADDR  ) != 0x00
+	if (inb(ioaddr+FJ_MACADDR  ) != 0x00
 	||  inb(ioaddr+FJ_MACADDR+1) != 0x00
 	||  inb(ioaddr+FJ_MACADDR+2) != 0x0e)
 		return -ENODEV;
 
-	irq = irqmap[(inb(ioaddr + FJ_CONFIG0)>>6) & 0x03];
+	/* Check PnP mode for FMV-183/184/183A/184A. */
+	/* This PnP routine is very poor. IO and IRQ should be known. */
+	if (inb(ioaddr + FJ_STATUS1) & 0x20) {
+		irq = dev->irq;
+		for (i = 0; i < 8; i++) {
+			if (irq == irqmap_pnp[i])
+				break;
+		}
+		if (i == 8)
+			return -ENODEV;
+	} else {
+		if (fmv18x_probe_list[inb(ioaddr + FJ_CONFIG0) & 0x07] != ioaddr)
+			return -ENODEV;
+		irq = irqmap[(inb(ioaddr + FJ_CONFIG0)>>6) & 0x03];
+	}
 
 	/* Snarf the interrupt vector now. */
-	if (request_irq(irq, &net_interrupt, 0, "fmv18x", NULL)) {
+	if (request_irq(irq, &net_interrupt, 0, "fmv18x", dev)) {
 		printk ("FMV-18x found at %#3x, but it's unusable due to a conflict on"
 				"IRQ %d.\n", ioaddr, irq);
 		return EAGAIN;
@@ -198,7 +215,6 @@ int fmv18x_probe1(struct device *dev, short ioaddr)
 
 	dev->base_addr = ioaddr;
 	dev->irq = irq;
-	irq2dev_map[irq] = dev;
 
 	for(i = 0; i < 6; i++) {
 		unsigned char val = inb(ioaddr + FJ_MACADDR + i);
@@ -247,6 +263,7 @@ int fmv18x_probe1(struct device *dev, short ioaddr)
 	/* Switch to bank 2 and lock our I/O address. */
 	outb(0x08, ioaddr + CONFIG_1);
 	outb(dev->if_port, ioaddr + MODE13);
+	outb(0x00, ioaddr + COL16CNTL);
 
 	if (net_debug)
 		printk(version);
@@ -264,7 +281,7 @@ int fmv18x_probe1(struct device *dev, short ioaddr)
 	dev->set_multicast_list = &set_multicast_list;
 
 	/* Fill in the fields of 'dev' with ethernet-generic values. */
-	   
+
 	ether_setup(dev);
 	return 0;
 }
@@ -283,6 +300,8 @@ static int net_open(struct device *dev)
 	outb(0xe8, ioaddr + CONFIG_1);
 
 	lp->tx_started = 0;
+	lp->tx_queue_ready = 1;
+	lp->rx_started = 0;
 	lp->tx_queue = 0;
 	lp->tx_queue_len = 0;
 
@@ -345,17 +364,9 @@ net_send_packet(struct sk_buff *skb, struct device *dev)
 		sti();
 	}
 
-	/* If some higher layer thinks we've missed an tx-done interrupt
-	   we are passed NULL. Caution: dev_tint() handles the cli()/sti()
-	   itself. */
-	if (skb == NULL) {
-		dev_tint(dev);
-		return 0;
-	}
-
 	/* Block a timer-based transmit from overlapping.  This could better be
 	   done with atomic_swap(1, dev->tbusy), but set_bit() works as well. */
-	if (set_bit(0, (void*)&dev->tbusy) != 0)
+	if (test_and_set_bit(0, (void*)&dev->tbusy) != 0)
 		printk("%s: Transmitter access conflict.\n", dev->name);
 	else {
 		short length = ETH_ZLEN < skb->len ? skb->len : ETH_ZLEN;
@@ -372,14 +383,20 @@ net_send_packet(struct sk_buff *skb, struct device *dev)
 			printk("%s: Transmitting a packet of length %lu.\n", dev->name,
 				   (unsigned long)skb->len);
 
-		/* Disable both interrupts. */
-		outw(0x0000, ioaddr + TX_INTR);
-		
-		outw(length, ioaddr + DATAPORT);
-		outsw(ioaddr + DATAPORT, buf, (length + 1) >> 1);
+		/* We may not start transmitting unless we finish transferring
+		   a packet into the Tx queue. During executing the following
+		   codes we possibly catch a Tx interrupt. Thus we flag off
+		   tx_queue_ready, so that we prevent the interrupt routine
+		   (net_interrupt) to start transmitting. */
+		lp->tx_queue_ready = 0;
+		{
+			outw(length, ioaddr + DATAPORT);
+			outsw(ioaddr + DATAPORT, buf, (length + 1) >> 1);
 
-		lp->tx_queue++;
-		lp->tx_queue_len += length + 2;
+			lp->tx_queue++;
+			lp->tx_queue_len += length + 2;
+		}
+		lp->tx_queue_ready = 1;
 
 		if (lp->tx_started == 0) {
 			/* If the Tx is idle, always trigger a transmit. */
@@ -392,11 +409,8 @@ net_send_packet(struct sk_buff *skb, struct device *dev)
 		} else if (lp->tx_queue_len < 4096 - 1502)
 			/* Yes, there is room for one more packet. */
 			dev->tbusy = 0;
-
-		/* Re-enable interrupts */
-		outw(0x8182, ioaddr + TX_INTR);
 	}
-	dev_kfree_skb (skb, FREE_WRITE);
+	dev_kfree_skb (skb);
 
 	return 0;
 }
@@ -406,7 +420,7 @@ net_send_packet(struct sk_buff *skb, struct device *dev)
 static void
 net_interrupt(int irq, void *dev_id, struct pt_regs *regs)
 {
-	struct device *dev = (struct device *)(irq2dev_map[irq]);
+	struct device *dev = dev_id;
 	struct net_local *lp;
 	int ioaddr, status;
 
@@ -418,23 +432,37 @@ net_interrupt(int irq, void *dev_id, struct pt_regs *regs)
 
 	ioaddr = dev->base_addr;
 	lp = (struct net_local *)dev->priv;
-
-	/* Avoid multiple interrupts. */
-	outw(0x0000, ioaddr + TX_INTR);
-
-        status = inw(ioaddr + TX_STATUS);
+	status = inw(ioaddr + TX_STATUS);
 	outw(status, ioaddr + TX_STATUS);
 
 	if (net_debug > 4)
 		printk("%s: Interrupt with status %04x.\n", dev->name, status);
-	if (status & 0xff00
-		||  (inb(ioaddr + RX_MODE) & 0x40) == 0) {			/* Got a packet(s). */
+	if (lp->rx_started == 0 &&
+		(status & 0xff00 || (inb(ioaddr + RX_MODE) & 0x40) == 0)) {
+		/* Got a packet(s).
+		   We cannot execute net_rx more than once at the same time for
+		   the same device. During executing net_rx, we possibly catch a
+		   Tx interrupt. Thus we flag on rx_started, so that we prevent
+		   the interrupt routine (net_interrupt) to dive into net_rx
+		   again. */
+		lp->rx_started = 1;
+		outb(0x00, ioaddr + RX_INTR);	/* Disable RX intr. */
 		net_rx(dev);
+		outb(0x81, ioaddr + RX_INTR);	/* Enable  RX intr. */
+		lp->rx_started = 0;
 	}
 	if (status & 0x00ff) {
-		if (status & 0x80) {
+		if (status & 0x02) {
+			/* More than 16 collisions occurred */
+			if (net_debug > 4)
+				printk("%s: 16 Collision occur during Txing.\n", dev->name);
+			/* Cancel sending a packet. */
+			outb(0x03, ioaddr + COL16CNTL);
+			lp->stats.collisions++;
+		}
+		if (status & 0x82) {
 			lp->stats.tx_packets++;
-			if (lp->tx_queue) {
+			if (lp->tx_queue && lp->tx_queue_ready) {
 				outb(0x80 | lp->tx_queue, ioaddr + TX_START);
 				lp->tx_queue = 0;
 				lp->tx_queue_len = 0;
@@ -447,16 +475,9 @@ net_interrupt(int irq, void *dev_id, struct pt_regs *regs)
 				mark_bh(NET_BH);	/* Inform upper layers. */
 			}
 		}
-		if (status & 0x02 ) {
-			if (net_debug > 4)
-				printk("%s: 16 Collision occur during Txing.\n", dev->name);
-			/* Retry to send the packet */
-			outb(0x02, ioaddr + COL16CNTL);
-		}
 	}
 
 	dev->interrupt = 0;
-	outw(0x8182, ioaddr + TX_INTR);
 	return;
 }
 
@@ -466,7 +487,7 @@ net_rx(struct device *dev)
 {
 	struct net_local *lp = (struct net_local *)dev->priv;
 	int ioaddr = dev->base_addr;
-	int boguscount = 10;	/* 5 -> 10: by agy 19940922 */
+	int boguscount = 5;
 
 	while ((inb(ioaddr + RX_MODE) & 0x40) == 0) {
 		/* Clear PKT_RDY bit: by agy 19940922 */
@@ -543,7 +564,7 @@ net_rx(struct device *dev)
 		}
 
 		if (net_debug > 5 && i > 0)
-			printk("%s: Exint Rx packet with mode %02x after %d ticks.\n", 
+			printk("%s: Exint Rx packet with mode %02x after %d ticks.\n",
 				   dev->name, inb(ioaddr + RX_MODE), i);
 	}
 
@@ -578,8 +599,7 @@ static int net_close(struct device *dev)
 
 /* Get the current statistics.	This may be called with the card open or
    closed. */
-static struct enet_statistics *
-net_get_stats(struct device *dev)
+static struct net_device_stats *net_get_stats(struct device *dev)
 {
 	struct net_local *lp = (struct net_local *)dev->priv;
 
@@ -596,21 +616,21 @@ net_get_stats(struct device *dev)
    num_addrs > 0	Multicast mode, receive normal and MC packets, and do
 			best-effort filtering.
  */
-static void
-set_multicast_list(struct device *dev)
+ 
+static void set_multicast_list(struct device *dev)
 {
 	short ioaddr = dev->base_addr;
-	if (dev->mc_count || dev->flags&(IFF_PROMISC|IFF_ALLMULTI)) 
+	if (dev->mc_count || dev->flags&(IFF_PROMISC|IFF_ALLMULTI))
 	{
 		/*
 		 *	We must make the kernel realise we had to move
 		 *	into promisc mode or we start all out war on
 		 *	the cable. - AC
 		 */
-		dev->flags|=IFF_PROMISC;		
-	
+		dev->flags|=IFF_PROMISC;
+
 		outb(3, ioaddr + RX_MODE);	/* Enable promiscuous mode */
-	} 
+	}
 	else
 		outb(2, ioaddr + RX_MODE);	/* Disable promiscuous, use normal mode */
 }
@@ -625,6 +645,10 @@ static struct device dev_fmv18x = {
 
 static int io = 0x220;
 static int irq = 0;
+
+MODULE_PARM(io, "i");
+MODULE_PARM(irq, "i");
+MODULE_PARM(net_debug, "i");
 
 int init_module(void)
 {
@@ -647,8 +671,7 @@ cleanup_module(void)
 	dev_fmv18x.priv = NULL;
 
 	/* If we don't do this, we can't re-insmod it later. */
-	free_irq(dev_fmv18x.irq, NULL);
-	irq2dev_map[dev_fmv18x.irq] = NULL;
+	free_irq(dev_fmv18x.irq, &dev_fmv18x);
 	release_region(dev_fmv18x.base_addr, FMV18X_IO_EXTENT);
 }
 #endif /* MODULE */
